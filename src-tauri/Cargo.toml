@@ -1,0 +1,46 @@
+[package]
+name = "antijanja"
+version = "2.4.0"
+description = "AntiJanja - compartilhamento de tela P2P"
+edition = "2021"
+
+[lib]
+name = "antijanja_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+async-trait = "0.1.92"
+base64 = "0.23.1"
+blake3 = "1.8.7"
+bytes = "1.12.1"
+chacha20poly1305 = "0.11.0"
+flate2 = "1.1.11"
+futures = "0.3.34"
+getrandom = "0.4.3"
+image = "0.25.10"
+mainline = "8.0.1"
+opus = "0.4.0"
+pollster = "1.0.1"
+rtc = "0.21.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sysinfo = "0.40.3"
+tauri = { version = "2", features = [] }
+tauri-plugin-process = "2"
+tauri-plugin-updater = "2"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+wasapi = "0.27.0"
+webrtc = "0.21.1"
+wgpu = "30.0.2"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Threading", "Win32_Graphics_Direct3D11", "Win32_Graphics_Direct3D", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D10", "Win32_Media"] }
+windows-capture = "2.0.1"
+xcap = "0.9.10"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
