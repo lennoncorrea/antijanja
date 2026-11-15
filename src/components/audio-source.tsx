@@ -66,7 +66,7 @@ export function AudioSource({ detailed = false }: { detailed?: boolean }) {
               {options.map((a) => (
                 <SelectItem key={a.exe} value={a.exe}>
                   {a.name}
-                  {a.active && <span className="text-xs text-emerald-500">tocando agora</span>}
+                  {a.active && <span className="text-xs text-live-text">tocando agora</span>}
                 </SelectItem>
               ))}
             </SelectContent>

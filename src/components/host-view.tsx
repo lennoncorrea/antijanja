@@ -28,7 +28,7 @@ export function HostView() {
           <div className="flex items-center gap-3">
             <div className="min-w-0">
               <h2 className="flex items-center gap-2 text-lg font-semibold">
-                <span className="size-2 animate-pulse rounded-full bg-red-500" />Você está transmitindo
+                <span className="size-2 animate-pulse rounded-full bg-live" />Você está transmitindo
               </h2>
               <p className="truncate text-sm text-muted-foreground">{source?.name}</p>
             </div>
@@ -109,7 +109,7 @@ function CodeCard() {
         <Button className="w-full" disabled={!code} onClick={() => copyCode(code)}><Copy />Copiar código</Button>
         <div className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5">
           <div className="flex items-center gap-2.5">
-            {isPublic ? <Globe className="size-4 text-emerald-500" /> : <Lock className="size-4 text-muted-foreground" />}
+            {isPublic ? <Globe className="size-4 text-live-text" /> : <Lock className="size-4 text-muted-foreground" />}
             <div className="grid leading-tight">
               <Label htmlFor="public-live" className="text-sm">{isPublic ? "Pública" : "Só com o código"}</Label>
               <span className="text-xs text-muted-foreground">{isPublic ? "Aparece em “Ao vivo agora”" : "Não aparece na lista"}</span>
@@ -141,7 +141,7 @@ function ViewersCard() {
               <Avatar className="size-8"><AvatarFallback className="text-xs">{initials(p.name)}</AvatarFallback></Avatar>
               <div className="min-w-0 flex-1">
                 <p className="truncate text-sm font-medium">{p.name}</p>
-                <p className={`text-xs ${p.state === "connected" ? "text-emerald-500" : "text-amber-500"}`}>{STATE_TEXT[p.state]}</p>
+                <p className={`text-xs ${p.state === "connected" ? "text-live-text" : "text-warn"}`}>{STATE_TEXT[p.state]}</p>
               </div>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -205,7 +205,7 @@ function SettingsCard() {
             {info && (
               <div className="grid gap-1 rounded-lg bg-muted/40 px-4 py-3 text-sm">
                 <p className="flex items-center gap-2">
-                  {info.hardware ? <Gauge className="size-4 text-emerald-500" /> : <Cpu className="size-4 text-amber-500" />}
+                  {info.hardware ? <Gauge className="size-4 text-live-text" /> : <Cpu className="size-4 text-warn" />}
                   H.264 com {info.encoder}{info.hardware ? ", na placa de vídeo" : ", no processador"}
                 </p>
                 <p className="text-xs text-muted-foreground">
@@ -219,8 +219,8 @@ function SettingsCard() {
           <TabsContent value="audio" className="grid gap-4 pt-3">
             <AudioSource />
             {watchingCount > 0 && (s.audioMode === "exclude" || s.audioMode === "include") && (
-              <p className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
-                <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+              <p className="flex items-start gap-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-foreground">
+                <TriangleAlert className="mt-0.5 size-4 shrink-0 text-warn" />
                 {s.audioMode === "exclude"
                   ? "O áudio das transmissões que você está assistindo também vai junto neste modo. Use “Todo o PC”, que deixa o AntiJanja de fora."
                   : "Neste modo só o app escolhido vai na transmissão, então o áudio do que você assiste não vaza."}
@@ -238,7 +238,7 @@ function SettingsCard() {
             </div>
             <div className="flex items-center gap-3 text-sm">
               <div className="h-1.5 w-24 shrink-0 overflow-hidden rounded-full bg-muted">
-                <div className="h-full rounded-full bg-emerald-500 transition-[width] duration-100" style={{ width: `${Math.min(100, level * 100)}%` }} />
+                <div className="h-full rounded-full bg-live transition-[width] duration-100" style={{ width: `${Math.min(100, level * 100)}%` }} />
               </div>
               <span className={audioStatus.kind === "err" ? "text-destructive" : audioStatus.kind === "ok" ? "text-foreground" : "text-muted-foreground"}>
                 {audioStatus.text}

@@ -1,13 +1,22 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
-@import "@fontsource-variable/geist";
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
 
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
     --font-heading: var(--font-sans);
-    --font-sans: 'Geist Variable', sans-serif;
+    --font-sans: 'Inter Variable', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono Variable', ui-monospace, monospace;
+    --color-rail: var(--rail);
+    --color-live: var(--live);
+    --color-live-foreground: var(--live-foreground);
+    --color-live-text: var(--live-text);
+    --color-strong: var(--strong);
+    --color-strong-foreground: var(--strong-foreground);
+    --color-warn: var(--warn);
     --color-sidebar-ring: var(--sidebar-ring);
     --color-sidebar-border: var(--sidebar-border);
     --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -48,73 +57,86 @@
     --radius-4xl: calc(var(--radius) * 2.6);
 }
 
+/*
+ * Identidade do AntiJanja. Paleta base (Realtime Colors):
+ * texto #09200a · fundo #f8fcf9 · primária #4dc75b · secundária #92c6dd · destaque #7092d2.
+ * O tema escuro é a mesma paleta com a claridade invertida.
+ */
 :root {
-    --background: oklch(1 0 0);
-    --foreground: oklch(0.145 0 0);
-    --card: oklch(1 0 0);
-    --card-foreground: oklch(0.145 0 0);
-    --popover: oklch(1 0 0);
-    --popover-foreground: oklch(0.145 0 0);
-    --primary: oklch(0.205 0 0);
-    --primary-foreground: oklch(0.985 0 0);
-    --secondary: oklch(0.97 0 0);
-    --secondary-foreground: oklch(0.205 0 0);
-    --muted: oklch(0.97 0 0);
-    --muted-foreground: oklch(0.556 0 0);
-    --accent: oklch(0.97 0 0);
-    --accent-foreground: oklch(0.205 0 0);
-    --destructive: oklch(0.577 0.245 27.325);
-    --border: oklch(0.922 0 0);
-    --input: oklch(0.922 0 0);
-    --ring: oklch(0.708 0 0);
-    --chart-1: oklch(0.87 0 0);
-    --chart-2: oklch(0.556 0 0);
-    --chart-3: oklch(0.439 0 0);
-    --chart-4: oklch(0.371 0 0);
-    --chart-5: oklch(0.269 0 0);
+    --background: #f8fcf9;
+    --foreground: #09200a;
+    --card: #ffffff;
+    --card-foreground: #09200a;
+    --popover: #ffffff;
+    --popover-foreground: #09200a;
+    --primary: #4dc75b;
+    --primary-foreground: #09200a;
+    --secondary: #eef5ef;
+    --secondary-foreground: #09200a;
+    --muted: #eef5ef;
+    --muted-foreground: #4a5e4c;
+    --accent: #e4efe6;
+    --accent-foreground: #09200a;
+    --destructive: #d93a2b;
+    --border: #dde9df;
+    --input: #d3e2d6;
+    --ring: #4dc75b;
+    --rail: #f1f7f2;
+    --live: #4dc75b;
+    --live-foreground: #09200a;
+    --live-text: #1e7a2b;
+    --strong: #09200a;
+    --strong-foreground: #f8fcf9;
+    --warn: #b7791f;
+    /* Capas das transmissões (sem miniatura): fundo e iniciais */
+    --cover-1: #dceef5; --cover-1-ink: #1f5f7a;
+    --cover-2: #e2e9f7; --cover-2-ink: #2d4f8f;
+    --cover-3: #e3f5e5; --cover-3-ink: #1e7a2b;
+    --chart-1: #4dc75b;
+    --chart-2: #92c6dd;
+    --chart-3: #7092d2;
+    --chart-4: #2d4f8f;
+    --chart-5: #1e7a2b;
     --radius: 0.625rem;
-    --sidebar: oklch(0.985 0 0);
-    --sidebar-foreground: oklch(0.145 0 0);
-    --sidebar-primary: oklch(0.205 0 0);
-    --sidebar-primary-foreground: oklch(0.985 0 0);
-    --sidebar-accent: oklch(0.97 0 0);
-    --sidebar-accent-foreground: oklch(0.205 0 0);
-    --sidebar-border: oklch(0.922 0 0);
-    --sidebar-ring: oklch(0.708 0 0);
+    --sidebar: var(--rail);
+    --sidebar-foreground: var(--foreground);
+    --sidebar-primary: var(--primary);
+    --sidebar-primary-foreground: var(--primary-foreground);
+    --sidebar-accent: var(--accent);
+    --sidebar-accent-foreground: var(--accent-foreground);
+    --sidebar-border: var(--border);
+    --sidebar-ring: var(--ring);
 }
 
 .dark {
-    --background: oklch(0.145 0 0);
-    --foreground: oklch(0.985 0 0);
-    --card: oklch(0.205 0 0);
-    --card-foreground: oklch(0.985 0 0);
-    --popover: oklch(0.205 0 0);
-    --popover-foreground: oklch(0.985 0 0);
-    --primary: oklch(0.922 0 0);
-    --primary-foreground: oklch(0.205 0 0);
-    --secondary: oklch(0.269 0 0);
-    --secondary-foreground: oklch(0.985 0 0);
-    --muted: oklch(0.269 0 0);
-    --muted-foreground: oklch(0.708 0 0);
-    --accent: oklch(0.269 0 0);
-    --accent-foreground: oklch(0.985 0 0);
-    --destructive: oklch(0.704 0.191 22.216);
-    --border: oklch(1 0 0 / 10%);
-    --input: oklch(1 0 0 / 15%);
-    --ring: oklch(0.556 0 0);
-    --chart-1: oklch(0.87 0 0);
-    --chart-2: oklch(0.556 0 0);
-    --chart-3: oklch(0.439 0 0);
-    --chart-4: oklch(0.371 0 0);
-    --chart-5: oklch(0.269 0 0);
-    --sidebar: oklch(0.205 0 0);
-    --sidebar-foreground: oklch(0.985 0 0);
-    --sidebar-primary: oklch(0.488 0.243 264.376);
-    --sidebar-primary-foreground: oklch(0.985 0 0);
-    --sidebar-accent: oklch(0.269 0 0);
-    --sidebar-accent-foreground: oklch(0.985 0 0);
-    --sidebar-border: oklch(1 0 0 / 10%);
-    --sidebar-ring: oklch(0.556 0 0);
+    --background: #06100a;
+    --foreground: #dff6e0;
+    --card: #0c1a10;
+    --card-foreground: #dff6e0;
+    --popover: #0c1a10;
+    --popover-foreground: #dff6e0;
+    --primary: #4dc75b;
+    --primary-foreground: #06100a;
+    --secondary: #13251a;
+    --secondary-foreground: #dff6e0;
+    --muted: #13251a;
+    --muted-foreground: #9db8a0;
+    --accent: #172c1e;
+    --accent-foreground: #dff6e0;
+    --destructive: #f0604f;
+    --border: #1a2e1f;
+    --input: #22382a;
+    --ring: #4dc75b;
+    --rail: #08140c;
+    --live: #4dc75b;
+    --live-foreground: #06100a;
+    --live-text: #6fd87b;
+    --strong: #dff6e0;
+    --strong-foreground: #06100a;
+    --warn: #f2c14e;
+    --cover-1: #10283a; --cover-1-ink: #92c6dd;
+    --cover-2: #17223d; --cover-2-ink: #a3b9e8;
+    --cover-3: #0f2a14; --cover-3-ink: #6fd87b;
 }
 
 @layer base {
@@ -127,4 +149,9 @@
   html {
     @apply font-sans;
     }
+}
+
+/* Linhas de varredura discretas nas capas das transmissões. */
+.scanlines {
+  background-image: repeating-linear-gradient(0deg, color-mix(in oklab, currentColor 6%, transparent) 0 1px, transparent 1px 4px);
 }

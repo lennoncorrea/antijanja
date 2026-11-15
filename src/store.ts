@@ -1,6 +1,7 @@
 import { create } from "zustand";
 
 export type View = "home" | "host" | "watch";
+export type Theme = "light" | "dark";
 export type AudioMode = "none" | "system" | "exclude" | "include";
 export type PeerState = "connecting" | "connected" | "unstable";
 export type Step = "prepare" | "publish" | "wait" | "connect";
@@ -75,8 +76,15 @@ export function save(key: string, value: unknown) {
   try { localStorage.setItem("aj." + key, JSON.stringify(value)); } catch { /* sem storage */ }
 }
 
+function initialTheme(): Theme {
+  const saved = load<string>("theme", "");
+  if (saved === "light" || saved === "dark") return saved;
+  try { return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"; } catch { return "dark"; }
+}
+
 interface State {
   view: View;
+  theme: Theme;
   net: "pending" | "ok" | "err";
   name: string;
   settings: StreamSettings;
@@ -111,6 +119,7 @@ interface State {
 
 export const useApp = create<State>(() => ({
   view: "home",
+  theme: initialTheme(),
   net: "pending",
   name: load("name", ""),
   settings: { ...DEFAULTS, ...load<Partial<StreamSettings>>("stream", {}) },
@@ -136,3 +145,10 @@ export const useApp = create<State>(() => ({
 
 export const getState = useApp.getState;
 export const setState = useApp.setState;
+
+/** Troca entre claro e escuro e lembra a escolha. */
+export function setTheme(theme: Theme) {
+  document.documentElement.classList.toggle("dark", theme === "dark");
+  setState({ theme });
+  save("theme", theme);
+}

@@ -140,7 +140,7 @@ function Tile({ viewer: v, focused, layoutKey, bare }: { viewer: Viewer; focused
           <Avatar className="size-7"><AvatarFallback className="text-[11px]">{initials(v.hostName || "?")}</AvatarFallback></Avatar>
           <div className="min-w-0 leading-tight">
             <p className="truncate text-sm font-medium">{v.hostName || "Conectando…"}</p>
-            <p className={cn("text-xs", v.watching ? "text-emerald-500" : "text-muted-foreground")}>{v.watching ? "Ao vivo, P2P" : "Entrando"}</p>
+            <p className={cn("text-xs", v.watching ? "text-live-text" : "text-muted-foreground")}>{v.watching ? "Ao vivo, P2P" : "Entrando"}</p>
           </div>
           {v.stats && v.watching && (
             <div className="ml-auto hidden flex-wrap justify-end gap-1 @container md:flex">
@@ -149,7 +149,7 @@ function Tile({ viewer: v, focused, layoutKey, bare }: { viewer: Viewer; focused
               {v.ping !== null && (
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <Badge variant="secondary" className={cn("tabular-nums", v.ping > 150 && "bg-amber-500 text-black")}>
+                    <Badge variant="secondary" className={cn("tabular-nums", v.ping > 150 && "bg-warn text-black")}>
                       {v.ping} ms{v.stats.buffer_ms > 0 ? ` +${v.stats.buffer_ms}` : ""}
                     </Badge>
                   </TooltipTrigger>
@@ -184,7 +184,7 @@ function Tile({ viewer: v, focused, layoutKey, bare }: { viewer: Viewer; focused
               {STEPS.map((s, i) => (
                 <li key={s.id} className={cn("flex items-center gap-2.5 text-sm", i !== stepIndex && "text-muted-foreground")}>
                   <span className="grid size-4 place-items-center">
-                    {i < stepIndex ? <Check className="size-4 text-emerald-500" />
+                    {i < stepIndex ? <Check className="size-4 text-live-text" />
                       : i === stepIndex ? <Loader2 className="size-4 animate-spin text-primary" />
                       : <span className="size-1.5 rounded-full bg-muted-foreground/40" />}
                   </span>

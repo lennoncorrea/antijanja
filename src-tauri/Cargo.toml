@@ -1,6 +1,6 @@
 [package]
 name = "antijanja"
-version = "2.4.0"
+version = "2.5.0"
 description = "AntiJanja - compartilhamento de tela P2P"
 edition = "2021"
 

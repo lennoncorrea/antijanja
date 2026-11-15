@@ -97,7 +97,7 @@ export function SourcePicker() {
                     )}
                     <div className="absolute top-2 left-2 flex gap-1">
                       {s.primary && <Badge variant="secondary" className="bg-background/80 backdrop-blur">Principal</Badge>}
-                      {isCurrent && <Badge className="bg-red-600 text-white">No ar</Badge>}
+                      {isCurrent && <Badge className="bg-live text-live-foreground">No ar</Badge>}
                     </div>
                   </div>
                   <div className="min-w-0 px-1">
