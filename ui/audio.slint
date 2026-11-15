@@ -1,0 +1,85 @@
+// Escolha da fonte de áudio que vai junto com a transmissão.
+import { Theme } from "theme.slint";
+import { App } from "state.slint";
+import { Btn, Icon, Select } from "widgets.slint";
+
+component ModeTile inherits Rectangle {
+    in property <string> value;
+    in property <string> label;
+    in property <image> icon;
+    property <bool> on: App.s-audio-mode == value;
+    height: 40px;
+    border-radius: 9px;
+    border-width: 1px;
+    border-color: on ? Theme.primary : Theme.border;
+    background: on ? Theme.accent : ta.has-hover ? Theme.muted : transparent;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 10px;
+        spacing: 10px;
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                source: root.icon;
+                tint: root.on ? Theme.fg : Theme.muted-fg;
+            }
+        }
+        Text {
+            text: root.label;
+            color: Theme.fg;
+            font-size: 13px;
+            font-weight: root.on ? 600 : 500;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { App.set-setting("audio-mode", root.value); }
+    }
+}
+
+export component AudioSource inherits VerticalLayout {
+    // 4 = uma linha só; 2 = grade 2×2.
+    in property <int> columns: 2;
+    vertical-stretch: 0;
+    spacing: 10px;
+    if root.columns == 4 : HorizontalLayout {
+        spacing: 8px;
+        ModeTile { value: "none"; label: "Sem áudio"; icon: @image-url("icons/volume-x.svg"); }
+        ModeTile { value: "system"; label: "Todo o PC"; icon: @image-url("icons/volume.svg"); }
+        ModeTile { value: "exclude"; label: "Tudo, menos um app"; icon: @image-url("icons/volume-minus.svg"); }
+        ModeTile { value: "include"; label: "Só um app"; icon: @image-url("icons/app-window.svg"); }
+    }
+    if root.columns != 4 : VerticalLayout {
+        spacing: 8px;
+        HorizontalLayout {
+            spacing: 8px;
+            ModeTile { value: "none"; label: "Sem áudio"; icon: @image-url("icons/volume-x.svg"); }
+            ModeTile { value: "system"; label: "Todo o PC"; icon: @image-url("icons/volume.svg"); }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            ModeTile { value: "exclude"; label: "Tudo, menos um app"; icon: @image-url("icons/volume-minus.svg"); }
+            ModeTile { value: "include"; label: "Só um app"; icon: @image-url("icons/app-window.svg"); }
+        }
+    }
+    if App.s-audio-mode == "exclude" || App.s-audio-mode == "include" : HorizontalLayout {
+        spacing: 8px;
+        Select {
+            horizontal-stretch: 1;
+            options: App.app-options;
+            value: App.s-audio-app;
+            selected(v) => { App.set-setting("audio-app", v); }
+        }
+        Btn {
+            width: 40px;
+            kind: "outline";
+            icon-only: true;
+            icon: @image-url("icons/refresh.svg");
+            has-icon: true;
+            accessible-label: "Atualizar lista de apps";
+            clicked => { App.refresh-apps(); }
+        }
+    }
+}

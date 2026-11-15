@@ -1,0 +1,55 @@
+[package]
+name = "antijanja"
+version = "3.0.0"
+description = "AntiJanja - compartilhamento de tela P2P"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "antijanja"
+path = "src/main.rs"
+
+[build-dependencies]
+slint-build = "1.18"
+embed-resource = "3"
+
+[dependencies]
+# Interface
+slint = { version = "1.18", features = ["raw-window-handle-06"] }
+arboard = { version = "3", default-features = false }
+raw-window-handle = "0.6"
+# Atualização automática (releases do GitHub, assinadas com minisign)
+ureq = "3"
+minisign-verify = "0.3"
+# Motor (captura, codificação, P2P, áudio, player)
+async-trait = "0.1.92"
+base64 = "0.23.1"
+blake3 = "1.8.7"
+bytes = "1.12.1"
+chacha20poly1305 = "0.11.0"
+flate2 = "1.1.11"
+futures = "0.3.34"
+getrandom = "0.4.3"
+image = "0.25.10"
+mainline = "8.0.1"
+opus = "0.4.0"
+pollster = "1.0.1"
+rtc = "0.21.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sysinfo = "0.40.3"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+wasapi = "0.27.0"
+webrtc = "0.21.1"
+wgpu = "30.0.2"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Threading", "Win32_Graphics_Direct3D11", "Win32_Graphics_Direct3D", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D10", "Win32_Media", "Win32_Graphics_Dwm", "Win32_System_Registry"] }
+windows-capture = "2.0.1"
+xcap = "0.9.10"
+
+# LTO "thin" e algumas unidades de código: binário quase igual, build bem mais leve
+# (o build completo com lto=true travava o PC).
+[profile.release]
+codegen-units = 4
+lto = "thin"
+opt-level = "s"
+strip = true

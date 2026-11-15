@@ -1,0 +1,492 @@
+// Transmitindo: prévia, código, quem está assistindo e configurações ao vivo.
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { App, SelectOption } from "state.slint";
+import { AudioSource } from "audio.slint";
+import { Badge, Btn, Card, Cover, Divider, Icon, Segmented, Select, Slider, Toggle } from "widgets.slint";
+
+component Field inherits VerticalLayout {
+    in property <string> label;
+    in property <[SelectOption]> options;
+    in property <string> value;
+    callback selected(string);
+    spacing: 8px;
+    Text { text: root.label; font-size: 13px; font-weight: 500; color: Theme.fg; }
+    Select {
+        options: root.options;
+        value: root.value;
+        selected(v) => { root.selected(v); }
+    }
+}
+
+component ToggleRow inherits Rectangle {
+    in property <string> title;
+    in property <string> body;
+    in property <bool> checked;
+    callback toggled(bool);
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Theme.border;
+    HorizontalLayout {
+        padding: 12px;
+        padding-left: 16px;
+        spacing: 16px;
+        VerticalLayout {
+            spacing: 2px;
+            Text { text: root.title; font-size: 13px; font-weight: 500; color: Theme.fg; }
+            Text { text: root.body; font-size: 12px; color: Theme.muted-fg; wrap: word-wrap; }
+        }
+        VerticalLayout {
+            alignment: center;
+            Toggle {
+                checked: root.checked;
+                toggled(v) => { root.toggled(v); }
+            }
+        }
+    }
+}
+
+component SettingsCard inherits Card {
+    property <string> tab: "video";
+    property <[SelectOption]> res-options: [
+        { value: "0", label: "Original" }, { value: "2160", label: "2160p (4K)" }, { value: "1440", label: "1440p" },
+        { value: "1080", label: "1080p" }, { value: "900", label: "900p" }, { value: "720", label: "720p" }, { value: "480", label: "480p" }
+    ];
+    property <[SelectOption]> fps-options: [
+        { value: "30", label: "30" }, { value: "60", label: "60" }, { value: "120", label: "120" }, { value: "144", label: "144" }
+    ];
+    property <[SelectOption]> bitrate-options: [
+        { value: "0", label: "Automático" }, { value: "3000", label: "3 Mb/s" }, { value: "6000", label: "6 Mb/s" },
+        { value: "10000", label: "10 Mb/s" }, { value: "15000", label: "15 Mb/s" }, { value: "20000", label: "20 Mb/s" },
+        { value: "30000", label: "30 Mb/s" }, { value: "50000", label: "50 Mb/s" }, { value: "80000", label: "80 Mb/s" }
+    ];
+    property <[SelectOption]> abitrate-options: [
+        { value: "64", label: "64 kb/s" }, { value: "96", label: "96 kb/s" }, { value: "128", label: "128 kb/s" },
+        { value: "192", label: "192 kb/s" }, { value: "256", label: "256 kb/s" }, { value: "320", label: "320 kb/s" },
+        { value: "510", label: "510 kb/s (máximo)" }
+    ];
+
+    VerticalLayout {
+        padding: 20px;
+        spacing: 14px;
+        VerticalLayout {
+            spacing: 4px;
+            Text { text: "Configurações da transmissão"; font-size: 16px; font-weight: 600; color: Theme.fg; }
+            Text { text: "As mudanças valem na hora, para todo mundo que está assistindo."; font-size: 13px; color: Theme.muted-fg; wrap: word-wrap; }
+        }
+        HorizontalLayout {
+            alignment: start;
+            Segmented {
+                options: [{ value: "video", label: "Vídeo" }, { value: "audio", label: "Áudio" }];
+                value: root.tab;
+                selected(v) => { root.tab = v; }
+            }
+        }
+
+        if root.tab == "video" : VerticalLayout {
+            spacing: 14px;
+            HorizontalLayout {
+                spacing: 14px;
+                Field {
+                    label: "Resolução";
+                    options: root.res-options;
+                    value: App.s-res;
+                    selected(v) => { App.set-setting("res", v); }
+                }
+                Field {
+                    label: "Quadros por segundo";
+                    options: root.fps-options;
+                    value: App.s-fps;
+                    selected(v) => { App.set-setting("fps", v); }
+                }
+                Field {
+                    label: "Bitrate alvo";
+                    options: root.bitrate-options;
+                    value: App.s-bitrate;
+                    selected(v) => { App.set-setting("bitrate", v); }
+                }
+            }
+            Text {
+                text: "O bitrate é atingido com movimento na tela. Com a imagem parada, o encoder gasta menos, porque não há o que mandar.";
+                font-size: 12px;
+                color: Theme.muted-fg;
+                wrap: word-wrap;
+            }
+            ToggleRow {
+                title: "Mostrar o cursor do mouse";
+                body: "Desligue para transmitir só o conteúdo.";
+                checked: App.s-cursor;
+                toggled(v) => { App.set-setting("cursor", v ? "1" : "0"); }
+            }
+            if App.has-info : Rectangle {
+                border-radius: 10px;
+                background: Theme.muted.with-alpha(0.6);
+                VerticalLayout {
+                    padding: 12px;
+                    padding-left: 16px;
+                    spacing: 4px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        VerticalLayout {
+                            alignment: center;
+                            Icon {
+                                source: App.hardware ? @image-url("icons/gauge.svg") : @image-url("icons/cpu.svg");
+                                tint: App.hardware ? Theme.live-text : Theme.warn;
+                            }
+                        }
+                        Text { text: App.encoder-line; font-size: 13px; color: Theme.fg; }
+                    }
+                    Text { text: App.encoder-detail; font-size: 12px; color: Theme.muted-fg; wrap: word-wrap; }
+                }
+            }
+        }
+
+        if root.tab == "audio" : VerticalLayout {
+            spacing: 14px;
+            AudioSource {
+                columns: 2;
+            }
+            if App.watch-count > 0 && (App.s-audio-mode == "exclude" || App.s-audio-mode == "include") : Rectangle {
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: Theme.warn.with-alpha(0.4);
+                background: Theme.warn.with-alpha(0.1);
+                HorizontalLayout {
+                    padding: 10px;
+                    padding-left: 12px;
+                    spacing: 8px;
+                    Icon {
+                        source: @image-url("icons/alert.svg");
+                        tint: Theme.warn;
+                    }
+                    Text {
+                        text: App.s-audio-mode == "exclude"
+                            ? "O áudio das transmissões que você está assistindo também vai junto neste modo. Use “Todo o PC”, que deixa o AntiJanja de fora."
+                            : "Neste modo só o app escolhido vai na transmissão, então o áudio do que você assiste não vaza.";
+                        font-size: 12px;
+                        color: Theme.fg;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 14px;
+                Field {
+                    label: "Bitrate do áudio";
+                    options: root.abitrate-options;
+                    value: App.s-abitrate;
+                    selected(v) => { App.set-setting("abitrate", v); }
+                }
+                VerticalLayout {
+                    spacing: 8px;
+                    HorizontalLayout {
+                        Text { text: "Volume"; font-size: 13px; font-weight: 500; color: Theme.fg; }
+                        Rectangle { }
+                        Text { text: App.s-volume + "%"; font-size: 13px; color: Theme.muted-fg; font-family: Theme.mono; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        min-height: 40px;
+                        Slider {
+                            minimum: 0;
+                            maximum: 200;
+                            step: 5;
+                            value: App.s-volume;
+                            changed(v) => { App.set-setting("volume", v); }
+                        }
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 12px;
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 96px;
+                        height: 6px;
+                        border-radius: 3px;
+                        background: Theme.muted;
+                        clip: true;
+                        Rectangle {
+                            x: 0;
+                            width: parent.width * Math.min(1, App.audio-level);
+                            height: 100%;
+                            border-radius: 3px;
+                            background: Theme.live;
+                            animate width { duration: 100ms; }
+                        }
+                    }
+                }
+                Text {
+                    text: App.audio-status;
+                    font-size: 13px;
+                    color: App.audio-status-kind == "err" ? Theme.destructive : App.audio-status-kind == "ok" ? Theme.fg : Theme.muted-fg;
+                    overflow: elide;
+                }
+            }
+        }
+    }
+}
+
+component CodeCard inherits Card {
+    VerticalLayout {
+        padding: 20px;
+        spacing: 14px;
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                spacing: 4px;
+                Text { text: "Código da transmissão"; font-size: 16px; font-weight: 600; color: Theme.fg; }
+                Text { text: "Quem tiver o código entra sozinho. Você não precisa aprovar."; font-size: 13px; color: Theme.muted-fg; wrap: word-wrap; }
+            }
+            VerticalLayout {
+                alignment: start;
+                Btn {
+                    width: 32px;
+                    height: 32px;
+                    kind: "ghost";
+                    icon-only: true;
+                    icon: @image-url("icons/refresh.svg");
+                    has-icon: true;
+                    enabled: App.code != "";
+                    accessible-label: "Gerar outro código";
+                    clicked => { App.new-code(); }
+                }
+            }
+        }
+        Rectangle {
+            min-height: 96px;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: Theme.muted.with-alpha(0.5);
+            VerticalLayout {
+                padding: 16px;
+                spacing: 4px;
+                if App.code == "" : Text { text: "Gerando código…"; font-size: 14px; color: Theme.muted-fg; }
+                if App.code != "" : Text { text: App.code-prefix; font-family: Theme.mono; font-size: 15px; color: Theme.live-text; }
+                if App.code != "" : Text {
+                    text: App.code-body;
+                    font-family: Theme.mono;
+                    font-size: 15px;
+                    color: Theme.fg;
+                    wrap: word-wrap;
+                }
+            }
+        }
+        Btn {
+            kind: "primary";
+            text: "Copiar código";
+            icon: @image-url("icons/copy.svg");
+            has-icon: true;
+            enabled: App.code != "";
+            clicked => { App.copy-my-code(); }
+        }
+        Rectangle {
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            HorizontalLayout {
+                padding: 10px;
+                padding-left: 12px;
+                spacing: 10px;
+                VerticalLayout {
+                    alignment: center;
+                    Icon {
+                        source: App.s-public ? @image-url("icons/globe.svg") : @image-url("icons/lock.svg");
+                        tint: App.s-public ? Theme.live-text : Theme.muted-fg;
+                    }
+                }
+                VerticalLayout {
+                    spacing: 1px;
+                    Text { text: App.s-public ? "Pública" : "Só com o código"; font-size: 13px; font-weight: 500; color: Theme.fg; }
+                    Text { text: App.s-public ? "Aparece em “Ao vivo agora”" : "Não aparece na lista"; font-size: 12px; color: Theme.muted-fg; }
+                }
+                Rectangle { }
+                VerticalLayout {
+                    alignment: center;
+                    Toggle {
+                        checked: App.s-public;
+                        toggled(v) => { App.set-setting("public", v ? "1" : "0"); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component ViewersCard inherits Card {
+    VerticalLayout {
+        padding: 20px;
+        spacing: 10px;
+        Text { text: "Assistindo"; font-size: 16px; font-weight: 600; color: Theme.fg; }
+        if App.peers.length == 0 : Text {
+            text: "Ninguém ainda. Quem entrar com o código aparece aqui.";
+            font-size: 13px;
+            color: Theme.muted-fg;
+            wrap: word-wrap;
+        }
+        for p in App.peers : Rectangle {
+            height: 48px;
+            border-radius: 8px;
+            background: row.has-hover ? Theme.muted.with-alpha(0.6) : transparent;
+            row := TouchArea { }
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 4px;
+                spacing: 12px;
+                VerticalLayout {
+                    alignment: center;
+                    Cover {
+                        width: 32px;
+                        height: 32px;
+                        border-radius: 16px;
+                        idx: Math.mod(p.id, 3) + 1;
+                        initials: p.initials;
+                        text-size: 12px;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 1px;
+                    Text { text: p.name; font-size: 13px; font-weight: 500; color: Theme.fg; overflow: elide; }
+                    Text { text: p.state-text; font-size: 12px; color: p.connected ? Theme.live-text : Theme.warn; }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Btn {
+                        width: 32px;
+                        height: 32px;
+                        kind: "ghost";
+                        icon-only: true;
+                        icon: @image-url("icons/user-x.svg");
+                        has-icon: true;
+                        opacity: row.has-hover ? 1 : 0;
+                        accessible-label: "Remover " + p.name;
+                        clicked => { App.kick(p.id); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component HostView inherits ScrollView {
+    content-width: self.visible-width;
+    HorizontalLayout {
+        padding: 24px;
+        spacing: 24px;
+        alignment: start;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 16px;
+            alignment: start;
+            HorizontalLayout {
+                spacing: 12px;
+                VerticalLayout {
+                    spacing: 2px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 8px;
+                                height: 8px;
+                                border-radius: 4px;
+                                background: Theme.live;
+                            }
+                        }
+                        Text { text: "Você está transmitindo"; font-size: 18px; font-weight: 600; color: Theme.fg; }
+                    }
+                    Text { text: App.source-name; font-size: 13px; color: Theme.muted-fg; overflow: elide; }
+                }
+                Rectangle { }
+                VerticalLayout {
+                    alignment: center;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Btn {
+                            kind: "outline";
+                            text: "Trocar fonte";
+                            icon: @image-url("icons/repeat.svg");
+                            has-icon: true;
+                            clicked => { App.open-picker("switch"); }
+                        }
+                        Btn {
+                            kind: "danger";
+                            text: "Parar";
+                            icon: @image-url("icons/stop.svg");
+                            has-icon: true;
+                            icon-size: 12px;
+                            clicked => { App.stop-sharing(); }
+                        }
+                    }
+                }
+            }
+
+            preview := Rectangle {
+                height: Math.min(self.width * 9 / 16, 460px);
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: #000000;
+                clip: true;
+                if App.has-preview : Image {
+                    width: 100%;
+                    height: 100%;
+                    source: App.preview;
+                    image-fit: contain;
+                }
+                Badge {
+                    x: 12px;
+                    y: 12px;
+                    mono: false;
+                    bg: Theme.bg.with-alpha(0.8);
+                    text: "Prévia, atualiza a cada segundo";
+                }
+                Rectangle {
+                    x: parent.width - self.width - 12px;
+                    y: 12px;
+                    height: 22px;
+                    width: eyeRow.preferred-width + 14px;
+                    border-radius: 6px;
+                    background: Theme.bg.with-alpha(0.8);
+                    eyeRow := HorizontalLayout {
+                        padding-left: 7px;
+                        padding-right: 7px;
+                        spacing: 5px;
+                        VerticalLayout {
+                            alignment: center;
+                            Icon {
+                                source: @image-url("icons/eye.svg");
+                                width: 13px;
+                                height: 13px;
+                            }
+                        }
+                        Text { text: App.host-viewers; font-size: 11px; color: Theme.fg; font-family: Theme.mono; vertical-alignment: center; }
+                    }
+                }
+                if App.has-info : HorizontalLayout {
+                    x: 12px;
+                    y: parent.height - 22px - 12px;
+                    height: 22px;
+                    spacing: 6px;
+                    Badge { bg: Theme.bg.with-alpha(0.8); text: "Envio " + App.stat-res; }
+                    Badge { bg: Theme.bg.with-alpha(0.8); text: "FPS " + App.stat-fps; }
+                    Badge { bg: Theme.bg.with-alpha(0.8); text: "Taxa " + App.stat-rate; }
+                }
+            }
+
+            SettingsCard { }
+        }
+        VerticalLayout {
+            width: 340px;
+            spacing: 24px;
+            alignment: start;
+            CodeCard { }
+            ViewersCard { }
+        }
+    }
+}

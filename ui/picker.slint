@@ -1,0 +1,256 @@
+// "O que você quer transmitir?": telas e janelas com miniatura.
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { App, Source } from "state.slint";
+import { AudioSource } from "audio.slint";
+import { Badge, Btn, Divider, Icon, Segmented, Spinner, Toggle } from "widgets.slint";
+
+component SourceCard inherits Rectangle {
+    in property <Source> s;
+    property <bool> selected: App.picker-selected == s.id;
+    opacity: s.blank ? 0 : 1;
+    border-radius: 12px;
+    border-width: selected ? 2px : 1px;
+    border-color: selected ? Theme.primary : ta.has-hover ? Theme.input : Theme.border;
+    background: Theme.card;
+    VerticalLayout {
+        padding: 8px;
+        spacing: 8px;
+        alignment: start;
+        Rectangle {
+            height: self.width * 9 / 16;
+            border-radius: 8px;
+            background: Theme.muted;
+            clip: true;
+            if root.s.has-thumb : Image {
+                width: 100%;
+                height: 100%;
+                source: root.s.thumb;
+                image-fit: contain;
+            }
+            if !root.s.has-thumb : Icon {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 28px;
+                height: 28px;
+                source: root.s.is-window ? @image-url("icons/app-window.svg") : @image-url("icons/monitor.svg");
+                tint: Theme.muted-fg;
+            }
+            HorizontalLayout {
+                x: 8px;
+                y: 8px;
+                height: 22px;
+                spacing: 4px;
+                if root.s.primary : Badge { mono: false; bg: Theme.bg.with-alpha(0.85); text: "Principal"; }
+                if root.s.current : Badge { mono: false; bg: Theme.live; ink: Theme.primary-fg; text: "No ar"; }
+            }
+        }
+        VerticalLayout {
+            padding-left: 4px;
+            padding-right: 4px;
+            spacing: 1px;
+            Text { text: root.s.name; font-size: 13px; font-weight: 600; color: Theme.fg; overflow: elide; }
+            Text { text: root.s.detail; font-size: 12px; color: Theme.muted-fg; overflow: elide; }
+        }
+    }
+    ta := TouchArea {
+        enabled: !root.s.blank;
+        mouse-cursor: pointer;
+        clicked => { App.picker-select(root.s.id); }
+        double-clicked => { App.picker-confirm(root.s.id); }
+    }
+}
+
+export component SourcePicker inherits Rectangle {
+    background: Theme.overlay;
+    // Clique fora fecha.
+    TouchArea {
+        clicked => { App.close-picker(); }
+    }
+    dialog := Rectangle {
+        width: Math.min(parent.width - 48px, 900px);
+        height: Math.min(parent.height - 48px, App.picker == "start" ? 760px : 620px);
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: 14px;
+        border-width: 1px;
+        border-color: Theme.border;
+        background: Theme.card;
+        drop-shadow-blur: 30px;
+        drop-shadow-offset-y: 8px;
+        drop-shadow-color: #00000055;
+        clip: true;
+        // Engole os cliques dentro do diálogo (não fechar).
+        TouchArea { }
+        VerticalLayout {
+          VerticalLayout {
+            vertical-stretch: 1;
+            padding: 20px;
+            spacing: 14px;
+            HorizontalLayout {
+                VerticalLayout {
+                    spacing: 4px;
+                    Text {
+                        text: App.picker == "switch" ? "Trocar o que está sendo transmitido" : "O que você quer transmitir?";
+                        font-size: 17px;
+                        font-weight: 600;
+                        color: Theme.fg;
+                    }
+                    Text {
+                        text: App.picker == "switch" ? "Quem está assistindo continua conectado, com o mesmo código." : "Escolha uma tela inteira ou só uma janela.";
+                        font-size: 13px;
+                        color: Theme.muted-fg;
+                    }
+                }
+                Rectangle { }
+                VerticalLayout {
+                    alignment: start;
+                    Btn {
+                        width: 32px;
+                        height: 32px;
+                        kind: "ghost";
+                        icon-only: true;
+                        icon: @image-url("icons/x.svg");
+                        has-icon: true;
+                        accessible-label: "Fechar";
+                        clicked => { App.close-picker(); }
+                    }
+                }
+            }
+            HorizontalLayout {
+                Segmented {
+                    options: [
+                        { value: "monitor", label: App.sources-loading ? "Telas" : "Telas  " + App.count-monitors },
+                        { value: "window", label: App.sources-loading ? "Janelas" : "Janelas  " + App.count-windows }
+                    ];
+                    value: App.picker-tab;
+                    selected(v) => { App.picker-tab-changed(v); }
+                }
+                Rectangle { }
+                Btn {
+                    height: 34px;
+                    kind: "ghost";
+                    font-size: 13px;
+                    text: "Atualizar";
+                    icon: @image-url("icons/refresh.svg");
+                    has-icon: true;
+                    icon-size: 14px;
+                    enabled: !App.sources-loading;
+                    clicked => { App.picker-refresh(); }
+                }
+            }
+
+            // As miniaturas rolam dentro desta área; nada vaza para fora do diálogo.
+            Rectangle {
+                vertical-stretch: 1;
+                min-height: 160px;
+                if App.sources-loading : HorizontalLayout {
+                    alignment: center;
+                    spacing: 10px;
+                    VerticalLayout {
+                        alignment: center;
+                        Spinner { }
+                    }
+                    Text { text: "Procurando telas e janelas…"; font-size: 13px; color: Theme.muted-fg; vertical-alignment: center; }
+                }
+                if !App.sources-loading && App.source-rows.length == 0 : Text {
+                    width: 100%;
+                    height: 100%;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                    text: App.picker-tab == "window" ? "Nenhuma janela aberta para transmitir. Janelas minimizadas não aparecem." : "Nenhuma tela encontrada.";
+                    font-size: 13px;
+                    color: Theme.muted-fg;
+                }
+                if !App.sources-loading : ScrollView {
+                    width: 100%;
+                    height: 100%;
+                    content-width: self.visible-width;
+                    VerticalLayout {
+                        spacing: 12px;
+                        padding-bottom: 4px;
+                        for row in App.source-rows : HorizontalLayout {
+                            spacing: 12px;
+                            for s in row.items : SourceCard {
+                                horizontal-stretch: 1;
+                                s: s;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if App.picker == "start" : VerticalLayout {
+                vertical-stretch: 0;
+                spacing: 12px;
+                Divider { }
+                Text { text: "Áudio que vai junto"; font-size: 13px; font-weight: 500; color: Theme.fg; }
+                AudioSource {
+                    columns: 4;
+                }
+                Rectangle {
+                    border-radius: 10px;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    HorizontalLayout {
+                        padding: 12px;
+                        padding-left: 16px;
+                        spacing: 16px;
+                        VerticalLayout {
+                            spacing: 2px;
+                            Text { text: "Aparecer em “Ao vivo agora”"; font-size: 13px; font-weight: 500; color: Theme.fg; }
+                            Text {
+                                text: "Qualquer pessoa com o AntiJanja vê sua transmissão na lista e pode entrar. Desligado, só entra quem receber o código.";
+                                font-size: 12px;
+                                color: Theme.muted-fg;
+                                wrap: word-wrap;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Toggle {
+                                checked: App.s-public;
+                                toggled(v) => { App.set-setting("public", v ? "1" : "0"); }
+                            }
+                        }
+                    }
+                }
+            }
+
+          }
+            Rectangle {
+                height: 64px;
+                background: Theme.muted.with-alpha(0.5);
+                Rectangle {
+                    y: 0;
+                    height: 1px;
+                    background: Theme.border;
+                }
+                HorizontalLayout {
+                    padding-left: 20px;
+                    padding-right: 20px;
+                    spacing: 8px;
+                    alignment: end;
+                    VerticalLayout {
+                        alignment: center;
+                        Btn {
+                            kind: "ghost";
+                            text: "Cancelar";
+                            clicked => { App.close-picker(); }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Btn {
+                            kind: "primary";
+                            text: App.picker == "switch" ? "Trocar para esta fonte" : "Começar transmissão";
+                            enabled: App.picker-selected != "";
+                            clicked => { App.picker-confirm(App.picker-selected); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

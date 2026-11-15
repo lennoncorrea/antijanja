@@ -1,0 +1,56 @@
+// Identidade do AntiJanja. Paleta base (Realtime Colors):
+// texto #e8f1f3 · fundo #040a0b · primária #00d4ff · secundária #1e8194 · destaque #1cc2e3.
+// A paleta original é escura; o tema claro é a mesma paleta com a claridade invertida.
+// O app abre no tema do Windows.
+import "../assets/fonts/Inter-Regular.ttf";
+import "../assets/fonts/Inter-Medium.ttf";
+import "../assets/fonts/Inter-SemiBold.ttf";
+import "../assets/fonts/Inter-Bold.ttf";
+import "../assets/fonts/Inter-ExtraBold.ttf";
+import "../assets/fonts/JetBrainsMono-Medium.ttf";
+
+export global Theme {
+    in-out property <bool> dark: true;
+
+    out property <string> sans: "Inter";
+    out property <string> mono: "JetBrains Mono";
+
+    out property <color> bg: dark ? #040a0b : #f4fafb;
+    out property <color> fg: dark ? #e8f1f3 : #0c1517;
+    out property <color> card: dark ? #0b1517 : #ffffff;
+    out property <color> muted: dark ? #122124 : #e8f2f4;
+    out property <color> muted-fg: dark ? #93aab0 : #4a6168;
+    out property <color> soft-fg: dark ? #c4d6da : #2a3f44;
+    out property <color> accent: dark ? #162a2e : #dcecef;
+    out property <color> border: dark ? #17292d : #d5e5e8;
+    out property <color> input: dark ? #21383d : #c6dbdf;
+    out property <color> rail: dark ? #071012 : #eef6f7;
+    out property <color> primary: #00d4ff;
+    out property <color> primary-fg: #04191f;
+    out property <color> live: #00d4ff;
+    out property <color> live-text: dark ? #1cc2e3 : #00788f;
+    out property <color> strong: dark ? #e8f1f3 : #0c1517;
+    out property <color> strong-fg: dark ? #040a0b : #f4fafb;
+    out property <color> destructive: dark ? #f0604f : #d93a2b;
+    out property <color> warn: dark ? #f2c14e : #b7791f;
+    out property <color> overlay: dark ? #000000b3 : #0c151766;
+    // Capa grande (transmissão em destaque) e etiquetas escuras sobre imagem.
+    out property <color> feature-bg: #062a33;
+    out property <color> feature-ink: #00d4ff;
+    out property <color> tag-bg: #040a0bd9;
+    out property <color> tag-fg: #e8f1f3;
+
+    // Capas das transmissões (sem miniatura): fundo e iniciais, 3 variações.
+    pure public function cover-bg(i: int) -> color {
+        if (dark) {
+            return i == 1 ? #06303b : i == 2 ? #0f2a30 : #0b2236;
+        }
+        return i == 1 ? #d6f5fc : i == 2 ? #d9eef2 : #dcebf7;
+    }
+    pure public function cover-ink(i: int) -> color {
+        if (dark) {
+            return i == 1 ? #00d4ff : i == 2 ? #4fc3d6 : #6cc7e8;
+        }
+        return i == 1 ? #00788f : i == 2 ? #1e8194 : #2a6aa3;
+    }
+}

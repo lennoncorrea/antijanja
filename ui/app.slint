@@ -1,0 +1,307 @@
+// Janela principal do AntiJanja.
+import { Theme } from "theme.slint";
+import { App, Stream, StreamRow, WatchingItem, Source, SourceRow, Peer, AudioApp, SelectOption, Tile, Toast } from "state.slint";
+import { Btn, Icon } from "widgets.slint";
+import { HomeView } from "home.slint";
+import { HostView } from "host.slint";
+import { WatchView } from "watch.slint";
+import { SourcePicker } from "picker.slint";
+
+export { Theme, App, Stream, StreamRow, WatchingItem, Source, SourceRow, Peer, AudioApp, SelectOption, Tile, Toast }
+
+component Logo inherits Rectangle {
+    width: 22px;
+    height: 22px;
+    // Duas janelas sobrepostas + o ponto "ao vivo".
+    Rectangle {
+        x: parent.width * 4 / 32;
+        y: parent.height * 7 / 32;
+        width: parent.width * 17 / 32;
+        height: parent.height * 12 / 32;
+        border-radius: 2px;
+        border-width: 2px;
+        border-color: Theme.fg;
+    }
+    Rectangle {
+        x: parent.width * 11 / 32;
+        y: parent.height * 13 / 32;
+        width: parent.width * 17 / 32;
+        height: parent.height * 12 / 32;
+        border-radius: 2px;
+        background: Theme.fg;
+    }
+    Rectangle {
+        x: parent.width * 4.4 / 32;
+        y: parent.height * 22.4 / 32;
+        width: parent.width * 5.2 / 32;
+        height: self.width;
+        border-radius: self.width / 2;
+        background: Theme.live;
+    }
+}
+
+component Tab inherits Rectangle {
+    in property <string> label;
+    in property <string> target;
+    in property <int> count: 0;
+    in property <bool> live-dot: false;
+    property <bool> on: App.view == target;
+    height: 30px;
+    border-radius: 6px;
+    background: on ? Theme.muted : ta.has-hover ? Theme.muted.with-alpha(0.6) : transparent;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 6px;
+        if root.live-dot : VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 6px;
+                height: 6px;
+                border-radius: 3px;
+                background: Theme.live;
+            }
+        }
+        Text {
+            text: root.label;
+            font-size: 13px;
+            font-weight: root.on ? 600 : 500;
+            color: root.on || ta.has-hover ? Theme.fg : Theme.muted-fg;
+            vertical-alignment: center;
+        }
+        if root.count > 0 : VerticalLayout {
+            alignment: center;
+            Rectangle {
+                height: 17px;
+                width: n.preferred-width + 10px;
+                border-radius: 4px;
+                background: root.on ? Theme.card : Theme.muted;
+                n := Text {
+                    x: 5px;
+                    height: 100%;
+                    vertical-alignment: center;
+                    text: root.count;
+                    font-family: Theme.mono;
+                    font-size: 11px;
+                    color: Theme.fg;
+                }
+            }
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { App.navigate(root.target); }
+    }
+}
+
+component TopBar inherits Rectangle {
+    height: 44px;
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: Theme.border;
+    }
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 10px;
+        spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            Logo { }
+        }
+        Text { text: "AntiJanja"; font-size: 15px; font-weight: 800; letter-spacing: -0.3px; color: Theme.fg; vertical-alignment: center; }
+        HorizontalLayout {
+            padding-left: 16px;
+            spacing: 4px;
+            alignment: start;
+            VerticalLayout {
+                alignment: center;
+                Tab { label: "Início"; target: "home"; }
+            }
+            if App.live : VerticalLayout {
+                alignment: center;
+                Tab { label: "Transmitindo"; target: "host"; live-dot: true; count: App.host-viewers; }
+            }
+            VerticalLayout {
+                alignment: center;
+                Tab { label: "Assistindo"; target: "watch"; count: App.watch-count; }
+            }
+        }
+        Rectangle { }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 7px;
+                    height: 7px;
+                    border-radius: 3.5px;
+                    background: App.net == "ok" ? Theme.live : App.net == "err" ? Theme.destructive : Theme.warn;
+                }
+            }
+            Text {
+                text: App.net == "ok" ? "Rede P2P conectada" : App.net == "err" ? "Sem rede P2P" : "Entrando na rede P2P";
+                font-size: 12px;
+                color: Theme.muted-fg;
+                vertical-alignment: center;
+            }
+            VerticalLayout {
+                alignment: center;
+                Btn {
+                    width: 32px;
+                    height: 32px;
+                    kind: "ghost";
+                    icon-only: true;
+                    icon: Theme.dark ? @image-url("icons/sun.svg") : @image-url("icons/moon.svg");
+                    has-icon: true;
+                    accessible-label: Theme.dark ? "Usar tema claro" : "Usar tema escuro";
+                    clicked => { App.toggle-theme(); }
+                }
+            }
+        }
+    }
+}
+
+component Toasts inherits VerticalLayout {
+    spacing: 8px;
+    alignment: start;
+    for t in App.toasts : HorizontalLayout {
+        alignment: center;
+        Rectangle {
+            width: Math.min(row.preferred-width, 520px);
+            height: 44px;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: Theme.card;
+            drop-shadow-blur: 18px;
+            drop-shadow-offset-y: 4px;
+            drop-shadow-color: #00000040;
+            row := HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 16px;
+                spacing: 10px;
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        background: t.kind == "err" ? Theme.destructive : t.kind == "ok" ? Theme.live : Theme.muted-fg;
+                    }
+                }
+                Text {
+                    text: t.text;
+                    font-size: 13px;
+                    color: Theme.fg;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+        }
+    }
+}
+
+component UpdateOverlay inherits Rectangle {
+    background: Theme.bg.with-alpha(0.97);
+    TouchArea { }
+    VerticalLayout {
+        alignment: center;
+        HorizontalLayout {
+            alignment: center;
+            VerticalLayout {
+                width: 320px;
+                spacing: 16px;
+                HorizontalLayout {
+                    alignment: center;
+                    Icon {
+                        source: @image-url("icons/download.svg");
+                        tint: Theme.primary;
+                        width: 32px;
+                        height: 32px;
+                    }
+                }
+                VerticalLayout {
+                    spacing: 4px;
+                    Text { text: "Atualizando para a versão " + App.update-version; font-size: 15px; font-weight: 600; color: Theme.fg; horizontal-alignment: center; }
+                    Text { text: "O AntiJanja reinicia sozinho quando terminar."; font-size: 13px; color: Theme.muted-fg; horizontal-alignment: center; }
+                }
+                Rectangle {
+                    height: 6px;
+                    border-radius: 3px;
+                    background: Theme.muted;
+                    clip: true;
+                    Rectangle {
+                        x: App.update-progress < 0 ? (parent.width * 1.3) * Math.mod(animation-tick() / 1.4s, 1) - parent.width * 0.3 : 0;
+                        width: App.update-progress < 0 ? parent.width * 0.3 : parent.width * App.update-progress;
+                        height: 100%;
+                        border-radius: 3px;
+                        background: Theme.primary;
+                    }
+                }
+                if App.update-progress >= 0 : Text {
+                    text: Math.round(App.update-progress * 100) + "%";
+                    font-size: 12px;
+                    color: Theme.muted-fg;
+                    font-family: Theme.mono;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: App.title;
+    icon: @image-url("../assets/icons/128x128.png");
+    preferred-width: 1200px;
+    preferred-height: 780px;
+    min-width: 940px;
+    min-height: 620px;
+    background: Theme.bg;
+    default-font-family: Theme.sans;
+
+    changed width => { App.layout-changed(); }
+    changed height => { App.layout-changed(); }
+
+    keys := FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.F11) {
+                App.key-f11();
+                return accept;
+            }
+            if (e.text == Key.Escape) {
+                App.key-escape();
+                return accept;
+            }
+            reject
+        }
+
+        VerticalLayout {
+            if !App.fullscreen : TopBar { }
+            Rectangle {
+                vertical-stretch: 1;
+                if App.view == "home" : HomeView { }
+                if App.view == "host" : HostView { }
+                if App.view == "watch" : WatchView { }
+            }
+        }
+    }
+
+    if App.picker != "" : SourcePicker {
+        width: 100%;
+        height: 100%;
+    }
+
+    Toasts {
+        x: 0;
+        y: 56px;
+        width: root.width;
+    }
+
+    if App.update-version != "" : UpdateOverlay {
+        width: 100%;
+        height: 100%;
+    }
+}

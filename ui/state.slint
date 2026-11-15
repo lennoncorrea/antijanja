@@ -1,0 +1,194 @@
+// Estado compartilhado entre a interface e o Rust (src/ui.rs).
+// O Rust escreve as propriedades e implementa os callbacks.
+
+export struct Stream {
+    name: string,
+    title: string,
+    code: string,
+    viewers: int,
+    quality: string,
+    since: string,
+    initials: string,
+    cover: int,
+    watching: bool,
+    // Vaga vazia para completar a linha da grade.
+    blank: bool,
+}
+
+export struct StreamRow {
+    items: [Stream],
+}
+
+export struct WatchingItem {
+    id: string,
+    name: string,
+    initials: string,
+    cover: int,
+    detail: string,
+}
+
+export struct Source {
+    id: string,
+    name: string,
+    detail: string,
+    thumb: image,
+    has-thumb: bool,
+    is-window: bool,
+    primary: bool,
+    current: bool,
+    blank: bool,
+}
+
+export struct SourceRow {
+    items: [Source],
+}
+
+export struct Peer {
+    id: int,
+    name: string,
+    initials: string,
+    state-text: string,
+    connected: bool,
+}
+
+export struct AudioApp {
+    exe: string,
+    name: string,
+    active: bool,
+}
+
+export struct SelectOption {
+    value: string,
+    label: string,
+}
+
+// Uma transmissão que estou assistindo. x/y/w/h: posição na área dos tiles,
+// calculada no Rust (o player nativo fica exatamente sobre a área de vídeo).
+export struct Tile {
+    id: string,
+    name: string,
+    initials: string,
+    watching: bool,
+    step: int,
+    res: string,
+    rate: string,
+    ping: string,
+    ping-warn: bool,
+    volume: int,
+    muted: bool,
+    chrome: bool,
+    focused: bool,
+    x: length,
+    y: length,
+    w: length,
+    h: length,
+}
+
+export struct Toast {
+    id: int,
+    text: string,
+    kind: string,
+}
+
+export global App {
+    // ----------------------------------------------------------------- geral
+    in property <string> title: "AntiJanja";
+    in property <string> view: "home";
+    in property <string> net: "pending";
+    in property <bool> fullscreen;
+    in property <bool> live;
+    in property <int> host-viewers;
+    in property <int> watch-count;
+    in-out property <string> my-name;
+    callback navigate(string);
+    callback toggle-theme();
+    callback name-edited(string);
+    callback layout-changed();
+    callback key-f11();
+    callback key-escape();
+
+    // ---------------------------------------------------------------- Início
+    in property <bool> public-loading: true;
+    in property <bool> public-busy;
+    in property <int> public-count;
+    in property <int> public-watching;
+    in property <bool> public-mine;
+    in property <string> public-updated: "Atualizar";
+    in property <bool> has-featured;
+    in property <Stream> featured;
+    in property <[StreamRow]> rows;
+    in property <[WatchingItem]> watching-list;
+    callback refresh-public();
+    callback watch(string);
+    callback copy-code(string);
+    callback join(string);
+    callback paste-join();
+
+    // ------------------------------------------------- Configurações da transmissão
+    in property <string> s-res: "1080";
+    in property <string> s-fps: "60";
+    in property <string> s-bitrate: "0";
+    in property <bool> s-cursor: true;
+    in property <string> s-audio-mode: "system";
+    in property <string> s-audio-app;
+    in property <string> s-abitrate: "192";
+    in property <int> s-volume: 100;
+    in property <bool> s-public: true;
+    in property <[AudioApp]> apps;
+    // Mesma lista, pronta para o seletor ("Discord · tocando agora").
+    in property <[SelectOption]> app-options;
+    callback set-setting(string, string);
+    callback refresh-apps();
+
+    // --------------------------------------------------------------- Seletor
+    in property <string> picker;
+    in property <string> picker-tab: "monitor";
+    in property <bool> sources-loading;
+    in property <[SourceRow]> source-rows;
+    in property <int> count-monitors;
+    in property <int> count-windows;
+    in property <string> picker-selected;
+    callback open-picker(string);
+    callback close-picker();
+    callback picker-refresh();
+    callback picker-tab-changed(string);
+    callback picker-select(string);
+    callback picker-confirm(string);
+
+    // ----------------------------------------------------------- Transmitindo
+    in property <string> source-name;
+    in property <image> preview;
+    in property <bool> has-preview;
+    in property <bool> has-info;
+    in property <string> stat-res;
+    in property <string> stat-fps;
+    in property <string> stat-rate;
+    in property <bool> hardware;
+    in property <string> encoder-line;
+    in property <string> encoder-detail;
+    in property <string> code;
+    in property <string> code-prefix;
+    in property <string> code-body;
+    in property <[Peer]> peers;
+    in property <string> audio-status: "Sem áudio";
+    in property <string> audio-status-kind;
+    in property <float> audio-level;
+    callback stop-sharing();
+    callback new-code();
+    callback copy-my-code();
+    callback kick(int);
+
+    // -------------------------------------------------------------- Assistindo
+    in property <[Tile]> tiles;
+    in property <bool> has-focus;
+    callback leave(string);
+    callback toggle-focus(string);
+    callback set-volume(string, int);
+    callback toggle-mute(string);
+    callback unfocus();
+
+    // ------------------------------------------------- Avisos e atualização
+    in property <[Toast]> toasts;
+    in property <string> update-version;
+    in property <float> update-progress: -1;
+}

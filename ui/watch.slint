@@ -1,0 +1,280 @@
+// Assistindo: várias transmissões lado a lado.
+// A posição de cada tile vem do Rust, que põe o player nativo exatamente sobre a
+// área de vídeo. Por isso as alturas do cabeçalho (44) e do rodapé (40) são fixas.
+import { Theme } from "theme.slint";
+import { App, Tile } from "state.slint";
+import { Badge, Btn, Cover, EmptyState, Icon, Slider, Spinner, TextField } from "widgets.slint";
+
+component AddBar inherits Rectangle {
+    height: 60px;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 12px;
+        Text { text: "Assistindo"; font-size: 16px; font-weight: 600; color: Theme.fg; vertical-alignment: center; }
+        if App.watch-count > 0 : VerticalLayout {
+            alignment: center;
+            Badge { text: App.watch-count; }
+        }
+        if App.has-focus : VerticalLayout {
+            alignment: center;
+            Btn {
+                height: 32px;
+                kind: "outline";
+                font-size: 13px;
+                pad: 12px;
+                text: "Ver todas";
+                icon: @image-url("icons/grid.svg");
+                has-icon: true;
+                icon-size: 14px;
+                clicked => { App.unfocus(); }
+            }
+        }
+        Rectangle { }
+        VerticalLayout {
+            alignment: center;
+            HorizontalLayout {
+                spacing: 8px;
+                code := TextField {
+                    width: 340px;
+                    mono: true;
+                    placeholder: "Cole outro código (AJ2.)";
+                    accepted(t) => {
+                        App.join(t);
+                        self.text = "";
+                    }
+                }
+                Btn {
+                    width: 40px;
+                    kind: "outline";
+                    icon-only: true;
+                    icon: @image-url("icons/paste.svg");
+                    has-icon: true;
+                    accessible-label: "Colar e entrar";
+                    clicked => { App.paste-join(); }
+                }
+                Btn {
+                    kind: "primary";
+                    text: "Adicionar";
+                    icon: @image-url("icons/plus.svg");
+                    has-icon: true;
+                    clicked => {
+                        if (code.text != "") {
+                            App.join(code.text);
+                            code.text = "";
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component Step inherits HorizontalLayout {
+    in property <string> label;
+    // 0 = feito, 1 = agora, 2 = depois
+    in property <int> phase;
+    spacing: 10px;
+    alignment: start;
+    VerticalLayout {
+        alignment: center;
+        Rectangle {
+            width: 16px;
+            height: 16px;
+            if root.phase == 0 : Icon {
+                source: @image-url("icons/check.svg");
+                tint: Theme.live-text;
+            }
+            if root.phase == 1 : Spinner { }
+            if root.phase == 2 : Rectangle {
+                x: 5px;
+                y: 5px;
+                width: 6px;
+                height: 6px;
+                border-radius: 3px;
+                background: Theme.muted-fg.with-alpha(0.4);
+            }
+        }
+    }
+    Text {
+        text: root.label;
+        font-size: 13px;
+        color: root.phase == 1 ? Theme.fg : Theme.muted-fg;
+        vertical-alignment: center;
+    }
+}
+
+component TileView inherits Rectangle {
+    in property <Tile> t;
+    property <bool> bare: App.fullscreen;
+    background: Theme.card;
+    border-radius: bare ? 0px : 12px;
+    border-width: bare ? 0px : 1px;
+    border-color: Theme.border;
+    clip: true;
+    VerticalLayout {
+        if root.t.chrome : Rectangle {
+            height: 44px;
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Theme.border;
+            }
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 6px;
+                spacing: 10px;
+                VerticalLayout {
+                    alignment: center;
+                    Cover {
+                        width: 28px;
+                        height: 28px;
+                        border-radius: 14px;
+                        initials: root.t.initials;
+                        text-size: 11px;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Text { text: root.t.name; font-size: 13px; font-weight: 600; color: Theme.fg; overflow: elide; }
+                    Text {
+                        text: root.t.watching ? "Ao vivo, P2P" : "Entrando";
+                        font-size: 12px;
+                        color: root.t.watching ? Theme.live-text : Theme.muted-fg;
+                    }
+                }
+                Rectangle { }
+                if root.t.watching && root.t.res != "" && root.width > 480px : VerticalLayout {
+                    alignment: center;
+                    HorizontalLayout {
+                        spacing: 4px;
+                        Badge { text: root.t.res; }
+                        Badge { text: root.t.rate; }
+                        if root.t.ping != "" : Badge {
+                            text: root.t.ping;
+                            bg: root.t.ping-warn ? Theme.warn : Theme.muted;
+                            ink: root.t.ping-warn ? #000000 : Theme.fg;
+                        }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    HorizontalLayout {
+                        spacing: 2px;
+                        Btn {
+                            width: 32px;
+                            height: 32px;
+                            kind: "ghost";
+                            icon-only: true;
+                            icon: root.t.focused ? @image-url("icons/minimize.svg") : @image-url("icons/maximize.svg");
+                            has-icon: true;
+                            accessible-label: root.t.focused ? "Voltar para a grade" : "Ampliar";
+                            clicked => { App.toggle-focus(root.t.id); }
+                        }
+                        Btn {
+                            width: 32px;
+                            height: 32px;
+                            kind: "ghost";
+                            icon-only: true;
+                            icon: @image-url("icons/x.svg");
+                            has-icon: true;
+                            accessible-label: "Parar de assistir";
+                            clicked => { App.leave(root.t.id); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Área de vídeo: o player nativo fica por cima quando conectado.
+        Rectangle {
+            vertical-stretch: 1;
+            background: root.t.watching ? #000000 : Theme.bg;
+            if !root.t.watching : VerticalLayout {
+                alignment: center;
+                HorizontalLayout {
+                    alignment: center;
+                    VerticalLayout {
+                        spacing: 10px;
+                        Step { label: "Preparando a conexão"; phase: root.t.step > 0 ? 0 : root.t.step == 0 ? 1 : 2; }
+                        Step { label: "Mandando o pedido pela rede P2P"; phase: root.t.step > 1 ? 0 : root.t.step == 1 ? 1 : 2; }
+                        Step { label: "Esperando o host responder"; phase: root.t.step > 2 ? 0 : root.t.step == 2 ? 1 : 2; }
+                        Step { label: "Conectando direto ao host"; phase: root.t.step > 3 ? 0 : root.t.step == 3 ? 1 : 2; }
+                    }
+                }
+            }
+        }
+
+        if root.t.chrome && root.t.watching : Rectangle {
+            height: 40px;
+            Rectangle {
+                y: 0;
+                height: 1px;
+                background: Theme.border;
+            }
+            HorizontalLayout {
+                padding-left: 6px;
+                padding-right: 12px;
+                spacing: 10px;
+                alignment: start;
+                VerticalLayout {
+                    alignment: center;
+                    Btn {
+                        width: 32px;
+                        height: 32px;
+                        kind: "ghost";
+                        icon-only: true;
+                        icon: root.t.muted || root.t.volume == 0 ? @image-url("icons/volume-x.svg") : @image-url("icons/volume.svg");
+                        has-icon: true;
+                        accessible-label: root.t.muted ? "Ativar som" : "Silenciar";
+                        clicked => { App.toggle-mute(root.t.id); }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Slider {
+                        width: 128px;
+                        value: root.t.muted ? 0 : root.t.volume;
+                        changed(v) => { App.set-volume(root.t.id, v); }
+                    }
+                }
+                Text {
+                    text: (root.t.muted ? 0 : root.t.volume) + "%";
+                    font-size: 12px;
+                    color: Theme.muted-fg;
+                    font-family: Theme.mono;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
+
+export component WatchView inherits Rectangle {
+    VerticalLayout {
+        if !App.fullscreen : AddBar { }
+        Rectangle {
+            vertical-stretch: 1;
+            if App.tiles.length == 0 : VerticalLayout {
+                alignment: center;
+                padding: 24px;
+                HorizontalLayout {
+                    alignment: center;
+                    EmptyState {
+                        width: 420px;
+                        icon: @image-url("icons/tv.svg");
+                        title: "Nenhuma transmissão aberta";
+                        body: "Cole um código acima para assistir. Dá para abrir várias ao mesmo tempo, e elas aparecem lado a lado.";
+                    }
+                }
+            }
+            for t in App.tiles : TileView {
+                x: t.x;
+                y: t.y;
+                width: t.w;
+                height: t.h;
+                t: t;
+            }
+        }
+    }
+}
