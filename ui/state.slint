@@ -64,8 +64,19 @@ export struct SelectOption {
 
 // Uma transmissão que estou assistindo. x/y/w/h: posição na área dos tiles,
 // calculada no Rust (o player nativo fica exatamente sobre a área de vídeo).
+// Opção de um menu de escolha (fps, qualidade). `tag` = selo (ex.: "FG 2x").
+export struct MenuOption {
+    value: string,
+    label: string,
+    tag: string,
+    note: string,
+    selected: bool,
+}
+
 export struct Tile {
     id: string,
+    // Multiplicador da geração de quadros ativa ("2x"), vazio se desligada.
+    gen-tag: string,
     name: string,
     initials: string,
     watching: bool,
@@ -194,6 +205,24 @@ export global App {
     in property <bool> framegen-available;
     in property <string> view-fps: "0";
     callback set-view-fps(string);
+    // Menu de engrenagem de uma stream (posição calculada no Rust, que também abre
+    // um buraco na janela do vídeo para o menu aparecer por cima).
+    in property <string> menu-tile;
+    in property <string> menu-panel: "main";
+    in property <length> menu-x;
+    in property <length> menu-y;
+    in property <length> menu-h;
+    in property <[MenuOption]> menu-fps;
+    in property <[MenuOption]> menu-quality;
+    in property <string> menu-fps-label;
+    in property <string> menu-quality-label;
+    in property <string> menu-gen-tag;
+    in property <string> menu-info;
+    in property <string> menu-fps-hint;
+    callback toggle-menu(string);
+    callback close-menu();
+    callback menu-go(string);
+    callback pick-quality(string);
     callback unfocus();
 
     // ------------------------------------------------- Avisos e atualização

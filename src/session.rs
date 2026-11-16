@@ -868,12 +868,23 @@ pub async fn viewer_leave(app: AppHandle, id: String) {
 }
 
 /// Área de vídeo de uma stream em pixels físicos (relativos à janela). Thread principal.
-pub fn player_rect(id: String, x: i32, y: i32, width: i32, height: i32, visible: bool) {
+/// `hole`: retângulo (relativo ao vídeo) recortado para um menu aparecer por cima.
+pub fn player_rect(id: String, x: i32, y: i32, width: i32, height: i32, visible: bool, hole: Option<(i32, i32, i32, i32)>) {
     with_viewers(|m| {
         if let Some(p) = m.get(&id).and_then(|v| v.player.as_ref()) {
             p.set_rect(x, y, width, height, visible);
+            p.set_hole(hole);
         }
     });
+}
+
+/// Qualidade pedida ao host para uma stream ("auto" ou a altura, ex. "720").
+pub fn viewer_quality(id: &str, quality: &str) {
+    let session = with_viewers(|m| m.get(id).and_then(|v| v.session.clone()));
+    if let Some(s) = session {
+        let msg = serde_json::json!({ "t": "quality", "q": quality }).to_string();
+        transport::spawn(async move { s.send_message(&msg).await });
+    }
 }
 
 /// fps para assistir uma stream (0 = o da stream).
