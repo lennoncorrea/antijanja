@@ -83,7 +83,7 @@ struct HostSession {
     opus: Arc<Mutex<OpusEncoder>>,
     peers: Arc<Mutex<HashMap<u64, PeerEntry>>>,
     media_tx: tokio::sync::mpsc::Sender<Media>,
-    on_offer: Arc<dyn Fn(u8, String) + Send + Sync>,
+    on_offer: rendezvous::OfferFn,
     public: Option<rendezvous::PublicAnnouncer>,
     since: i64,
 }
@@ -242,12 +242,12 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
     let audio = start_audio(&app, &config, opus.clone(), media_tx.clone());
 
     // Pedidos de conexão vindos da DHT.
-    let on_offer: Arc<dyn Fn(u8, String) + Send + Sync> = {
+    let on_offer: rendezvous::OfferFn = {
         let app = app.clone();
         let peers = peers.clone();
         let video = video.clone();
         let offers: Offers = Arc::new(Mutex::new(HashMap::new()));
-        Arc::new(move |slot: u8, payload: String| {
+        Arc::new(move |code: &str, slot: u8, payload: String| {
             let Ok(msg) = serde_json::from_str::<serde_json::Value>(&payload) else { return };
             let (Some(sdp), Some(sid)) = (msg["sdp"].as_str(), msg["sid"].as_str()) else { return };
             if msg["t"] != "offer" {
@@ -258,9 +258,8 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
                 // Oferta repetida: o espectador não recebeu a resposta (a DHT perdeu ou
                 // ainda não propagou). Publica a mesma resposta de novo.
                 Some(Some((reply_slot, answer))) => {
-                    let (reply_slot, answer, app) = (*reply_slot, answer.clone(), app.clone());
+                    let (reply_slot, answer, app, code) = (*reply_slot, answer.clone(), app.clone(), code.to_string());
                     drop(map);
-                    let Some(code) = HOST.lock().unwrap().as_ref().map(|h| h.code.clone()) else { return };
                     std::thread::spawn(move || {
                         let _ = rendezvous::host_reply(&app.rdv(), &code, reply_slot, &answer);
                     });
@@ -274,8 +273,8 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
                     drop(map);
                     let name: String = msg["name"].as_str().unwrap_or("Espectador").chars().take(40).collect();
                     let (app, peers, video, offers) = (app.clone(), peers.clone(), video.clone(), offers.clone());
-                    let (sdp, sid) = (sdp.to_string(), sid.to_string());
-                    transport::spawn(async move { accept_viewer(app, peers, video, offers, slot, sid, sdp, name).await });
+                    let (sdp, sid, code) = (sdp.to_string(), sid.to_string(), code.to_string());
+                    transport::spawn(async move { accept_viewer(app, peers, video, offers, code, slot, sid, sdp, name).await });
                 }
             }
         })
@@ -304,6 +303,9 @@ async fn accept_viewer(
     peers: Arc<Mutex<HashMap<u64, PeerEntry>>>,
     video: VideoPipeline,
     offers: Offers,
+    // Código em que o pedido chegou: a resposta vai por ele, mesmo que o host
+    // tenha gerado um código novo nesse meio tempo.
+    code: String,
     slot: u8,
     sid: String,
     sdp: String,
@@ -376,7 +378,6 @@ async fn accept_viewer(
     peers.lock().unwrap().insert(id, PeerEntry { name: name.clone(), state: "connecting", peer: peer.clone(), sid: sid.clone() });
     emit_peers(&app, &peers);
 
-    let Some(code) = HOST.lock().unwrap().as_ref().map(|h| h.code.clone()) else { return };
     let host_name = HOST.lock().unwrap().as_ref().map(|h| h.config.name.clone()).unwrap_or_default();
     let payload = serde_json::json!({ "t": "answer", "sid": sid, "sdp": answer, "name": host_name }).to_string();
     offers.lock().unwrap().insert(sid.clone(), Some((slot, payload.clone())));

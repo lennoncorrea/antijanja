@@ -706,8 +706,8 @@ fn join_with_code(c: &mut Ctl, ui: &AppWindow, raw: &str) {
     if code.is_empty() {
         return toast(c, ui, "err", "Cole o código da transmissão primeiro.");
     }
-    if !code.starts_with("AJ2.") {
-        return toast(c, ui, "err", "Esse não é um código do AntiJanja. Ele começa com AJ2.");
+    if let Err(e) = rendezvous::check_code(&code) {
+        return toast(c, ui, "err", e);
     }
     if c.live && c.code == code {
         return toast(c, ui, "err", "Esse é o código da sua própria transmissão.");

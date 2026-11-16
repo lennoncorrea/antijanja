@@ -12,9 +12,16 @@ Compartilhamento de tela **100% P2P**, sem servidor central e sem conta.
 | Encontro dos peers | DHT Mainline do BitTorrent (BEP44), usada como "caixa postal" criptografada — em Rust |
 | Descoberta de IP público | STUN público (só informa o IP; nenhum dado de vídeo passa por ele) |
 
-O código `AJ2.…` carrega 32 bytes aleatórios. Dele o app deriva as chaves de assinatura e a chave
-de criptografia (ChaCha20-Poly1305) das mensagens trocadas na DHT. Os nós da DHT só veem dados
-criptografados; sem o código ninguém lê ou forja mensagens.
+O código `AJ3.…` é a chave pública (Ed25519) de um par sorteado pelo host a cada código. Dele o
+app deriva a chave dos espectadores e a chave de criptografia (ChaCha20-Poly1305) das mensagens
+trocadas na DHT. Os nós da DHT só veem dados criptografados; sem o código ninguém lê nem envia
+mensagens. A chave privada fica só no computador do host: quem tem o código pode pedir para
+assistir, mas não consegue responder no lugar do host.
+
+**Lista pública:** cada entrada é assinada pela chave do host da transmissão anunciada (ninguém
+anuncia, encerra ou renomeia a transmissão de outra pessoa) e as vagas mudam de endereço a cada
+10 min (quem travar uma vaga só a trava até a próxima troca). Sem servidor, não dá para impedir
+que alguém sobrescreva vagas sem parar.
 
 1. O host gera o código e fica consultando a DHT.
 2. O espectador cola o código, cria uma oferta WebRTC e a publica na DHT.
