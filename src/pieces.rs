@@ -396,6 +396,90 @@ impl Assembler {
     }
 }
 
+/// Quanto um quadro que falta pode demorar (os seguintes esperando) antes de ser dado como
+/// perdido. Pedaços chegam fora de ordem: o quadro 11 pode fechar antes do 10.
+pub const ORDER_WAIT: Duration = Duration::from_millis(60);
+
+/// Entrega os quadros de vídeo na ordem para o decoder. Um quadro perdido estraga os
+/// seguintes (eles dependem dele): aí descarta até o próximo keyframe e avisa que precisa
+/// de um (as mesmas regras do caminho RTP).
+pub struct Ordered {
+    next: Option<u32>,
+    ready: BTreeMap<u32, Frame>,
+    /// Faltou um quadro: descarta até o próximo keyframe. Começa assim (espera o primeiro).
+    broken: bool,
+    waiting_since: Option<Instant>,
+    /// Quadros dados como perdidos.
+    pub lost: u64,
+}
+
+impl Default for Ordered {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Ordered {
+    pub fn new() -> Self {
+        Self { next: None, ready: BTreeMap::new(), broken: true, waiting_since: None, lost: 0 }
+    }
+
+    pub fn needs_keyframe(&self) -> bool {
+        self.broken
+    }
+
+    /// Quadro refeito pelo montador. Devolve os que já podem ir para o decoder, na ordem.
+    pub fn push(&mut self, f: Frame, now: Instant) -> Vec<Frame> {
+        let next = *self.next.get_or_insert(f.frame);
+        if f.frame >= next {
+            self.ready.insert(f.frame, f);
+        }
+        self.drain(now)
+    }
+
+    /// Chamar de tempos em tempos: desiste de quadros que não chegaram a tempo.
+    pub fn tick(&mut self, now: Instant) -> Vec<Frame> {
+        self.drain(now)
+    }
+
+    fn drain(&mut self, now: Instant) -> Vec<Frame> {
+        let mut out = vec![];
+        loop {
+            let Some(next) = self.next else { break };
+            if let Some(f) = self.ready.remove(&next) {
+                self.next = Some(next.wrapping_add(1));
+                self.waiting_since = None;
+                if f.keyframe {
+                    self.broken = false;
+                }
+                if !self.broken {
+                    out.push(f);
+                }
+                continue;
+            }
+            let Some((&first, _)) = self.ready.iter().next() else { break };
+            // Falta `next` e há quadros depois dele. Um keyframe adiante resolve na hora
+            // (os que faltam antes dele não fazem mais diferença); senão espera um pouco.
+            let keyframe_ahead = self.ready.iter().find(|(_, f)| f.keyframe).map(|(&n, _)| n);
+            let since = *self.waiting_since.get_or_insert(now);
+            let to = match keyframe_ahead {
+                Some(k) => k,
+                None if now.saturating_duration_since(since) >= ORDER_WAIT => first,
+                None => break,
+            };
+            self.lost += to.wrapping_sub(next) as u64;
+            // Quadros completos antes do keyframe não servem mais (dependem dos perdidos).
+            self.ready.retain(|&n, _| n >= to);
+            if keyframe_ahead.is_none() {
+                self.broken = true;
+            }
+            self.next = Some(to);
+            self.waiting_since = None;
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +505,57 @@ mod tests {
             x ^= x << 5;
             v.swap(i, x as usize % (i + 1));
         }
+    }
+
+    fn vf(n: u32, keyframe: bool) -> Frame {
+        Frame { kind: KIND_VIDEO, rendition: 0, frame: n, ts: n * 1500, keyframe, data: vec![n as u8] }
+    }
+
+    fn nums(v: &[Frame]) -> Vec<u32> {
+        v.iter().map(|f| f.frame).collect()
+    }
+
+    #[test]
+    fn ordered_waits_for_the_first_keyframe_then_delivers_in_order() {
+        let mut o = Ordered::new();
+        let t = Instant::now();
+        assert!(o.push(vf(0, false), t).is_empty(), "sem keyframe ainda: descarta");
+        assert!(o.needs_keyframe());
+        assert_eq!(nums(&o.push(vf(1, true), t)), vec![1]);
+        assert!(!o.needs_keyframe());
+        // 3 fecha antes do 2: segura o 3 até o 2 chegar.
+        assert!(o.push(vf(3, false), t).is_empty());
+        assert_eq!(nums(&o.push(vf(2, false), t)), vec![2, 3]);
+    }
+
+    #[test]
+    fn ordered_gives_up_on_a_missing_frame_and_waits_for_a_keyframe() {
+        let mut o = Ordered::new();
+        let t = Instant::now();
+        o.push(vf(0, true), t);
+        assert!(o.push(vf(2, false), t).is_empty(), "o 1 ainda pode chegar");
+        assert!(o.tick(t + ORDER_WAIT / 2).is_empty());
+        // Passou o prazo: o 1 se perdeu; o 2 e os seguintes dependem dele.
+        assert!(o.tick(t + ORDER_WAIT).is_empty());
+        assert!(o.needs_keyframe());
+        assert_eq!(o.lost, 1);
+        assert!(o.push(vf(3, false), t + ORDER_WAIT).is_empty());
+        assert_eq!(nums(&o.push(vf(4, true), t + ORDER_WAIT)), vec![4]);
+        assert!(!o.needs_keyframe());
+    }
+
+    #[test]
+    fn ordered_jumps_to_a_keyframe_without_waiting() {
+        let mut o = Ordered::new();
+        let t = Instant::now();
+        o.push(vf(0, true), t);
+        // 1 e 2 sumiram, o keyframe 3 chegou: não precisa esperar pelos que faltam.
+        assert_eq!(nums(&o.push(vf(3, true), t)), vec![3]);
+        assert_eq!(o.lost, 2);
+        assert!(!o.needs_keyframe());
+        // Um atrasado de antes do keyframe é ignorado.
+        assert!(o.push(vf(1, false), t).is_empty());
+        assert_eq!(nums(&o.push(vf(4, false), t)), vec![4]);
     }
 
     #[test]

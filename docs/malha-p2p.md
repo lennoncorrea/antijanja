@@ -106,7 +106,24 @@ ordem e sem reenvio, pedaços de 1.100 bytes a 60 fps):
 O canal aguenta o vídeo. Falta ver o comportamento numa rede real (o SCTP tem controle de
 congestionamento próprio); isso entra na etapa 1.
 
-### Etapa 1: pedaços codificados do host para o espectador (sem malha)
+### Etapa 1: pedaços codificados do host para o espectador (sem malha) — em andamento
+
+Feito:
+
+- `src/pieces.rs`: codificador e montador (blocos de até 64 pedaços: o plano do RaptorQ
+  para k=273 custava 66 ms na primeira vez; com blocos, um keyframe de 300 KB codifica em
+  ~1,5 ms) e `Ordered` (entrega na ordem, espera 60 ms por atrasados, pula para o próximo
+  keyframe quando perde um quadro).
+- Transporte: canal "aj-p"; o host manda pedaços quando `USE_PIECES` está ligado
+  (`AJ_PIECES=1`) e o espectador tem o canal; senão RTP. Cada mensagem leva um número
+  sequencial do canal (perda medida por ele, no relatório "rr" de sempre).
+- Teste `loopback_pieces` (vídeo real 720p60, 240 quadros): 240/240 decodificados sem
+  perda e com 5% dos pedaços perdidos (perda medida 5,2%; nenhum keyframe extra pedido).
+- App de verdade (autoteste): 1080p60 pelos pedaços, buffer 12 ms, framegen a 120 fps.
+
+Falta: opção na interface, teste numa rede real (entre dois PCs) e o áudio (segue RTP).
+
+Plano original da etapa:
 
 - `src/pieces.rs`: quadro → pedaços (codificador) e pedaços → quadro (montador), com
   folga, limite de memória e descarte de quadros velhos. Testes sem rede: perder qualquer

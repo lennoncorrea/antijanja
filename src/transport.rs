@@ -5,6 +5,9 @@
 //!   O encoder roda uma vez só e os pacotes são distribuídos para todos.
 //! - Espectador: recebe RTP, remonta os quadros H.264 e entrega Opus cru.
 //! - Canal de dados "aj": pedidos de keyframe e aviso de saída.
+//! - Canal de dados "aj-p" (malha P2P, etapa 1; docs/malha-p2p.md): o vídeo em pedaços
+//!   codificados (`pieces`), fora de ordem e sem reenvio, no lugar da faixa RTP de vídeo.
+//!   Liga com USE_PIECES; espectador sem esse canal (versão antiga) continua no RTP.
 
 use bytes::{Bytes, BytesMut};
 use rtc::interceptor::Registry;
@@ -47,6 +50,8 @@ pub static BROKEN_FRAMES: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 pub static KEYFRAME_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Só para testes: embaralha a ordem de chegada (por mil pacotes), simulando rede real.
 pub static TEST_REORDER_PERMILLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Testes: descarta essa fração (por mil) dos pedaços que chegam ao espectador.
+pub static TEST_PIECE_LOSS_PERMILLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const OPUS_PT: u8 = 111;
 const ICE_TIMEOUT: Duration = Duration::from_secs(4);
 const RTP_MTU: usize = 1200;
@@ -57,6 +62,14 @@ const MIN_PACING_BPS: u64 = 2_000_000;
 const PACER_BURST: Duration = Duration::from_millis(5);
 /// Quadros esperando no pacer (~0,75 s a 60 fps). Cheio: a rede não está dando conta.
 const PACER_QUEUE: usize = 45;
+/// Canal de dados dos pedaços.
+const PIECES_LABEL: &str = "aj-p";
+/// Folga de pedaços extras no caminho direto host → espectador (o RTP tem retransmissão;
+/// os pedaços não, a folga faz esse papel). Keyframes: o dobro (ver `pieces::overhead_for`).
+const PIECE_OVERHEAD: f32 = 0.25;
+/// Vídeo em pedaços pelo canal de dados em vez de RTP (malha, etapa 1). Desligado por
+/// padrão; a sessão liga com AJ_PIECES=1.
+pub static USE_PIECES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn runtime() -> Arc<dyn Runtime> {
     static RT: OnceLock<Arc<dyn Runtime>> = OnceLock::new();
@@ -244,6 +257,32 @@ async fn pace(video: Arc<TrackLocalStaticRTP>, mut rx: tokio::sync::mpsc::Receiv
     }
 }
 
+/// Como `pace`, para os pedaços. Cada mensagem leva na frente um número sequencial do
+/// canal (4 bytes): quem recebe mede a perda por ele.
+async fn pace_pieces(slot: Arc<Mutex<Option<Arc<dyn DataChannel>>>>, mut rx: tokio::sync::mpsc::Receiver<Vec<Vec<u8>>>, rate: Arc<AtomicU64>) {
+    let mut next = tokio::time::Instant::now();
+    let mut seq: u32 = 0;
+    while let Some(frame) = rx.recv().await {
+        let Some(dc) = slot.lock().unwrap().clone() else { continue };
+        for piece in frame {
+            let now = tokio::time::Instant::now();
+            if next + PACER_BURST < now {
+                next = now - PACER_BURST;
+            }
+            if next > now {
+                tokio::time::sleep_until(next).await;
+            }
+            let bits = ((piece.len() + 4 + 60) * 8) as f64; // + cabeçalhos SCTP/DTLS/UDP/IP
+            next += Duration::from_secs_f64(bits / rate.load(Ordering::Relaxed).max(1) as f64);
+            let mut b = BytesMut::with_capacity(4 + piece.len());
+            b.extend_from_slice(&seq.to_le_bytes());
+            b.extend_from_slice(&piece);
+            seq = seq.wrapping_add(1);
+            let _ = dc.send(b).await;
+        }
+    }
+}
+
 /* ========================================================================== */
 /*                                   HOST                                      */
 /* ========================================================================== */
@@ -260,6 +299,12 @@ pub struct HostPeer {
     pts: Mutex<Option<(PayloadType, PayloadType)>>,
     senders: Vec<Arc<dyn webrtc::rtp_transceiver::RtpSender>>,
     pub dc: Mutex<Option<Arc<dyn DataChannel>>>,
+    /// Canal dos pedaços (o espectador cria; None = versão antiga, só RTP).
+    pieces_dc: Arc<Mutex<Option<Arc<dyn DataChannel>>>>,
+    piece_tx: tokio::sync::mpsc::Sender<Vec<Vec<u8>>>,
+    /// Número do próximo quadro e timestamp (90 kHz) no caminho por pedaços.
+    piece_state: Mutex<(u32, u32)>,
+    use_pieces: bool,
 }
 
 impl HostPeer {
@@ -272,11 +317,23 @@ impl HostPeer {
     ) -> Res<(Arc<HostPeer>, String)> {
         let (gtx, mut grx) = channel::<()>(1);
         let dc_slot: Arc<Mutex<Option<Arc<dyn DataChannel>>>> = Arc::new(Mutex::new(None));
-        let slot = dc_slot.clone();
+        let pieces_slot: Arc<Mutex<Option<Arc<dyn DataChannel>>>> = Arc::new(Mutex::new(None));
+        let (slot, pslot) = (dc_slot.clone(), pieces_slot.clone());
         let on_dc: Arc<dyn Fn(Arc<dyn DataChannel>) + Send + Sync> = Arc::new(move |dc: Arc<dyn DataChannel>| {
-            *slot.lock().unwrap() = Some(dc.clone());
             let on_message = on_message.clone();
+            let (slot, pslot) = (slot.clone(), pslot.clone());
             spawn(async move {
+                if dc.label().await.ok().as_deref() == Some(PIECES_LABEL) {
+                    *pslot.lock().unwrap() = Some(dc.clone());
+                    // Nada chega por ele no host; só esvazia os eventos.
+                    while let Some(ev) = dc.poll().await {
+                        if matches!(ev, DataChannelEvent::OnClose) {
+                            break;
+                        }
+                    }
+                    return;
+                }
+                *slot.lock().unwrap() = Some(dc.clone());
                 while let Some(ev) = dc.poll().await {
                     match ev {
                         DataChannelEvent::OnMessage(m) => on_message(String::from_utf8_lossy(&m.data).into_owned()),
@@ -314,6 +371,10 @@ impl HostPeer {
         // Até saber o alvo (logo que o espectador entra), solta com folga.
         let pacing_bps = Arc::new(AtomicU64::new(40_000_000));
         spawn(pace(video.clone(), pacer_rx, pacing_bps.clone()));
+        let (piece_tx, piece_rx) = tokio::sync::mpsc::channel(PACER_QUEUE);
+        spawn(pace_pieces(pieces_slot.clone(), piece_rx, pacing_bps.clone()));
+        let mut seed = [0u8; 4];
+        let _ = getrandom::fill(&mut seed);
         let peer = Arc::new(HostPeer {
             pc, audio, assrc,
             packetizer: Mutex::new(packetizer),
@@ -322,6 +383,10 @@ impl HostPeer {
             pts: Mutex::new(None),
             senders: vec![vs, a_s],
             dc: Mutex::new(None),
+            pieces_dc: pieces_slot,
+            piece_tx,
+            piece_state: Mutex::new((0, u32::from_le_bytes(seed))),
+            use_pieces: USE_PIECES.load(Ordering::Relaxed),
         });
         // O canal de dados chega depois; guardamos quando aparecer.
         let p = peer.clone();
@@ -354,6 +419,11 @@ impl HostPeer {
     /// Entrega um quadro ao pacer. `Ok(false)`: a fila do pacer está cheia e o quadro foi
     /// descartado (o espectador vai precisar de um keyframe).
     pub async fn send_video(&self, data: Bytes, duration: Duration) -> Res<bool> {
+        if self.use_pieces {
+            if let Some(r) = self.send_pieces(&data, duration) {
+                return r;
+            }
+        }
         let (vpt, _) = self.payload_types().await.ok_or("sem codec negociado")?;
         let samples = (duration.as_secs_f64() * 90000.0).round() as u32;
         let mut packetizer = self.packetizer.lock().unwrap();
@@ -369,6 +439,29 @@ impl HostPeer {
             p.header.payload_type = vpt;
         }
         Ok(self.pacer.try_send(packets).is_ok())
+    }
+
+    /// Vídeo em pedaços pelo canal "aj-p". None: o espectador não tem esse canal (vai RTP).
+    fn send_pieces(&self, data: &Bytes, duration: Duration) -> Option<Res<bool>> {
+        self.pieces_dc.lock().unwrap().as_ref()?;
+        let samples = (duration.as_secs_f64() * 90000.0).round() as u32;
+        // O número do quadro avança mesmo se ele for descartado: o espectador vê o buraco
+        // e pede keyframe (os seguintes dependem dele).
+        let (frame, ts) = {
+            let mut st = self.piece_state.lock().unwrap();
+            let cur = *st;
+            *st = (cur.0.wrapping_add(1), cur.1.wrapping_add(samples));
+            cur
+        };
+        if self.piece_tx.capacity() == 0 {
+            return Some(Ok(false));
+        }
+        let keyframe = crate::media::has_nal(data, 5);
+        let Some(mut enc) = crate::pieces::FrameEncoder::new(crate::pieces::KIND_VIDEO, 0, frame, ts, data, keyframe, 1) else {
+            return Some(Ok(true));
+        };
+        let pieces = enc.pieces(crate::pieces::overhead_for(keyframe, PIECE_OVERHEAD));
+        Some(Ok(self.piece_tx.try_send(pieces).is_ok()))
     }
 
     /// Bitrate alvo atual do vídeo (b/s): o pacer solta os pacotes com folga sobre ele.
@@ -438,6 +531,13 @@ impl ViewerSession {
         }
         let dc = pc.create_data_channel("aj", None).await.map_err(err)?;
         let _ = dc_cell.set(dc.clone());
+        // Pedaços: fora de ordem e sem reenvio (a folga dos pedaços extras cobre a perda).
+        let init = webrtc::data_channel::RTCDataChannelInit { ordered: false, max_retransmits: Some(0), ..Default::default() };
+        let pdc = pc.create_data_channel(PIECES_LABEL, Some(init)).await.map_err(err)?;
+        {
+            let (s, cell) = (sinks.clone(), dc_cell.clone());
+            spawn(async move { receive_pieces(pdc, s, cell).await });
+        }
         let on_message = sinks.on_message.clone();
         let dcc = dc.clone();
         spawn(async move {
@@ -568,6 +668,80 @@ async fn receive_track(track: Arc<dyn TrackRemote>, sinks: ViewerSinks, dc: Arc<
         if let Some(r) = meter.report(Instant::now(), jb.received, jb.last_ext) {
             if let (Some(dc), Ok(json)) = (dc.get(), serde_json::to_value(r)) {
                 let mut msg = json;
+                msg["t"] = "rr".into();
+                let _ = dc.send_text(&msg.to_string()).await;
+            }
+        }
+    }
+}
+
+/// Recebe o vídeo em pedaços (canal "aj-p"): monta os quadros, entrega na ordem, pede
+/// keyframe quando perde um e manda os relatórios para o bitrate adaptativo do host.
+async fn receive_pieces(pdc: Arc<dyn DataChannel>, sinks: ViewerSinks, dc: Arc<OnceLock<Arc<dyn DataChannel>>>) {
+    use crate::pieces::{Assembler, Header, Ordered, KIND_VIDEO};
+    let mut asm = Assembler::new();
+    let mut ord = Ordered::new();
+    let mut meter = NetMeter::new(Instant::now());
+    let mut last_request = Instant::now() - Duration::from_secs(10);
+    // Perda pelo número sequencial do canal (estendido além dos 32 bits).
+    let (mut received, mut last_seq, mut ext) = (0u64, None::<u32>, 0i64);
+    let mut highest: Option<u64> = None;
+    let mut rng: u32 = 0x2545_f491;
+    loop {
+        // Sem pedaços chegando, ainda acorda para dar quadros atrasados como perdidos.
+        let ev = match tokio::time::timeout(Duration::from_millis(20), pdc.poll()).await {
+            Ok(Some(ev)) => Some(ev),
+            Ok(None) => break,
+            Err(_) => None,
+        };
+        let now = Instant::now();
+        let mut out = vec![];
+        match ev {
+            Some(DataChannelEvent::OnMessage(m)) if m.data.len() > 4 => {
+                let d = &m.data;
+                let loss = TEST_PIECE_LOSS_PERMILLE.load(Ordering::Relaxed);
+                if loss > 0 {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 17;
+                    rng ^= rng << 5;
+                    if rng % 1000 < loss {
+                        continue; // perdido na "rede"
+                    }
+                }
+                let seq = u32::from_le_bytes([d[0], d[1], d[2], d[3]]);
+                if let Some(last) = last_seq {
+                    ext += seq.wrapping_sub(last) as i32 as i64;
+                }
+                last_seq = Some(seq);
+                received += 1;
+                highest = Some(highest.map_or(ext.max(0) as u64, |h| h.max(ext.max(0) as u64)));
+                let piece = &d[4..];
+                if let Some(h) = Header::read(piece) {
+                    meter.on_packet(now, d.len(), h.ts);
+                }
+                if let Some(f) = asm.push(piece, now) {
+                    if f.kind == KIND_VIDEO {
+                        out.extend(ord.push(f, now));
+                    }
+                }
+            }
+            Some(DataChannelEvent::OnClose) => break,
+            _ => {}
+        }
+        out.extend(ord.tick(now));
+        for f in out {
+            (sinks.on_video)(f.data, f.ts);
+        }
+        // Só depois de receber algum pedaço (com o host no RTP, este canal fica mudo).
+        if received > 0 && ord.needs_keyframe() && last_request.elapsed() > KEYFRAME_REQUEST_INTERVAL {
+            last_request = Instant::now();
+            KEYFRAME_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            if let Some(dc) = dc.get() {
+                let _ = dc.send_text(r#"{"t":"kf"}"#).await;
+            }
+        }
+        if let Some(r) = meter.report(now, received, highest) {
+            if let (Some(dc), Ok(mut msg)) = (dc.get(), serde_json::to_value(r)) {
                 msg["t"] = "rr".into();
                 let _ = dc.send_text(&msg.to_string()).await;
             }
@@ -933,6 +1107,108 @@ mod tests {
         }
         let _ = block_on(host.close());
         let _ = block_on(viewer.close());
+    }
+
+    /// Etapa 1 da malha: vídeo codificado de verdade atravessa o WebRTC em pedaços (canal
+    /// "aj-p") e é decodificado do outro lado; depois, com 5% dos pedaços perdidos.
+    /// `cargo test loopback_pieces -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn loopback_pieces() {
+        crate::media::mf_init().unwrap();
+        USE_PIECES.store(true, Ordering::SeqCst);
+        for loss in [0u32, 50] {
+            TEST_PIECE_LOSS_PERMILLE.store(loss, Ordering::SeqCst);
+            KEYFRAME_REQUESTS.store(0, Ordering::SeqCst);
+            let decoded = Arc::new(AtomicUsize::new(0));
+            let corrupt = Arc::new(AtomicUsize::new(0));
+            let (vtx, vrx) = std::sync::mpsc::channel::<(Vec<u8>, u32)>();
+            let sinks = ViewerSinks {
+                on_video: Arc::new(move |f, ts| { let _ = vtx.send((f, ts)); }),
+                on_audio: Arc::new(|_| {}),
+                on_state: Arc::new(|_| {}),
+                on_message: Arc::new(|_| {}),
+            };
+            let (viewer, offer) = block_on(ViewerSession::offer(sinks, false)).expect("oferta");
+            let want_kf = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reports = Arc::new(Mutex::new(Vec::<crate::congestion::Report>::new()));
+            let (wk, rr) = (want_kf.clone(), reports.clone());
+            let (connected_tx, connected_rx) = std::sync::mpsc::channel();
+            let (peer, answer) = block_on(HostPeer::answer(
+                offer,
+                false,
+                Arc::new(move |e| { if e == PeerEvent::Connected { let _ = connected_tx.send(()); } }),
+                Arc::new(move |m| {
+                    if m.contains("\"kf\"") { wk.store(true, Ordering::SeqCst); }
+                    if let Ok(r) = serde_json::from_str::<crate::congestion::Report>(&m) { rr.lock().unwrap().push(r); }
+                }),
+            ))
+            .expect("resposta");
+            block_on(viewer.accept_answer(answer)).expect("aceitar resposta");
+            connected_rx.recv_timeout(Duration::from_secs(10)).expect("não conectou");
+            // Espera o canal dos pedaços chegar no host (antes disso iria por RTP).
+            for _ in 0..100 {
+                if peer.pieces_dc.lock().unwrap().is_some() { break; }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(peer.pieces_dc.lock().unwrap().is_some(), "canal de pedaços não abriu");
+
+            let (d, c) = (decoded.clone(), corrupt.clone());
+            let dec_thread = std::thread::spawn(move || {
+                crate::media::mf_init().unwrap();
+                let mut dec = crate::media::Decoder::new().unwrap();
+                let mut last_ts = None::<u32>;
+                while let Ok((f, ts)) = vrx.recv_timeout(Duration::from_secs(2)) {
+                    // Na ordem: cada timestamp maior que o anterior.
+                    if last_ts.is_some_and(|l| ts.wrapping_sub(l) as i32 <= 0) { c.fetch_add(1, Ordering::SeqCst); }
+                    last_ts = Some(ts);
+                    match dec.decode(&f, 0) {
+                        Ok(frames) => for fr in frames { assert_eq!((fr.width, fr.height), (1280, 720)); d.fetch_add(1, Ordering::SeqCst); },
+                        Err(_) => { c.fetch_add(1, Ordering::SeqCst); }
+                    }
+                }
+            });
+
+            let conv = crate::media::Converter::new(1280, 720, 1280, 720, 60).unwrap();
+            let enc = crate::media::Encoder::new(1280, 720, 60, 4_000_000, true, None).unwrap();
+            let mut enc = enc;
+            let mut img = vec![0u8; 1280 * 720 * 4];
+            let frames = 240u32;
+            for i in 0..frames {
+                if want_kf.swap(false, Ordering::SeqCst) { enc.force_keyframe(); }
+                for (j, px) in img.chunks_exact_mut(4).enumerate() {
+                    px[0] = ((j as u32 + i * 7) % 256) as u8; px[1] = (i % 256) as u8; px[2] = 90; px[3] = 255;
+                }
+                let nv12 = conv.convert(&img, i as i64 * 166_667, 166_667).unwrap();
+                for pkt in enc.encode(&nv12).unwrap() {
+                    block_on(peer.send_video(Bytes::from(pkt.data), Duration::from_micros(16_667))).unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(16));
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            let _ = block_on(peer.pc.close());
+            let _ = block_on(viewer.pc.close());
+            dec_thread.join().unwrap();
+            let reports = reports.lock().unwrap();
+            let mean_loss = reports.iter().map(|r| r.loss).sum::<f32>() / reports.len().max(1) as f32;
+            println!(
+                "perda simulada {:.1}%: decodificados {} de {frames}, fora de ordem/erros {}, pedidos de keyframe {}, relatórios {} (perda média medida {:.1}%)",
+                loss as f32 / 10.0, decoded.load(Ordering::SeqCst), corrupt.load(Ordering::SeqCst),
+                KEYFRAME_REQUESTS.load(Ordering::SeqCst), reports.len(), mean_loss * 100.0
+            );
+            assert_eq!(corrupt.load(Ordering::SeqCst), 0, "quadro fora de ordem ou que não decodificou");
+            assert!(reports.len() >= 4, "o espectador devia mandar relatórios");
+            if loss == 0 {
+                assert!(decoded.load(Ordering::SeqCst) >= frames as usize - 10);
+                assert!(mean_loss < 0.01);
+            } else {
+                // 5% de perda com 25% de folga: quase todos os quadros fecham.
+                assert!(decoded.load(Ordering::SeqCst) >= frames as usize * 85 / 100);
+                assert!((mean_loss - 0.05).abs() < 0.03, "a perda medida devia ser ~5%: {mean_loss}");
+            }
+        }
+        TEST_PIECE_LOSS_PERMILLE.store(0, Ordering::SeqCst);
+        USE_PIECES.store(false, Ordering::SeqCst);
     }
 
     /// Host e espectador na mesma máquina: vídeo codificado de verdade atravessa o WebRTC

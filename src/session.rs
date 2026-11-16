@@ -407,6 +407,9 @@ pub fn sources_list() -> Vec<Source> {
 pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
     let state = app.rdv();
     stop_host(&state);
+    // Malha P2P, etapa 1 (docs/malha-p2p.md): vídeo em pedaços pelo canal de dados, para
+    // quem tem esse canal. Por enquanto só com AJ_PIECES=1.
+    transport::USE_PIECES.store(std::env::var_os("AJ_PIECES").is_some(), Ordering::Relaxed);
     let (media_tx, mut media_rx) = tokio::sync::mpsc::channel::<Media>(240);
     let peers: Arc<Mutex<HashMap<u64, PeerEntry>>> = Arc::new(Mutex::new(HashMap::new()));
     let keyframes: Arc<Mutex<std::collections::HashSet<u32>>> = Default::default();
