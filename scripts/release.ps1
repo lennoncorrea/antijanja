@@ -7,13 +7,30 @@
 # O build roda com poucas tarefas e prioridade baixa para não travar o PC.
 # A chave privada fica em ~/.tauri/antijanja.key (fora do projeto). Sem ela não dá para
 # assinar e os apps instalados recusam a atualização. Guarde uma cópia em lugar seguro.
-param([switch]$SkipBuild, [switch]$Publish, [int]$Jobs = 4)
+#
+#   -Version 0.3.3   -> usa essa versão (grava no Cargo.toml antes de compilar)
+#   -Target <commit> -> commit onde a tag vX.Y.Z é criada (padrão: o branch padrão)
+#   -Notes "..."     -> texto da release
+#
+# Normalmente quem roda isto é a action .github/workflows/release.yml, a cada PR da
+# dev mergeado na main.
+param([switch]$SkipBuild, [switch]$Publish, [int]$Jobs = 4, [string]$Version = "", [string]$Target = "", [string]$Notes = "")
 $ErrorActionPreference = "Stop"
 $Repo = "lennoncorrea/antijanja"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
-$Version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+if ($Version) {
+  if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "Versão inválida: $Version" }
+  # Troca só a primeira linha "version = ..." (a do [package]).
+  $Lines = [IO.File]::ReadAllLines((Join-Path $Root "Cargo.toml"))
+  $i = [Array]::FindIndex($Lines, [Predicate[string]]{ param($l) $l -match '^version = "' })
+  $Lines[$i] = "version = `"$Version`""
+  [IO.File]::WriteAllLines((Join-Path $Root "Cargo.toml"), $Lines)  # UTF-8 sem BOM
+} else {
+  $Version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+}
+if (-not $Notes) { $Notes = "AntiJanja $Version" }
 $Exe = Join-Path $Root "target\release\antijanja.exe"
 $OutDir = Join-Path $Root "target\release\bundle"
 $Setup = Join-Path $OutDir "AntiJanja_${Version}_x64-setup.exe"
@@ -54,8 +71,11 @@ if ($LASTEXITCODE -ne 0) { throw "falha ao assinar" }
 $Signature = (Get-Content "$Setup.sig" -Raw).Trim()
 
 $Latest = [ordered]@{
-  version   = $Version
-  notes     = "AntiJanja $Version"
+  # Os apps antigos (2.x e 3.x) só leem "version" e só atualizam para uma versão maior
+  # que a deles: fica fixo em 3.999.0. A versão real (0.x) vai em "app_version".
+  version     = "3.999.0"
+  app_version = $Version
+  notes       = "AntiJanja $Version"
   pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
   platforms = [ordered]@{
     "windows-x86_64" = [ordered]@{
@@ -69,7 +89,9 @@ $LatestPath = Join-Path $OutDir "latest.json"
 
 Write-Host "`nPronto:`n  $Setup`n  $LatestPath"
 if ($Publish) {
-  gh release create "v$Version" $Setup $LatestPath --repo $Repo --title "AntiJanja $Version" --notes "AntiJanja $Version"
+  $TargetArgs = if ($Target) { @("--target", $Target) } else { @() }
+  gh release create "v$Version" $Setup $LatestPath --repo $Repo --title "AntiJanja $Version" --notes $Notes @TargetArgs
+  if ($LASTEXITCODE -ne 0) { throw "gh release create falhou" }
 } else {
   Write-Host "`nPara publicar: .\scripts\release.ps1 -SkipBuild -Publish"
 }

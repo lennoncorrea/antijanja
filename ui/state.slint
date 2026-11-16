@@ -163,6 +163,8 @@ export global App {
     in property <string> stat-res;
     in property <string> stat-fps;
     in property <string> stat-rate;
+    // Limite imposto pela rede de quem assiste (vazio = sem limite).
+    in property <string> stat-net;
     in property <bool> hardware;
     in property <string> encoder-line;
     in property <string> encoder-detail;
@@ -183,8 +185,15 @@ export global App {
     in property <bool> has-focus;
     callback leave(string);
     callback toggle-focus(string);
+    // Tela cheia com esta stream (ou sai da tela cheia).
+    callback toggle-fullscreen(string);
     callback set-volume(string, int);
     callback toggle-mute(string);
+    // fps para assistir ("0" = o da stream), vale para todas as streams. Acima do da
+    // stream precisa de placa NVIDIA (geração de quadros).
+    in property <bool> framegen-available;
+    in property <string> view-fps: "0";
+    callback set-view-fps(string);
     callback unfocus();
 
     // ------------------------------------------------- Avisos e atualização

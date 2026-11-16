@@ -43,6 +43,8 @@ struct Ctl {
     ui: slint::Weak<AppWindow>,
     app: AppHandle,
     s: settings::Settings,
+    /// Placa NVIDIA com Optical Flow (geração de quadros possível).
+    framegen_available: bool,
     view: String,
     net: String,
     live: bool,
@@ -427,7 +429,13 @@ fn relayout(c: &Ctl, ui: &AppWindow) {
             initials: s(initials(if v.host_name.is_empty() { "?" } else { &v.host_name })),
             watching: v.watching,
             step: v.step,
-            res: s(if stats.is_some() { format!("{}p {}fps", num("height") as u32, num("fps").round() as u32) } else { String::new() }),
+            res: s(if stats.is_some() {
+                let (fps, shown) = (num("fps").round() as u32, num("shown_fps").round() as u32);
+                // fps escolhido para assistir: "30→120fps" (recebidos → mostrados).
+                if shown.abs_diff(fps) > 2 { format!("{}p {}→{}fps", num("height") as u32, fps, shown) } else { format!("{}p {}fps", num("height") as u32, fps) }
+            } else {
+                String::new()
+            }),
             rate: s(format_rate(num("kbps"))),
             ping: s(v.ping.map(|p| if buffer > 0 { format!("{p} ms +{buffer}") } else { format!("{p} ms") }).unwrap_or_default()),
             ping_warn: v.ping.is_some_and(|p| p > 150),
@@ -479,6 +487,18 @@ fn set_fullscreen(c: &mut Ctl, ui: &AppWindow, on: bool) {
     c.controls_until = on.then(|| Instant::now() + CONTROLS_TIME);
     ui.window().set_fullscreen(on);
     render_general(c, ui);
+    relayout(c, ui);
+}
+
+/// Tela cheia só com a stream `id`; se já estiver em tela cheia, volta para a grade.
+fn toggle_stream_fullscreen(c: &mut Ctl, ui: &AppWindow, id: &str) {
+    if c.fullscreen {
+        c.focus = None;
+        set_fullscreen(c, ui, false);
+    } else {
+        c.focus = Some(id.to_string());
+        set_fullscreen(c, ui, true);
+    }
     relayout(c, ui);
 }
 
@@ -727,8 +747,9 @@ fn join_with_code(c: &mut Ctl, ui: &AppWindow, raw: &str) {
     relayout(c, ui);
 
     let (app, name) = (c.app.clone(), my_name(c));
+    let view_fps = view_fps(c, ui);
     transport::tokio_rt().spawn(async move {
-        let r = session::viewer_join(app, id.clone(), code, name, volume).await;
+        let r = session::viewer_join(app, id.clone(), code, name, volume, view_fps).await;
         let _ = slint::invoke_from_event_loop(move || {
             with(|c, ui| match r {
                 Ok(host) => {
@@ -743,6 +764,38 @@ fn join_with_code(c: &mut Ctl, ui: &AppWindow, raw: &str) {
             });
         });
     });
+}
+
+/// fps para assistir que vale de verdade: o escolhido, sem passar do que o monitor
+/// mostra. (Sem placa NVIDIA compatível, o gerador desliga sozinho e só a redução vale.)
+fn view_fps(c: &Ctl, ui: &AppWindow) -> u32 {
+    match c.s.view_fps {
+        0 => 0,
+        f => f.min(monitor_hz(ui)),
+    }
+}
+
+/// Taxa de atualização (Hz) do monitor onde está a janela principal.
+fn monitor_hz(ui: &AppWindow) -> u32 {
+    use windows::Win32::Graphics::Gdi::*;
+    let fallback = 60;
+    let Some(hwnd) = hwnd_of(ui) else { return fallback };
+    unsafe {
+        let mon = MonitorFromWindow(windows::Win32::Foundation::HWND(hwnd as *mut _), MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if !GetMonitorInfoW(mon, &mut info as *mut _ as *mut MONITORINFO).as_bool() {
+            return fallback;
+        }
+        let mut mode = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
+        if !EnumDisplaySettingsW(windows::core::PCWSTR(info.szDevice.as_ptr()), ENUM_CURRENT_SETTINGS, &mut mode).as_bool() {
+            return fallback;
+        }
+        match mode.dmDisplayFrequency {
+            f if f >= 24 => f,
+            _ => fallback,
+        }
+    }
 }
 
 fn end_watching(c: &mut Ctl, ui: &AppWindow, id: &str, message: Option<&str>, is_error: bool) {
@@ -824,6 +877,14 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
             a.set_stat_res(s(format!("{}×{}", f("width") as u32, f("height") as u32)));
             a.set_stat_fps(s((f("fps").round() as u32).to_string()));
             a.set_stat_rate(s(format!("{} de {}", format_rate(f("kbps")), format_rate(f("target_kbps")))));
+            // Bitrate adaptativo: a rede de alguém que assiste não aguenta o escolhido.
+            let (net_kbps, net_fps) = (f("net_kbps"), f("net_fps") as u32);
+            a.set_stat_net(s(match (net_kbps > 0.0, net_fps > 0) {
+                (false, false) => String::new(),
+                (true, false) => format!("Rede: até {}", format_rate(net_kbps)),
+                (false, true) => format!("Rede: {net_fps} fps"),
+                (true, true) => format!("Rede: até {}, {net_fps} fps", format_rate(net_kbps)),
+            }));
             a.set_encoder_line(s(format!(
                 "H.264 com {}{}",
                 v["encoder"].as_str().unwrap_or("?"),
@@ -927,12 +988,7 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
         "player-input" => {
             let id = id_of(&v);
             match v["kind"].as_str().unwrap_or("") {
-                "dblclick" => {
-                    let focused = c.focus.as_deref() == Some(id.as_str());
-                    c.focus = if focused { None } else { Some(id) };
-                    set_fullscreen(c, ui, !focused);
-                    relayout(c, ui);
-                }
+                "dblclick" => toggle_stream_fullscreen(c, ui, &id),
                 "move" if c.fullscreen => {
                     let was_hidden = !c.controls_until.is_some_and(|t| t > Instant::now());
                     c.controls_until = Some(Instant::now() + CONTROLS_TIME);
@@ -1053,6 +1109,7 @@ fn wire(ui: &AppWindow) {
             relayout(c, ui);
         })
     });
+    a.on_toggle_fullscreen(|id| later(move |c, ui| toggle_stream_fullscreen(c, ui, &id)));
     a.on_unfocus(|| {
         later(|c, ui| {
             c.focus = None;
@@ -1060,6 +1117,21 @@ fn wire(ui: &AppWindow) {
         })
     });
     a.on_set_volume(|id, vol| later(move |c, ui| set_viewer_volume(c, ui, &id, vol.clamp(0, 100) as u32, false)));
+    a.on_set_view_fps(|v| {
+        later(move |c, ui| {
+            c.s.view_fps = v.parse().unwrap_or(0);
+            settings::save(&c.s);
+            let fps = view_fps(c, ui);
+            for x in &c.viewers {
+                session::viewer_view_fps(&x.id, fps);
+            }
+            ui.global::<App>().set_view_fps(s(c.s.view_fps.to_string()));
+            let hz = monitor_hz(ui);
+            if c.s.view_fps > 0 && fps < c.s.view_fps {
+                toast(c, ui, "", format!("Seu monitor mostra até {hz} quadros por segundo: assistindo a {fps} fps."));
+            }
+        })
+    });
     a.on_toggle_mute(|id| {
         later(move |c, ui| {
             let Some((vol, muted)) = c.viewers.iter().find(|v| v.id == id.as_str()).map(|v| (v.volume, v.muted)) else { return };
@@ -1147,6 +1219,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
             viewers: Vec::new(),
             focus: None,
             fullscreen: false,
+            framegen_available: false,
             controls_until: None,
             toasts: Vec::new(),
             toast_seq: 0,
@@ -1232,6 +1305,12 @@ pub fn run() -> Result<(), slint::PlatformError> {
     });
 
     with(|c, ui| refresh_apps(c, ui));
+    // A geração de quadros precisa de placa NVIDIA: descobre em segundo plano (inicia o CUDA).
+    bg(session::framegen_available, |c, ui, ok| {
+        c.framegen_available = ok;
+        ui.global::<App>().set_framegen_available(ok);
+        ui.global::<App>().set_view_fps(s(c.s.view_fps.to_string()));
+    });
     start_updater();
 
     slint::run_event_loop_until_quit()

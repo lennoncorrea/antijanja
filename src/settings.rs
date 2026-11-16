@@ -20,6 +20,9 @@ pub struct Settings {
     pub volume: u32,
     pub public: bool,
     pub view_volume: u32,
+    /// fps para assistir (0 = o da stream). Acima do da stream, gera quadros
+    /// intermediários (placa NVIDIA); abaixo, descarta.
+    pub view_fps: u32,
 }
 
 impl Default for Settings {
@@ -37,6 +40,7 @@ impl Default for Settings {
             volume: 100,
             public: true,
             view_volume: 100,
+            view_fps: 0,
         }
     }
 }

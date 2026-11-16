@@ -1,0 +1,83 @@
+name: Release
+
+# Cada PR da dev mergeado na main vira uma release: instalador assinado + latest.json.
+# Os apps instalados se atualizam sozinhos ao abrir.
+#
+# Versão: a do Cargo.toml, se ainda não foi lançada; senão a última release 0.x com o
+# último número + 1 (0.3.2 -> 0.3.3). Para pular para 0.4.0, mude o Cargo.toml no PR.
+#
+# Precisa do secret TAURI_SIGNING_PRIVATE_KEY (conteúdo de ~/.tauri/antijanja.key).
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.ref == 'dev' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      # Ações fixadas por commit: este job tem a chave de assinatura.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Escolher a versão
+        id: version
+        shell: pwsh
+        run: |
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $released = @(git tag --list "v0.*" |
+            Where-Object { $_ } |
+            ForEach-Object { $_.Substring(1) } |
+            Where-Object { $_ -match '^\d+\.\d+\.\d+$' } |
+            ForEach-Object { [version]$_ } |
+            Sort-Object -Descending)
+          if ($released.Count -eq 0 -or [version]$cargo -gt $released[0]) {
+            $v = $cargo
+          } else {
+            $last = $released[0]
+            $v = "$($last.Major).$($last.Minor).$($last.Build + 1)"
+          }
+          $lastText = if ($released.Count) { $released[0] } else { "nenhuma" }
+          Write-Host "Cargo.toml: $cargo | última release 0.x: $lastText | esta release: $v"
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Compilar, assinar e publicar
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Por variável de ambiente (e não ${{ }} dentro do script): o título do PR
+          # não vira código.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          if (-not $env:SIGNING_KEY) {
+            throw "Falta o secret TAURI_SIGNING_PRIVATE_KEY (conteúdo de ~/.tauri/antijanja.key)."
+          }
+          $key = Join-Path $env:RUNNER_TEMP "antijanja.key"
+          [IO.File]::WriteAllText($key, $env:SIGNING_KEY)
+          $env:TAURI_SIGNING_PRIVATE_KEY_PATH = $key
+          try {
+            ./scripts/release.ps1 -Publish -Jobs 4 -Version $env:VERSION -Target $env:TARGET -Notes "$env:PR_TITLE (#$env:PR_NUMBER)"
+          } finally {
+            Remove-Item $key -Force -ErrorAction SilentlyContinue
+          }

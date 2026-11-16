@@ -41,11 +41,17 @@ pub struct VideoInfo {
     pub encode_ms: f32,
     /// Quadros novos entregues pelo Windows por segundo (o resto são repetições).
     pub captured_fps: f32,
+    /// Bitrate limitado pela rede de quem assiste (kb/s; 0 = sem limite).
+    pub net_kbps: u32,
+    /// fps reduzido por falta de banda (0 = o escolhido).
+    pub net_fps: u32,
 }
 
 pub enum Msg {
     Capture(CaptureMsg),
     Settings(VideoSettings),
+    /// Limite de bitrate pela rede (b/s; None = sem limite). Ver `congestion`.
+    Network(Option<u32>),
     Source(String),
     Keyframe,
     Stop,
@@ -82,6 +88,7 @@ impl VideoPipeline {
         let _ = self.tx.send(m);
     }
     pub fn set_settings(&self, s: VideoSettings) { self.send(Msg::Settings(s)) }
+    pub fn set_network(&self, cap_bps: Option<u32>) { self.send(Msg::Network(cap_bps)) }
     pub fn set_source(&self, id: String) { self.send(Msg::Source(id)) }
     pub fn keyframe(&self) { self.send(Msg::Keyframe) }
     pub fn stop(&self) { self.send(Msg::Stop) }
@@ -136,8 +143,17 @@ enum Pending {
     Gpu(GpuFrame),
 }
 
+/// Tempo mínimo entre trocas de fps por causa da rede (cada troca recria o encoder).
+const NET_FPS_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
 struct State {
+    /// O que está valendo agora: o escolhido por quem transmite, limitado pela rede.
     settings: VideoSettings,
+    /// O escolhido por quem transmite.
+    user: VideoSettings,
+    net_bps: Option<u32>,
+    net_fps: Option<u32>,
+    net_fps_changed: Option<Instant>,
     gpu: Option<GpuDevice>,
     active: Option<Active>,
     want_keyframe: bool,
@@ -166,6 +182,9 @@ impl State {
         }
         self.active = None;
         self.last_nv12 = None;
+        // Encoder novo: aplica o limite da rede (pode ter chegado antes do 1º quadro).
+        self.update_net_fps();
+        self.settings = self.effective();
         let fps = self.settings.fps;
         let bitrate = bitrate_for(&self.settings, out);
         let built = match &self.gpu {
@@ -190,6 +209,36 @@ impl State {
                 (cb.on_error)(format!("Erro no encoder: {err}"));
                 false
             }
+        }
+    }
+
+    fn output(&self) -> Option<(u32, u32)> {
+        self.frame_size.map(|(w, h)| output_size(w, h, self.user.res))
+    }
+
+    /// Configurações que valem com o limite da rede aplicado.
+    fn effective(&self) -> VideoSettings {
+        let mut s = self.user.clone();
+        if let Some(f) = self.net_fps {
+            s.fps = s.fps.min(f);
+        }
+        if let (Some(cap), Some(out)) = (self.net_bps, self.output()) {
+            if cap < bitrate_for(&s, out) {
+                s.bitrate = (cap / 1000).max(1);
+            }
+        }
+        s
+    }
+
+    /// Cai para 30 fps com pouca banda (e volta quando sobra), sem trocar toda hora.
+    fn update_net_fps(&mut self) {
+        let Some((w, h)) = self.output() else { return };
+        let next = crate::congestion::adapt_fps(self.user.fps, w, h, self.net_bps, self.net_fps);
+        let lifted = self.net_bps.is_none();
+        let can_change = lifted || self.net_fps_changed.is_none_or(|t| t.elapsed() >= NET_FPS_MIN_INTERVAL);
+        if next != self.net_fps && can_change {
+            self.net_fps = next;
+            self.net_fps_changed = Some(Instant::now());
         }
     }
 
@@ -311,7 +360,7 @@ fn run(
             })
             .ok();
     }
-    let mut st = State { settings, gpu, active: None, want_keyframe: true, last_nv12: None, frame_size: None, start: Instant::now(), convert_errors: 0, frame_index: 0 };
+    let mut st = State { user: settings.clone(), net_bps: None, net_fps: None, net_fps_changed: None, settings, gpu, active: None, want_keyframe: true, last_nv12: None, frame_size: None, start: Instant::now(), convert_errors: 0, frame_index: 0 };
     let mut pending: Option<Pending> = None;
     let mut next_due = Instant::now();
     // Relógio de vídeo: cada tick é 1/fps. A duração de cada quadro no RTP = ticks avançados,
@@ -319,6 +368,9 @@ fn run(
     let mut clock0 = next_due;
     let mut last_tick: u64 = 0;
     let mut clock_fps = st.settings.fps;
+    // Quando o último quadro saiu, e se o relógio acabou de recomeçar (troca de fps).
+    let mut last_sent: Option<Instant> = None;
+    let mut clock_restarted = false;
     let mut last_preview = Instant::now() - Duration::from_secs(10);
     let (mut win_frames, mut win_bytes, mut win_start) = (0u32, 0usize, Instant::now());
     let mut win_time = Duration::ZERO;
@@ -331,6 +383,7 @@ fn run(
             clock0 = Instant::now();
             next_due = clock0;
             last_tick = 0;
+            clock_restarted = true;
         }
         // Quadro novo esperando: codifica no tick. Sem quadro novo: só repete se ele estiver
         // atrasado meio intervalo (evita repetir e logo depois pular quando o Windows atrasa 1–2 ms).
@@ -377,7 +430,19 @@ fn run(
                 let _ = preview_tx.try_send(f);
                 continue;
             }
-            Ok(Msg::Settings(s)) => {
+            Ok(m @ (Msg::Settings(_) | Msg::Network(_))) => {
+                match m {
+                    Msg::Settings(user) => st.user = user,
+                    Msg::Network(cap) => {
+                        st.net_bps = cap;
+                        st.update_net_fps();
+                    }
+                    _ => unreachable!(),
+                }
+                let s = st.effective();
+                if s == st.settings {
+                    continue;
+                }
                 let restart_capture = s.cursor != st.settings.cursor;
                 let bitrate_only = s.res == st.settings.res && s.fps == st.settings.fps;
                 st.settings = s;
@@ -440,11 +505,22 @@ fn run(
         let was_gpu = matches!(pending, Some(Pending::Gpu(_)));
         let tick = (next_due.saturating_duration_since(clock0).as_secs_f64() / interval.as_secs_f64()).round() as u64;
         let ticks = tick.saturating_sub(last_tick).max(1);
-        let rtp_dur = interval * ticks as u32;
+        let mut rtp_dur = interval * ticks as u32;
+        if clock_restarted {
+            // O relógio recomeçou (e o encoder foi recriado): a duração deste quadro é o
+            // tempo real desde o anterior. Senão a pausa some do horário RTP e, para quem
+            // assiste, todos os quadros seguintes parecem atrasados (o bitrate adaptativo
+            // leria isso como fila na rede).
+            if let Some(t) = last_sent {
+                rtp_dur = t.elapsed().max(interval);
+            }
+        }
         let t0 = Instant::now();
         let result = st.encode_pending(&mut pending, &cb, rtp_dur);
         if result.is_some() {
             last_tick = tick.max(last_tick + 1);
+            last_sent = Some(Instant::now());
+            clock_restarted = false;
         }
         win_time += t0.elapsed();
         if let Some(bytes) = result {
@@ -491,7 +567,9 @@ fn run(
                     height: out.1,
                     fps: win_frames as f32 / el.as_secs_f32(),
                     kbps: (win_bytes as f64 * 8.0 / el.as_secs_f64() / 1000.0) as u32,
-                    target_kbps: bitrate_for(&st.settings, out) / 1000,
+                    target_kbps: bitrate_for(&st.user, out) / 1000,
+                    net_kbps: if st.settings.bitrate != st.user.bitrate { st.settings.bitrate } else { 0 },
+                    net_fps: st.net_fps.filter(|&f| f < st.user.fps).unwrap_or(0),
                     captured_fps: fresh_count as f32 / el.as_secs_f32(),
                     encode_ms: if win_frames > 0 { win_time.as_secs_f32() * 1000.0 / win_frames as f32 } else { 0.0 },
                 });
@@ -563,5 +641,66 @@ mod tests {
         let infos = infos.lock().unwrap();
         let last = infos.last().expect("sem estatísticas");
         assert!(last.fps >= 55.0, "FPS abaixo do alvo: {:.1}", last.fps);
+    }
+
+    /// Diagnóstico do bitrate: tamanho de cada quadro (keyframe ou não) e kb/s por
+    /// segundo com a tela real. Fase 1 normal; fase 2 simula um espectador com perda
+    /// de pacotes pedindo keyframe a cada 300 ms (o mínimo que o host aceita).
+    /// `cargo test bitrate_profile -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bitrate_profile() {
+        let src = capture::list_sources().into_iter().find(|s| s.primary || s.kind == "monitor").expect("sem tela");
+        let frames = Arc::new(std::sync::Mutex::new(Vec::<(Instant, usize, bool)>::new()));
+        let f = frames.clone();
+        let pipe = VideoPipeline::start(
+            src.id,
+            VideoSettings { res: 1080, fps: 60, bitrate: 12000, cursor: true },
+            Callbacks {
+                on_packet: Arc::new(move |d, _| {
+                    let key = crate::media::has_nal(&d, 5);
+                    f.lock().unwrap().push((Instant::now(), d.len(), key));
+                }),
+                on_info: Arc::new(|i| println!("  [encoder] {} kb/s (alvo {}) {:.0} fps", i.kbps, i.target_kbps, i.fps)),
+                on_preview: Arc::new(|_| {}),
+                on_error: Arc::new(|e| println!("  ERRO {e}")),
+                on_source_closed: Arc::new(|| {}),
+            },
+        )
+        .expect("pipeline");
+        let t0 = Instant::now();
+        std::thread::sleep(Duration::from_secs(10));
+        println!("  --- fase 2: keyframe a cada 300 ms ---");
+        let t1 = Instant::now();
+        while t1.elapsed() < Duration::from_secs(8) {
+            pipe.keyframe();
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        pipe.stop();
+        let frames = frames.lock().unwrap();
+        let summary = |label: &str, from: Instant, to: Instant| {
+            let sel: Vec<_> = frames.iter().filter(|(t, _, _)| *t >= from && *t < to).collect();
+            let keys: Vec<usize> = sel.iter().filter(|x| x.2).map(|x| x.1).collect();
+            let deltas: Vec<usize> = sel.iter().filter(|x| !x.2).map(|x| x.1).collect();
+            let avg = |v: &[usize]| if v.is_empty() { 0 } else { v.iter().sum::<usize>() / v.len() };
+            println!(
+                "{label}: {} quadros, {} keyframes (média {} KB, máx {} KB), quadros normais média {} KB",
+                sel.len(), keys.len(), avg(&keys) / 1024, keys.iter().max().unwrap_or(&0) / 1024, avg(&deltas) / 1024
+            );
+            let secs = (to - from).as_secs();
+            let per_sec: Vec<String> = (0..secs)
+                .map(|s| {
+                    let (a, b) = (from + Duration::from_secs(s), from + Duration::from_secs(s + 1));
+                    let bytes: usize = sel.iter().filter(|x| x.0 >= a && x.0 < b).map(|x| x.1).sum();
+                    format!("{}", bytes * 8 / 1000)
+                })
+                .collect();
+            println!("  kb/s por segundo: {}", per_sec.join(" "));
+            // Maior rajada: bytes de um único quadro em relação ao que a rede recebe num quadro.
+            let per_frame_budget = 12_000_000 / 8 / 60;
+            println!("  maior quadro = {:.0}x o orçamento de um quadro ({} KB)", *keys.iter().chain(deltas.iter()).max().unwrap_or(&0) as f64 / per_frame_budget as f64, per_frame_budget / 1024);
+        };
+        summary("fase 1 (normal)", t0, t1);
+        summary("fase 2 (keyframes)", t1, Instant::now());
     }
 }

@@ -18,6 +18,15 @@ trocadas na DHT. Os nós da DHT só veem dados criptografados; sem o código nin
 mensagens. A chave privada fica só no computador do host: quem tem o código pode pedir para
 assistir, mas não consegue responder no lugar do host.
 
+**Bitrate adaptativo:** quem assiste manda a cada 500 ms a taxa recebida, a perda de pacotes e o
+atraso de fila; o host estima quanto a rede de cada um aguenta e ajusta o encoder para a pior
+conexão (sem passar do bitrate escolhido). Com pouca banda, cai para 30 fps. Os pacotes de vídeo
+saem espaçados (pacer) e keyframes forçados são no máximo um por segundo.
+
+**Suavizar movimento:** com placa NVIDIA (GTX 16xx / RTX 20xx em diante), quem assiste pode gerar
+quadros intermediários: a NVIDIA Optical Flow do driver mede o movimento entre dois quadros e um
+shader desenha o quadro do meio. Uma stream de 30 fps aparece a 60, com ~16 ms a mais de atraso.
+
 **Lista pública:** cada entrada é assinada pela chave do host da transmissão anunciada (ninguém
 anuncia, encerra ou renomeia a transmissão de outra pessoa) e as vagas mudam de endereço a cada
 10 min (quem travar uma vaga só a trava até a próxima troca). Sem servidor, não dá para impedir
@@ -45,10 +54,23 @@ cargo run                        # roda o app (modo desenvolvimento)
 cargo test                       # testes unitários
 cargo test -- --ignored --nocapture  # testes contra a DHT real (precisa de internet)
 
-.\scripts\release.ps1            # build + instalador assinado + latest.json
-.\scripts\release.ps1 -Publish   # e publica a release no GitHub (atualiza quem já tem o app)
+.\scripts\release.ps1            # build + instalador assinado + latest.json (sem publicar)
 ```
 
 Os builds rodam com poucas tarefas e prioridade baixa (`CARGO_BUILD_JOBS=4`) para não travar o PC.
+
+### Releases
+
+Cada PR da `dev` mergeado na `main` vira uma release automaticamente
+(`.github/workflows/release.yml`): a action compila, assina, publica no GitHub e os apps
+instalados se atualizam ao abrir. Ela precisa do secret `TAURI_SIGNING_PRIVATE_KEY`
+(conteúdo de `~/.tauri/antijanja.key`).
+
+As versões são `0.x.y` enquanto o app não for considerado estável. A action usa a versão do
+`Cargo.toml` se ela ainda não foi lançada; senão soma 1 ao último número da última release
+(`0.3.2` → `0.3.3`). Para pular para `0.4.0`, mude o `Cargo.toml` no PR.
+
+Os apps antigos (2.x e 3.x) só atualizam para uma versão "maior" que a deles, então o
+`latest.json` leva `version: 3.999.0` (lido só por eles) e a versão real em `app_version`.
 
 Fontes: [Inter](https://rsms.me/inter/) e [JetBrains Mono](https://www.jetbrains.com/lp/mono/), ambas OFL (`assets/fonts`).

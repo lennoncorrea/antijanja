@@ -291,7 +291,9 @@ impl Encoder {
                 set_codec_value(c, &CODECAPI_AVEncCommonRateControlMode, VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32));
                 set_codec_value(c, &CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bitrate));
                 set_codec_value(c, &CODECAPI_AVEncCommonBufferSize, VARIANT::from(bitrate)); // 1 s de buffer
-                set_codec_value(c, &CODECAPI_AVEncMPVGOPSize, VARIANT::from(fps * 4)); // keyframe a cada ~4 s
+                // Keyframe periódico a cada ~10 s só por segurança: quem entra ou perde pacotes
+                // pede um. Cada keyframe é ~10x um quadro normal (pico de bitrate).
+                set_codec_value(c, &CODECAPI_AVEncMPVGOPSize, VARIANT::from(fps * 10));
                 set_codec_value(c, &CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32));
                 // Deixa o encoder comprimir até o limite do H.264 quando a cena é muito pesada.
                 set_codec_value(c, &CODECAPI_AVEncVideoMaxQP, VARIANT::from(51u32));
@@ -667,6 +669,57 @@ mod tests {
             enc.set_bitrate(eff);
         }
         println!("último segundo: {last:.2} Mb/s (conteúdo-limite: o encoder não comprime abaixo de ~7,5)");
+    }
+
+    /// Diagnóstico: conteúdo em movimento a 12 Mb/s com a malha fechada igual à do app
+    /// (corrige a cada segundo). Mostra kb/s por segundo, o valor pedido ao encoder e o
+    /// tamanho dos keyframes. (Diminuir CODECAPI_AVEncCommonBufferSize não mudou nada.)
+    /// `cargo test bitrate_profile_motion -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bitrate_profile_motion() {
+        mf_init().unwrap();
+        let (w, h, fps, target) = (1920u32, 1080u32, 60u32, 12_000_000u32);
+        {
+            let conv = Converter::new(w, h, w, h, fps).unwrap();
+            let mut enc = Encoder::new(w, h, fps, target, true, None).unwrap();
+            println!("encoder: {} (hardware: {})", enc.name, enc.hardware);
+            let mut eff = target;
+            let mut img = vec![0u8; (w * h * 4) as usize];
+            let (mut out, mut asked, mut keys, mut max_delta) = (vec![], vec![], vec![], 0usize);
+            for sec in 0..10u32 {
+                let mut bytes = 0usize;
+                for f in 0..fps {
+                    let i = sec * fps + f;
+                    // Textura rolando + uma faixa com ruído (parecido com um jogo/vídeo).
+                    for (j, px) in img.chunks_exact_mut(4).enumerate() {
+                        let (x, y) = (j as u32 % w, j as u32 / w);
+                        let n = if y > h * 2 / 3 { (x.wrapping_mul(2654435761) ^ (y + i).wrapping_mul(40503)) >> 24 } else { 0 };
+                        px[0] = (((x + i * 6) ^ (y * 2)) as u8).wrapping_add(n as u8);
+                        px[1] = ((y + i * 3) ^ (x / 3)) as u8;
+                        px[2] = (x / 8 + i) as u8;
+                        px[3] = 255;
+                    }
+                    let t = i as i64 * 10_000_000 / fps as i64;
+                    let nv12 = conv.convert(&img, t, 10_000_000 / fps as i64).unwrap();
+                    for p in enc.encode(&nv12).unwrap() {
+                        bytes += p.data.len();
+                        if p.keyframe { keys.push(p.data.len() / 1024) } else { max_delta = max_delta.max(p.data.len() / 1024) }
+                    }
+                }
+                let got = (bytes * 8) as u32;
+                out.push(got / 1000);
+                asked.push(eff / 1000);
+                let next = adjust_bitrate(eff, target, got);
+                if next.abs_diff(eff) > eff / 50 {
+                    eff = next;
+                    enc.set_bitrate(eff);
+                }
+            }
+            println!("  saiu (kb/s):    {:?}", out);
+            println!("  pedido (kb/s):  {:?}", asked);
+            println!("  keyframes (KB): {:?}, maior quadro normal: {} KB, orçamento por quadro: {} KB", keys, max_delta, target / 8 / fps / 1024);
+        }
     }
 
     fn gradient(w: u32, h: u32, t: u32) -> Vec<u8> {

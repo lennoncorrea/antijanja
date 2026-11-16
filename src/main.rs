@@ -3,18 +3,22 @@
 //! Pipeline 100% nativo:
 //! - captura: Windows Graphics Capture (`capture`)
 //! - conversão + codificação H.264 por hardware: Media Foundation (`media`, `video`)
-//! - transporte: WebRTC nativo, webrtc-rs (`transport`)
+//! - transporte: WebRTC nativo, webrtc-rs (`transport`), bitrate adaptativo (`congestion`)
 //! - encontro dos peers: DHT do BitTorrent, criptografado (`rendezvous`)
 //! - áudio: WASAPI com controle por aplicativo + Opus (`audio`)
-//! - exibição: wgpu numa janela-filha nativa (`player`)
+//! - exibição: wgpu numa janela-filha nativa (`player`), geração de quadros com a
+//!   NVIDIA Optical Flow (`nvof`, `framegen`)
 //! - interface: Slint (`ui`, arquivos em `ui/`), sem navegador embutido
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod audio;
 mod capture;
+mod framegen;
+mod congestion;
 mod gpu;
 mod media;
+mod nvof;
 mod player;
 mod playout;
 mod rendezvous;

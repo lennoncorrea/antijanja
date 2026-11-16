@@ -2,8 +2,8 @@
 // A posição de cada tile vem do Rust, que põe o player nativo exatamente sobre a
 // área de vídeo. Por isso as alturas do cabeçalho (44) e do rodapé (40) são fixas.
 import { Theme } from "theme.slint";
-import { App, Tile } from "state.slint";
-import { Badge, Btn, Cover, EmptyState, Icon, Slider, Spinner, TextField } from "widgets.slint";
+import { App, Tile, SelectOption } from "state.slint";
+import { Badge, Btn, Cover, EmptyState, Icon, Segmented, Slider, Spinner, TextField } from "widgets.slint";
 
 component AddBar inherits Rectangle {
     height: 60px;
@@ -106,6 +106,15 @@ component Step inherits HorizontalLayout {
 
 component TileView inherits Rectangle {
     in property <Tile> t;
+    // Acima do fps da stream só com geração de quadros (placa NVIDIA).
+    property <[SelectOption]> fps-options: App.framegen-available
+        ? [{ value: "0", label: "Original" }, { value: "30", label: "30" }, { value: "60", label: "60" }, { value: "120", label: "120" }, { value: "144", label: "144" }]
+        : [{ value: "0", label: "Original" }, { value: "30", label: "30" }, { value: "60", label: "60" }];
+    property <string> next-fps: App.view-fps == "0" ? "30"
+        : App.view-fps == "30" ? "60"
+        : App.view-fps == "60" ? (App.framegen-available ? "120" : "0")
+        : App.view-fps == "120" ? "144"
+        : "0";
     property <bool> bare: App.fullscreen;
     background: Theme.card;
     border-radius: bare ? 0px : 12px;
@@ -161,7 +170,8 @@ component TileView inherits Rectangle {
                     alignment: center;
                     HorizontalLayout {
                         spacing: 2px;
-                        Btn {
+                        // Em tela cheia só há uma stream: "ampliar" não faz sentido.
+                        if !App.fullscreen : Btn {
                             width: 32px;
                             height: 32px;
                             kind: "ghost";
@@ -170,6 +180,16 @@ component TileView inherits Rectangle {
                             has-icon: true;
                             accessible-label: root.t.focused ? "Voltar para a grade" : "Ampliar";
                             clicked => { App.toggle-focus(root.t.id); }
+                        }
+                        Btn {
+                            width: 32px;
+                            height: 32px;
+                            kind: "ghost";
+                            icon-only: true;
+                            icon: App.fullscreen ? @image-url("icons/fullscreen-exit.svg") : @image-url("icons/fullscreen.svg");
+                            has-icon: true;
+                            accessible-label: App.fullscreen ? "Sair da tela cheia (Esc)" : "Tela cheia (F11 ou duplo clique)";
+                            clicked => { App.toggle-fullscreen(root.t.id); }
                         }
                         Btn {
                             width: 32px;
@@ -244,6 +264,37 @@ component TileView inherits Rectangle {
                     color: Theme.muted-fg;
                     font-family: Theme.mono;
                     vertical-alignment: center;
+                }
+                // fps para assistir. Acima do da stream, a placa NVIDIA gera os quadros.
+                Rectangle { width: 6px; }
+                Text {
+                    text: "FPS";
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: Theme.muted-fg;
+                    vertical-alignment: center;
+                }
+                if root.width >= 640px : VerticalLayout {
+                    alignment: center;
+                    Segmented {
+                        height: 28px;
+                        options: root.fps-options;
+                        value: App.view-fps;
+                        selected(v) => { App.set-view-fps(v); }
+                    }
+                }
+                // Tile estreito: um botão que passa para a próxima opção.
+                if root.width < 640px : VerticalLayout {
+                    alignment: center;
+                    Btn {
+                        height: 28px;
+                        kind: "outline";
+                        font-size: 12px;
+                        pad: 10px;
+                        text: App.view-fps == "0" ? "Original" : App.view-fps;
+                        accessible-label: "fps para assistir: clique para trocar";
+                        clicked => { App.set-view-fps(root.next-fps); }
+                    }
                 }
             }
         }

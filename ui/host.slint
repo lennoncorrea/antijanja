@@ -476,6 +476,7 @@ export component HostView inherits ScrollView {
                     Badge { bg: Theme.bg.with-alpha(0.8); text: "Envio " + App.stat-res; }
                     Badge { bg: Theme.bg.with-alpha(0.8); text: "FPS " + App.stat-fps; }
                     Badge { bg: Theme.bg.with-alpha(0.8); text: "Taxa " + App.stat-rate; }
+                    if App.stat-net != "" : Badge { bg: Theme.warn; ink: #000000; text: App.stat-net; }
                 }
             }
 

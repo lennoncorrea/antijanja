@@ -4,6 +4,7 @@
 //! A janela-filha fica por cima da área de vídeo da interface; a interface (WebView) informa
 //! o retângulo dessa área. Eventos de mouse/teclado na janela-filha viram eventos Tauri.
 
+use crate::framegen::{Interpolator, Midpoint, PlaneViews};
 use crate::media::Nv12Frame;
 use std::num::NonZeroIsize;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -28,8 +29,15 @@ fn tag_of(hwnd: HWND) -> String {
 }
 static LAST_MOVE: AtomicIsize = AtomicIsize::new(0);
 
+/// Testes: (horário do present, gerado?, quanto esperou pelo get_current_texture).
+#[cfg(test)]
+pub static TRACE: std::sync::Mutex<Vec<(Instant, bool, Duration)>> = std::sync::Mutex::new(Vec::new());
+
 enum Msg {
     Frame(Nv12Frame),
+    /// Geração de quadros: entre o quadro atual e `next`, mostra o quadro gerado na fração
+    /// `t` em cada horário de `steps`; depois `next` em `next_at`.
+    Interp { next: Nv12Frame, mid: Midpoint, steps: Vec<(Instant, f32)>, next_at: Instant },
     Resize(u32, u32),
     Stop,
 }
@@ -180,6 +188,12 @@ impl PlayerFeed {
     pub fn push(&self, frame: Nv12Frame) {
         let _ = self.tx.try_send(Msg::Frame(frame));
     }
+
+    /// Quadros gerados entre o atual e `next` (`steps` = horário e fração de cada um),
+    /// depois `next` em `next_at` (ver `framegen`).
+    pub fn push_interp(&self, next: Nv12Frame, mid: Midpoint, steps: Vec<(Instant, f32)>, next_at: Instant) {
+        let _ = self.tx.try_send(Msg::Interp { next, mid, steps, next_at });
+    }
 }
 
 const SHADER: &str = r#"
@@ -210,6 +224,17 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Um quadro na placa de vídeo (planos Y e UV).
+struct Planes {
+    y: wgpu::Texture,
+    uv: wgpu::Texture,
+    y_view: wgpu::TextureView,
+    uv_view: wgpu::TextureView,
+    bind: wgpu::BindGroup,
+    w: u32,
+    h: u32,
+}
+
 struct Gpu {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -218,7 +243,10 @@ struct Gpu {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    planes: Option<(wgpu::Texture, wgpu::Texture, wgpu::BindGroup, u32, u32)>,
+    /// Dois quadros: o mostrado (`cur`) e o próximo (para o quadro do meio).
+    sets: [Option<Planes>; 2],
+    cur: usize,
+    interp: Interpolator,
 }
 
 fn init_gpu(hwnd: isize) -> Res<Gpu> {
@@ -315,7 +343,8 @@ fn init_gpu(hwnd: isize) -> Res<Gpu> {
         min_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
-    Ok(Gpu { surface, device, queue, config, pipeline, layout, sampler, planes: None })
+    let interp = Interpolator::new(&device, format);
+    Ok(Gpu { surface, device, queue, config, pipeline, layout, sampler, sets: [None, None], cur: 0, interp })
 }
 
 impl Gpu {
@@ -327,10 +356,10 @@ impl Gpu {
         }
     }
 
-    fn upload(&mut self, f: &Nv12Frame) {
+    /// Envia o quadro para o conjunto de texturas `slot`.
+    fn upload(&mut self, f: &Nv12Frame, slot: usize) {
         let (w, h) = (f.width, f.height);
-        let recreate = !matches!(&self.planes, Some((_, _, _, pw, ph)) if (*pw, *ph) == (w, h));
-        if recreate {
+        if !matches!(&self.sets[slot], Some(p) if (p.w, p.h) == (w, h)) {
             let mk = |w, h, format| {
                 self.device.create_texture(&wgpu::TextureDescriptor {
                     label: None,
@@ -343,37 +372,65 @@ impl Gpu {
                     view_formats: &[],
                 })
             };
-            let ty = mk(w, h, wgpu::TextureFormat::R8Unorm);
-            let tuv = mk(w / 2, h / 2, wgpu::TextureFormat::Rg8Unorm);
+            let y = mk(w, h, wgpu::TextureFormat::R8Unorm);
+            let uv = mk(w / 2, h / 2, wgpu::TextureFormat::Rg8Unorm);
+            let (y_view, uv_view) = (y.create_view(&Default::default()), uv.create_view(&Default::default()));
             let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &self.layout,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&ty.create_view(&Default::default())) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&tuv.create_view(&Default::default())) },
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&y_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&uv_view) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                 ],
             });
-            self.planes = Some((ty, tuv, bind, w, h));
+            self.sets[slot] = Some(Planes { y, uv, y_view, uv_view, bind, w, h });
         }
-        let (ty, tuv, _, _, _) = self.planes.as_ref().unwrap();
+        let p = self.sets[slot].as_ref().unwrap();
         let stride = f.stride;
         let y_size = (stride * h) as usize;
         self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: ty, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &p.y, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             &f.data[..y_size],
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(stride), rows_per_image: Some(h) },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
         self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: tuv, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &p.uv, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             &f.data[y_size..],
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(stride), rows_per_image: Some(h / 2) },
             wgpu::Extent3d { width: w / 2, height: h / 2, depth_or_array_layers: 1 },
         );
     }
 
-    fn render(&mut self) {
+    /// Quadro novo normal: substitui o mostrado.
+    fn show(&mut self, f: &Nv12Frame) {
+        self.upload(f, self.cur);
+        self.render(None);
+    }
+
+    /// Prepara os quadros gerados entre o mostrado e `next` (que vai para o outro
+    /// conjunto). Devolve false se não dá para interpolar (aí `next` já foi mostrado).
+    fn prepare_interp(&mut self, next: &Nv12Frame, mid: &Midpoint) -> bool {
+        let same_size = matches!(&self.sets[self.cur], Some(p) if (p.w, p.h) == (next.width, next.height));
+        if !same_size {
+            self.show(next);
+            return false;
+        }
+        self.upload(next, 1 - self.cur);
+        self.interp.upload_flow(&self.device, &self.queue, &mid.flow);
+        true
+    }
+
+    /// O quadro preparado em `prepare_interp` passa a ser o mostrado.
+    fn advance(&mut self) {
+        self.cur = 1 - self.cur;
+    }
+
+    /// Desenha o quadro atual, ou (`t`) o gerado na fração `t` entre o atual e o outro.
+    fn render(&mut self, t: Option<f32>) {
+        #[cfg(test)]
+        let waited = Instant::now();
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             _ => {
@@ -397,19 +454,36 @@ impl Gpu {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if let Some((_, _, bind, w, h)) = &self.planes {
+            if let Some(p) = &self.sets[self.cur] {
                 // Mantém a proporção (barras pretas onde sobrar).
                 let (sw, sh) = (self.config.width as f32, self.config.height as f32);
-                let scale = (sw / *w as f32).min(sh / *h as f32);
-                let (vw, vh) = (*w as f32 * scale, *h as f32 * scale);
+                let scale = (sw / p.w as f32).min(sh / p.h as f32);
+                let (vw, vh) = (p.w as f32 * scale, p.h as f32 * scale);
                 pass.set_viewport((sw - vw) / 2.0, (sh - vh) / 2.0, vw, vh, 0.0, 1.0);
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, bind, &[]);
-                pass.draw(0..3, 0..1);
+                let drew_mid = match (t, &self.sets[1 - self.cur]) {
+                    (Some(t), Some(next)) => self.interp.draw(
+                        &self.device,
+                        &self.queue,
+                        &mut pass,
+                        PlaneViews { y: &p.y_view, uv: &p.uv_view },
+                        PlaneViews { y: &next.y_view, uv: &next.uv_view },
+                        t,
+                    ),
+                    _ => false,
+                };
+                if !drew_mid {
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(0, &p.bind, &[]);
+                    pass.draw(0..3, 0..1);
+                }
             }
         }
+        #[cfg(test)]
+        let waited = waited.elapsed();
         self.queue.submit([enc.finish()]);
         self.queue.present(frame);
+        #[cfg(test)]
+        TRACE.lock().unwrap().push((Instant::now(), t.is_some(), waited));
     }
 }
 
@@ -424,45 +498,92 @@ fn render_thread(hwnd: isize, rx: Receiver<Msg>, ready: SyncSender<Res<()>>) {
             return;
         }
     };
-    let mut last_render = Instant::now();
-    while let Ok(msg) = rx.recv() {
-        let mut latest: Option<Nv12Frame> = None;
+    // Próximos desenhos com horário marcado: Some(t) = quadro gerado na fração t entre o
+    // atual e o preparado; None = mostrar o preparado (quadro real).
+    let mut schedule: std::collections::VecDeque<(Instant, Option<f32>)> = Default::default();
+    // Quadros que chegaram enquanto a agenda do par anterior ainda não terminou. Na rede
+    // os quadros chegam em grupos; descartar o real que esperava a vez (como antes)
+    // dava um engasgo a cada grupo.
+    let mut queue: std::collections::VecDeque<Msg> = Default::default();
+    loop {
+        let wait = match (schedule.front(), queue.is_empty()) {
+            (Some((at, _)), _) => Some(at.saturating_duration_since(Instant::now())),
+            (None, false) => Some(Duration::ZERO),
+            (None, true) => None,
+        };
+        let msg = match wait {
+            Some(w) => match rx.recv_timeout(w) {
+                Ok(m) => Some(m),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() {
+                Ok(m) => Some(m),
+                Err(_) => break,
+            },
+        };
         let mut redraw = false;
-        let mut handle = |m: Msg, gpu: &mut Gpu, latest: &mut Option<Nv12Frame>| -> bool {
+        for m in msg.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             match m {
-                Msg::Frame(f) => *latest = Some(f),
+                Msg::Stop => return,
                 Msg::Resize(w, h) => {
                     gpu.resize(w, h);
                     redraw = true;
                 }
-                Msg::Stop => return false,
-            }
-            true
-        };
-        if !handle(msg, &mut gpu, &mut latest) {
-            break;
-        }
-        // Junta mensagens pendentes: só o quadro mais novo importa.
-        let mut stop = false;
-        while let Ok(m) = rx.try_recv() {
-            if !handle(m, &mut gpu, &mut latest) {
-                stop = true;
-                break;
+                m => queue.push_back(m),
             }
         }
-        if stop {
-            break;
+        // Muito atrasado: pula para o quadro mais novo (gerar entre quadros que não são
+        // vizinhos daria errado, então ele entra como quadro normal).
+        if queue.len() > 3 {
+            if schedule.iter().any(|(_, step)| step.is_none()) {
+                gpu.advance();
+            }
+            schedule.clear();
+            let newest = queue.pop_back().unwrap();
+            queue.clear();
+            queue.push_back(match newest {
+                Msg::Interp { next, .. } => Msg::Frame(next),
+                m => m,
+            });
         }
-        if let Some(f) = latest {
-            gpu.upload(&f);
-            redraw = true;
+        // O que já está na hora.
+        let now = Instant::now();
+        if let Some(&(at, step)) = schedule.front() {
+            if at <= now {
+                schedule.pop_front();
+                if step.is_none() {
+                    gpu.advance();
+                }
+                gpu.render(step);
+                continue;
+            }
+        }
+        // Agenda vazia: próximo quadro da fila.
+        if schedule.is_empty() {
+            match queue.pop_front() {
+                Some(Msg::Frame(f)) => {
+                    gpu.show(&f);
+                    continue;
+                }
+                Some(Msg::Interp { next, mid, steps, next_at }) => {
+                    if gpu.prepare_interp(&next, &mid) {
+                        // Chegou atrasado (esperou o par anterior): desloca a agenda inteira,
+                        // mantendo o espaçamento entre os quadros.
+                        let first = steps.first().map(|s| s.0).unwrap_or(next_at);
+                        let shift = now.saturating_duration_since(first);
+                        schedule.extend(steps.into_iter().map(|(at, t)| (at + shift, Some(t))));
+                        schedule.push_back((next_at + shift, None));
+                    }
+                    continue;
+                }
+                _ => {}
+            }
         }
         if redraw {
-            gpu.render();
-            last_render = Instant::now();
+            gpu.render(None);
         }
     }
-    let _ = last_render;
 }
 
 #[cfg(test)]
@@ -480,6 +601,103 @@ mod tests {
                 }
             }
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Caminho completo de quem assiste com fps escolhido: captura a 30 fps -> encoder ->
+    /// decoder -> gerador de quadros -> player numa janela. Mede o intervalo entre os
+    /// quadros que vão para a tela (engasgo = intervalo bem maior que o esperado).
+    /// `cargo test framegen_smoothness -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn framegen_smoothness_end_to_end() {
+        use crate::video::{Callbacks, VideoPipeline, VideoSettings};
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::Arc;
+        crate::media::mf_init().unwrap();
+        let parent = unsafe {
+            CreateWindowExW(WS_EX_TOPMOST, w!("STATIC"), w!("teste fluidez"), WS_POPUP | WS_VISIBLE, 50, 50, 960, 540, None, None, None, None).unwrap()
+        };
+        pump(100);
+        let player = Player::create_in(parent.0 as isize).expect("player");
+        player.set_rect(0, 0, 960, 540, true);
+        let feed = player.feed();
+        let view_fps = Arc::new(AtomicU32::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        // Simula a rede: um quadro em três chega 14 ms adiantado (chegadas em grupos).
+        let jitter = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, Duration)>();
+        let src = crate::capture::list_sources().into_iter().find(|s| s.primary).unwrap();
+        let pipe = VideoPipeline::start(src.id, VideoSettings { res: 1080, fps: 30, bitrate: 8000, cursor: true }, Callbacks {
+            on_packet: Arc::new(move |d, dur| { let _ = tx.send((d, dur)); }),
+            on_info: Arc::new(|_| {}), on_preview: Arc::new(|_| {}),
+            on_error: Arc::new(|e| println!("ERRO {e}")), on_source_closed: Arc::new(|| {}),
+        }).unwrap();
+        let (vf, st, jt) = (view_fps.clone(), stop.clone(), jitter.clone());
+        let late = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+        let lt = late.clone();
+        let decode = std::thread::spawn(move || {
+            crate::media::mf_init().unwrap();
+            unsafe { windows::Win32::Media::timeBeginPeriod(1); }
+            let mut dec = crate::media::Decoder::new().unwrap();
+            let mut playout = crate::playout::Playout::new();
+            let mut presenter = crate::framegen::Presenter::new();
+            let mut ts = 0u32;
+            let mut count = 0u64;
+            while !st.load(Ordering::SeqCst) {
+                let Ok((data, dur)) = rx.recv_timeout(Duration::from_millis(500)) else { continue };
+                ts = ts.wrapping_add((dur.as_secs_f64() * 90000.0).round() as u32);
+                for f in dec.decode(&data, 0).unwrap_or_default() {
+                    count += 1;
+                    let mut at = playout.schedule(ts);
+                    if jt.load(Ordering::Relaxed) && count % 3 == 1 {
+                        at -= Duration::from_millis(14);
+                    }
+                    presenter.present(f, ts, at, vf.load(Ordering::Relaxed), &feed);
+                    // Quanto passou do horário ao entregar (o gerador roda antes da espera).
+                    lt.lock().unwrap().push(Instant::now().saturating_duration_since(at).as_secs_f64() * 1000.0);
+                }
+            }
+        });
+        pump(1500);
+        let mut results = vec![];
+        for (target, irregular) in [(0u32, false), (60, false), (120, false), (60, true), (120, true)] {
+            view_fps.store(target, Ordering::Relaxed);
+            jitter.store(irregular, Ordering::Relaxed);
+            pump(1000); // estabiliza
+            TRACE.lock().unwrap().clear();
+            late.lock().unwrap().clear();
+            pump(5000);
+            let trace = TRACE.lock().unwrap().clone();
+            let iv: Vec<f64> = trace.windows(2).map(|w| (w[1].0 - w[0].0).as_secs_f64() * 1000.0).collect();
+            let expect = 1000.0 / if target == 0 { 30.0 } else { target as f64 };
+            let mean = iv.iter().sum::<f64>() / iv.len().max(1) as f64;
+            let sd = (iv.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / iv.len().max(1) as f64).sqrt();
+            let hitches = iv.iter().filter(|&&x| x > expect * 1.8).count();
+            let max = iv.iter().cloned().fold(0.0, f64::max);
+            let generated = trace.iter().filter(|t| t.1).count();
+            let wait_max = trace.iter().map(|t| t.2.as_secs_f64() * 1000.0).fold(0.0, f64::max);
+            let wait_avg = trace.iter().map(|t| t.2.as_secs_f64() * 1000.0).sum::<f64>() / trace.len().max(1) as f64;
+            let lt = late.lock().unwrap();
+            let late_max = lt.iter().cloned().fold(0.0, f64::max);
+            results.push((target, irregular, hitches, trace.len() as f64 / 5.0));
+            println!(
+                "{}alvo {:>3}: {:.1} quadros/s na tela ({} gerados) | intervalo médio {:.2} ms (esperado {:.2}), desvio {:.2}, máx {:.1}, {} engasgos | espera da tela média {:.2} ms, máx {:.1} | decodificação atrasada até {:.1} ms",
+                if irregular { "[chegadas irregulares] " } else { "" },
+                if target == 0 { "orig".to_string() } else { target.to_string() },
+                trace.len() as f64 / 5.0, generated, mean, expect, sd, max, hitches, wait_avg, wait_max, late_max
+            );
+        }
+        stop.store(true, Ordering::SeqCst);
+        pipe.stop();
+        decode.join().unwrap();
+        player.destroy();
+        unsafe { let _ = DestroyWindow(parent); }
+        for (target, irregular, hitches, fps) in results {
+            if target > 0 {
+                assert!(hitches <= 5, "alvo {target} (irregular: {irregular}): {hitches} engasgos");
+                assert!(fps > target as f64 * 0.9, "alvo {target} (irregular: {irregular}): só {fps:.1} quadros/s");
+            }
         }
     }
 
@@ -510,8 +728,27 @@ mod tests {
         let img = mon.capture_region((420 - mx) as u32, (280 - my) as u32, 1, 1).unwrap();
         let p = img.get_pixel(0, 0);
         println!("pixel no centro do player: {:?}", p.0);
+        assert!(p.0[0] > 180 && p.0[1] < 80 && p.0[2] < 80, "esperava vermelho, veio {:?}", p.0);
+
+        // Geração de quadros: o gerado na metade entre vermelho e azul (sem movimento) é a
+        // mistura, e o azul aparece no horário marcado.
+        let mut blue = vec![32u8; (w * h) as usize];
+        for _ in 0..(w * h / 4) { blue.push(240); blue.push(118); }
+        let zero = crate::nvof::FlowField { width: w / 4, height: h / 4, grid: 4, data: vec![0; (w / 4 * h / 4 * 2) as usize] };
+        let mid = crate::framegen::Midpoint {
+            flow: crate::nvof::FlowPair { forward: zero.clone(), backward: zero },
+            gap: Duration::from_millis(800),
+        };
+        let now = Instant::now();
+        player.feed().push_interp(Nv12Frame { width: w, height: h, stride: w, data: blue }, mid, vec![(now, 0.5)], now + Duration::from_millis(400));
+        pump(150);
+        let between = mon.capture_region((420 - mx) as u32, (280 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
+        pump(600);
+        let after = mon.capture_region((420 - mx) as u32, (280 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
+        println!("quadro gerado (t = 0,5): {between:?}, depois: {after:?}");
         player.destroy();
         unsafe { let _ = DestroyWindow(parent); }
-        assert!(p.0[0] > 180 && p.0[1] < 80 && p.0[2] < 80, "esperava vermelho, veio {:?}", p.0);
+        assert!(between[0] > 70 && between[2] > 70, "o quadro gerado devia misturar vermelho e azul: {between:?}");
+        assert!(after[2] > 180 && after[0] < 80, "depois devia ficar azul: {after:?}");
     }
 }
