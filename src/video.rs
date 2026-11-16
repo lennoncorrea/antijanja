@@ -564,4 +564,65 @@ mod tests {
         let last = infos.last().expect("sem estatísticas");
         assert!(last.fps >= 55.0, "FPS abaixo do alvo: {:.1}", last.fps);
     }
+
+    /// Diagnóstico do bitrate: tamanho de cada quadro (keyframe ou não) e kb/s por
+    /// segundo com a tela real. Fase 1 normal; fase 2 simula um espectador com perda
+    /// de pacotes pedindo keyframe a cada 300 ms (o mínimo que o host aceita).
+    /// `cargo test bitrate_profile -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bitrate_profile() {
+        let src = capture::list_sources().into_iter().find(|s| s.primary || s.kind == "monitor").expect("sem tela");
+        let frames = Arc::new(std::sync::Mutex::new(Vec::<(Instant, usize, bool)>::new()));
+        let f = frames.clone();
+        let pipe = VideoPipeline::start(
+            src.id,
+            VideoSettings { res: 1080, fps: 60, bitrate: 12000, cursor: true },
+            Callbacks {
+                on_packet: Arc::new(move |d, _| {
+                    let key = crate::media::has_nal(&d, 5);
+                    f.lock().unwrap().push((Instant::now(), d.len(), key));
+                }),
+                on_info: Arc::new(|i| println!("  [encoder] {} kb/s (alvo {}) {:.0} fps", i.kbps, i.target_kbps, i.fps)),
+                on_preview: Arc::new(|_| {}),
+                on_error: Arc::new(|e| println!("  ERRO {e}")),
+                on_source_closed: Arc::new(|| {}),
+            },
+        )
+        .expect("pipeline");
+        let t0 = Instant::now();
+        std::thread::sleep(Duration::from_secs(10));
+        println!("  --- fase 2: keyframe a cada 300 ms ---");
+        let t1 = Instant::now();
+        while t1.elapsed() < Duration::from_secs(8) {
+            pipe.keyframe();
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        pipe.stop();
+        let frames = frames.lock().unwrap();
+        let summary = |label: &str, from: Instant, to: Instant| {
+            let sel: Vec<_> = frames.iter().filter(|(t, _, _)| *t >= from && *t < to).collect();
+            let keys: Vec<usize> = sel.iter().filter(|x| x.2).map(|x| x.1).collect();
+            let deltas: Vec<usize> = sel.iter().filter(|x| !x.2).map(|x| x.1).collect();
+            let avg = |v: &[usize]| if v.is_empty() { 0 } else { v.iter().sum::<usize>() / v.len() };
+            println!(
+                "{label}: {} quadros, {} keyframes (média {} KB, máx {} KB), quadros normais média {} KB",
+                sel.len(), keys.len(), avg(&keys) / 1024, keys.iter().max().unwrap_or(&0) / 1024, avg(&deltas) / 1024
+            );
+            let secs = (to - from).as_secs();
+            let per_sec: Vec<String> = (0..secs)
+                .map(|s| {
+                    let (a, b) = (from + Duration::from_secs(s), from + Duration::from_secs(s + 1));
+                    let bytes: usize = sel.iter().filter(|x| x.0 >= a && x.0 < b).map(|x| x.1).sum();
+                    format!("{}", bytes * 8 / 1000)
+                })
+                .collect();
+            println!("  kb/s por segundo: {}", per_sec.join(" "));
+            // Maior rajada: bytes de um único quadro em relação ao que a rede recebe num quadro.
+            let per_frame_budget = 12_000_000 / 8 / 60;
+            println!("  maior quadro = {:.0}x o orçamento de um quadro ({} KB)", *keys.iter().chain(deltas.iter()).max().unwrap_or(&0) as f64 / per_frame_budget as f64, per_frame_budget / 1024);
+        };
+        summary("fase 1 (normal)", t0, t1);
+        summary("fase 2 (keyframes)", t1, Instant::now());
+    }
 }
