@@ -20,8 +20,9 @@ pub struct Settings {
     pub volume: u32,
     pub public: bool,
     pub view_volume: u32,
-    /// Gerar quadros intermediários nas streams assistidas (NVIDIA Optical Flow).
-    pub framegen: bool,
+    /// fps para assistir (0 = o da stream). Acima do da stream, gera quadros
+    /// intermediários (placa NVIDIA); abaixo, descarta.
+    pub view_fps: u32,
 }
 
 impl Default for Settings {
@@ -39,7 +40,7 @@ impl Default for Settings {
             volume: 100,
             public: true,
             view_volume: 100,
-            framegen: false,
+            view_fps: 0,
         }
     }
 }

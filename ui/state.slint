@@ -189,10 +189,11 @@ export global App {
     callback toggle-fullscreen(string);
     callback set-volume(string, int);
     callback toggle-mute(string);
-    // Geração de quadros (NVIDIA Optical Flow): vale para todas as streams.
+    // fps para assistir ("0" = o da stream), vale para todas as streams. Acima do da
+    // stream precisa de placa NVIDIA (geração de quadros).
     in property <bool> framegen-available;
-    in property <bool> framegen;
-    callback toggle-framegen();
+    in property <string> view-fps: "0";
+    callback set-view-fps(string);
     callback unfocus();
 
     // ------------------------------------------------- Avisos e atualização

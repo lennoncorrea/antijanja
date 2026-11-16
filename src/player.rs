@@ -31,9 +31,9 @@ static LAST_MOVE: AtomicIsize = AtomicIsize::new(0);
 
 enum Msg {
     Frame(Nv12Frame),
-    /// Geração de quadros: mostra já o quadro do meio entre o atual e `next`, e o `next`
-    /// em `show_next_at`.
-    Mid { next: Nv12Frame, mid: Midpoint, show_next_at: Instant },
+    /// Geração de quadros: entre o quadro atual e `next`, mostra o quadro gerado na fração
+    /// `t` em cada horário de `steps`; depois `next` em `next_at`.
+    Interp { next: Nv12Frame, mid: Midpoint, steps: Vec<(Instant, f32)>, next_at: Instant },
     Resize(u32, u32),
     Stop,
 }
@@ -185,9 +185,10 @@ impl PlayerFeed {
         let _ = self.tx.try_send(Msg::Frame(frame));
     }
 
-    /// Mostra agora o quadro do meio e `next` em `show_next_at` (ver `framegen`).
-    pub fn push_mid(&self, next: Nv12Frame, mid: Midpoint, show_next_at: Instant) {
-        let _ = self.tx.try_send(Msg::Mid { next, mid, show_next_at });
+    /// Quadros gerados entre o atual e `next` (`steps` = horário e fração de cada um),
+    /// depois `next` em `next_at` (ver `framegen`).
+    pub fn push_interp(&self, next: Nv12Frame, mid: Midpoint, steps: Vec<(Instant, f32)>, next_at: Instant) {
+        let _ = self.tx.try_send(Msg::Interp { next, mid, steps, next_at });
     }
 }
 
@@ -401,28 +402,29 @@ impl Gpu {
     /// Quadro novo normal: substitui o mostrado.
     fn show(&mut self, f: &Nv12Frame) {
         self.upload(f, self.cur);
-        self.render(false);
+        self.render(None);
     }
 
-    /// Quadro do meio entre o mostrado e `next`; `next` passa a ser o atual (aparece no
-    /// próximo `render(false)`). Devolve false se não deu para interpolar (aí `next` já
-    /// foi mostrado direto).
-    fn show_mid(&mut self, next: &Nv12Frame, mid: &Midpoint) -> bool {
+    /// Prepara os quadros gerados entre o mostrado e `next` (que vai para o outro
+    /// conjunto). Devolve false se não dá para interpolar (aí `next` já foi mostrado).
+    fn prepare_interp(&mut self, next: &Nv12Frame, mid: &Midpoint) -> bool {
         let same_size = matches!(&self.sets[self.cur], Some(p) if (p.w, p.h) == (next.width, next.height));
         if !same_size {
             self.show(next);
             return false;
         }
-        let other = 1 - self.cur;
-        self.upload(next, other);
+        self.upload(next, 1 - self.cur);
         self.interp.upload_flow(&self.device, &self.queue, &mid.flow);
-        self.render(true);
-        self.cur = other;
         true
     }
 
-    /// Desenha o quadro atual, ou (`mid`) o do meio entre o atual e o outro conjunto.
-    fn render(&mut self, mid: bool) {
+    /// O quadro preparado em `prepare_interp` passa a ser o mostrado.
+    fn advance(&mut self) {
+        self.cur = 1 - self.cur;
+    }
+
+    /// Desenha o quadro atual, ou (`t`) o gerado na fração `t` entre o atual e o outro.
+    fn render(&mut self, t: Option<f32>) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             _ => {
@@ -452,16 +454,17 @@ impl Gpu {
                 let scale = (sw / p.w as f32).min(sh / p.h as f32);
                 let (vw, vh) = (p.w as f32 * scale, p.h as f32 * scale);
                 pass.set_viewport((sw - vw) / 2.0, (sh - vh) / 2.0, vw, vh, 0.0, 1.0);
-                let drew_mid = mid
-                    && match &self.sets[1 - self.cur] {
-                        Some(next) => self.interp.draw(
-                            &self.device,
-                            &mut pass,
-                            PlaneViews { y: &p.y_view, uv: &p.uv_view },
-                            PlaneViews { y: &next.y_view, uv: &next.uv_view },
-                        ),
-                        None => false,
-                    };
+                let drew_mid = match (t, &self.sets[1 - self.cur]) {
+                    (Some(t), Some(next)) => self.interp.draw(
+                        &self.device,
+                        &self.queue,
+                        &mut pass,
+                        PlaneViews { y: &p.y_view, uv: &p.uv_view },
+                        PlaneViews { y: &next.y_view, uv: &next.uv_view },
+                        t,
+                    ),
+                    _ => false,
+                };
                 if !drew_mid {
                     pass.set_pipeline(&self.pipeline);
                     pass.set_bind_group(0, &p.bind, &[]);
@@ -485,15 +488,19 @@ fn render_thread(hwnd: isize, rx: Receiver<Msg>, ready: SyncSender<Res<()>>) {
             return;
         }
     };
-    // Quadro real esperando a vez depois de um quadro do meio.
-    let mut show_next_at: Option<Instant> = None;
+    // Próximos desenhos com horário marcado: Some(t) = quadro gerado na fração t entre o
+    // atual e o preparado; None = mostrar o preparado (quadro real).
+    let mut schedule: std::collections::VecDeque<(Instant, Option<f32>)> = Default::default();
     loop {
-        let first = match show_next_at {
-            Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+        let first = match schedule.front().copied() {
+            Some((at, step)) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
                 Ok(m) => m,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    show_next_at = None;
-                    gpu.render(false);
+                    schedule.pop_front();
+                    if step.is_none() {
+                        gpu.advance();
+                    }
+                    gpu.render(step);
                     continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -524,23 +531,26 @@ fn render_thread(hwnd: isize, rx: Receiver<Msg>, ready: SyncSender<Res<()>>) {
                 }
             }
         }
+        if latest.is_some() {
+            // Chegou quadro novo antes de terminar os gerados: o real que esperava a vez
+            // passa a ser o atual (é o "A" do próximo par).
+            if schedule.iter().any(|(_, step)| step.is_none()) {
+                gpu.advance();
+            }
+            schedule.clear();
+        }
         match latest {
-            Some(Msg::Frame(f)) => {
-                show_next_at = None;
-                gpu.show(&f);
+            Some(Msg::Frame(f)) => gpu.show(&f),
+            // Atrasado (mais de um quadro na fila): gerar entre quadros que não são
+            // vizinhos daria errado; mostra o mais novo direto.
+            Some(Msg::Interp { next, .. }) if frames > 1 => gpu.show(&next),
+            Some(Msg::Interp { next, mid, steps, next_at }) => {
+                if gpu.prepare_interp(&next, &mid) {
+                    schedule.extend(steps.into_iter().map(|(at, t)| (at, Some(t))));
+                    schedule.push_back((next_at, None));
+                }
             }
-            // Atrasado (mais de um quadro na fila): o quadro do meio seria entre quadros
-            // que não são vizinhos; mostra o mais novo direto.
-            Some(Msg::Mid { next, .. }) if frames > 1 => {
-                show_next_at = None;
-                gpu.show(&next);
-            }
-            // Se ainda havia um quadro real esperando (do quadro do meio anterior), ele já
-            // está no conjunto atual e vira o "A" deste.
-            Some(Msg::Mid { next, mid, show_next_at: at }) => {
-                show_next_at = gpu.show_mid(&next, &mid).then_some(at);
-            }
-            _ if redraw => gpu.render(false),
+            _ if redraw => gpu.render(None),
             _ => {}
         }
     }
@@ -593,24 +603,25 @@ mod tests {
         println!("pixel no centro do player: {:?}", p.0);
         assert!(p.0[0] > 180 && p.0[1] < 80 && p.0[2] < 80, "esperava vermelho, veio {:?}", p.0);
 
-        // Geração de quadros: o do meio entre vermelho e azul (sem movimento) é a mistura,
-        // e o azul aparece no horário marcado.
+        // Geração de quadros: o gerado na metade entre vermelho e azul (sem movimento) é a
+        // mistura, e o azul aparece no horário marcado.
         let mut blue = vec![32u8; (w * h) as usize];
         for _ in 0..(w * h / 4) { blue.push(240); blue.push(118); }
         let zero = crate::nvof::FlowField { width: w / 4, height: h / 4, grid: 4, data: vec![0; (w / 4 * h / 4 * 2) as usize] };
         let mid = crate::framegen::Midpoint {
             flow: crate::nvof::FlowPair { forward: zero.clone(), backward: zero },
-            half_gap: Duration::from_millis(400),
+            gap: Duration::from_millis(800),
         };
-        player.feed().push_mid(Nv12Frame { width: w, height: h, stride: w, data: blue }, mid, Instant::now() + Duration::from_millis(400));
+        let now = Instant::now();
+        player.feed().push_interp(Nv12Frame { width: w, height: h, stride: w, data: blue }, mid, vec![(now, 0.5)], now + Duration::from_millis(400));
         pump(150);
         let between = mon.capture_region((420 - mx) as u32, (280 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
         pump(600);
         let after = mon.capture_region((420 - mx) as u32, (280 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
-        println!("quadro do meio: {between:?}, depois: {after:?}");
+        println!("quadro gerado (t = 0,5): {between:?}, depois: {after:?}");
         player.destroy();
         unsafe { let _ = DestroyWindow(parent); }
-        assert!(between[0] > 70 && between[2] > 70, "o quadro do meio devia misturar vermelho e azul: {between:?}");
+        assert!(between[0] > 70 && between[2] > 70, "o quadro gerado devia misturar vermelho e azul: {between:?}");
         assert!(after[2] > 180 && after[0] < 80, "depois devia ficar azul: {after:?}");
     }
 }

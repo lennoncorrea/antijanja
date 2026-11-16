@@ -2,8 +2,8 @@
 // A posição de cada tile vem do Rust, que põe o player nativo exatamente sobre a
 // área de vídeo. Por isso as alturas do cabeçalho (44) e do rodapé (40) são fixas.
 import { Theme } from "theme.slint";
-import { App, Tile } from "state.slint";
-import { Badge, Btn, Cover, EmptyState, Icon, Slider, Spinner, TextField } from "widgets.slint";
+import { App, Tile, SelectOption } from "state.slint";
+import { Badge, Btn, Cover, EmptyState, Icon, Segmented, Slider, Spinner, TextField } from "widgets.slint";
 
 component AddBar inherits Rectangle {
     height: 60px;
@@ -106,6 +106,15 @@ component Step inherits HorizontalLayout {
 
 component TileView inherits Rectangle {
     in property <Tile> t;
+    // Acima do fps da stream só com geração de quadros (placa NVIDIA).
+    property <[SelectOption]> fps-options: App.framegen-available
+        ? [{ value: "0", label: "Original" }, { value: "30", label: "30" }, { value: "60", label: "60" }, { value: "120", label: "120" }, { value: "144", label: "144" }]
+        : [{ value: "0", label: "Original" }, { value: "30", label: "30" }, { value: "60", label: "60" }];
+    property <string> next-fps: App.view-fps == "0" ? "30"
+        : App.view-fps == "30" ? "60"
+        : App.view-fps == "60" ? (App.framegen-available ? "120" : "0")
+        : App.view-fps == "120" ? "144"
+        : "0";
     property <bool> bare: App.fullscreen;
     background: Theme.card;
     border-radius: bare ? 0px : 12px;
@@ -256,22 +265,35 @@ component TileView inherits Rectangle {
                     font-family: Theme.mono;
                     vertical-alignment: center;
                 }
-                // Geração de quadros: só com placa NVIDIA compatível.
-                if App.framegen-available : VerticalLayout {
+                // fps para assistir. Acima do da stream, a placa NVIDIA gera os quadros.
+                Rectangle { width: 6px; }
+                Text {
+                    text: "FPS";
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: Theme.muted-fg;
+                    vertical-alignment: center;
+                }
+                if root.width >= 640px : VerticalLayout {
+                    alignment: center;
+                    Segmented {
+                        height: 28px;
+                        options: root.fps-options;
+                        value: App.view-fps;
+                        selected(v) => { App.set-view-fps(v); }
+                    }
+                }
+                // Tile estreito: um botão que passa para a próxima opção.
+                if root.width < 640px : VerticalLayout {
                     alignment: center;
                     Btn {
                         height: 28px;
-                        kind: App.framegen ? "primary" : "ghost";
+                        kind: "outline";
                         font-size: 12px;
                         pad: 10px;
-                        text: "Suavizar";
-                        icon: @image-url("icons/gauge.svg");
-                        has-icon: true;
-                        icon-size: 14px;
-                        accessible-label: App.framegen
-                            ? "Suavizar movimento ligado: gera quadros intermediários com a placa NVIDIA (streams de até 45 fps viram o dobro)"
-                            : "Suavizar movimento: gera quadros intermediários com a placa NVIDIA (streams de até 45 fps viram o dobro)";
-                        clicked => { App.toggle-framegen(); }
+                        text: App.view-fps == "0" ? "Original" : App.view-fps;
+                        accessible-label: "fps para assistir: clique para trocar";
+                        clicked => { App.set-view-fps(root.next-fps); }
                     }
                 }
             }

@@ -595,8 +595,8 @@ pub fn host_stop(app: &AppHandle) {
 
 struct ViewerState {
     gen: u64,
-    /// Gerar quadros intermediários (lido pela thread de decodificação).
-    framegen: Arc<AtomicBool>,
+    /// fps escolhido para assistir (0 = o da stream; lido pela thread de decodificação).
+    view_fps: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
     session: Option<Arc<ViewerSession>>,
     player: Option<Player>,
@@ -627,8 +627,8 @@ struct ViewerStats {
     kbps: u32,
     /// Atraso atual do buffer de reprodução (ms).
     buffer_ms: u32,
-    /// Quadros gerados por segundo (geração de quadros ligada).
-    gen_fps: f32,
+    /// Quadros mostrados por segundo (difere de `fps` com fps escolhido para assistir).
+    shown_fps: f32,
 }
 
 fn main_hwnd(app: &AppHandle) -> Res<isize> {
@@ -644,14 +644,14 @@ fn emit_viewer(app: &AppHandle, event: &str, id: &str, value: serde_json::Value)
 
 /// Entra numa transmissão pelo código. `id` identifica o tile na interface.
 /// Volta com o nome do host quando a conexão é montada.
-pub async fn viewer_join(app: AppHandle, id: String, code: String, name: String, volume: u32, framegen: bool) -> Res<String> {
+pub async fn viewer_join(app: AppHandle, id: String, code: String, name: String, volume: u32, view_fps: u32) -> Res<String> {
     leave_viewer(&app, &id).await;
     let gen = VIEWER_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let stop = Arc::new(AtomicBool::new(false));
     let vol = volume.min(100) as f32 / 100.0;
-    let framegen = Arc::new(AtomicBool::new(framegen));
+    let view_fps = Arc::new(AtomicU32::new(view_fps));
     with_viewers(|m| {
-        m.insert(id.clone(), ViewerState { gen, framegen: framegen.clone(), stop: stop.clone(), session: None, player: None, playback: None, volume: vol, muted: false });
+        m.insert(id.clone(), ViewerState { gen, view_fps: view_fps.clone(), stop: stop.clone(), session: None, player: None, playback: None, volume: vol, muted: false });
     });
     let step = |s: &str| emit_viewer(&app, "viewer-step", &id, s.into());
     step("prepare");
@@ -677,7 +677,7 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, name: String,
     {
         let (app, bytes_in, id) = (app.clone(), bytes_in.clone(), id.clone());
         let (wait_idr, want_kf) = (wait_idr.clone(), want_kf.clone());
-        let framegen = framegen.clone();
+        let view_fps = view_fps.clone();
         std::thread::Builder::new()
             .name("aj-decode".into())
             .spawn(move || {
@@ -690,7 +690,8 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, name: String,
                 let mut stats = ViewerStats { id, ..Default::default() };
                 let mut kbps_avg = 0.0f64;
                 let mut fg = crate::framegen::FrameGen::new();
-                let (mut fg_on, mut generated) = (false, 0u32);
+                let mut pacer = crate::framegen::Pacer::new();
+                let (mut fg_active, mut shown, mut prev_ts) = (false, 0u32, None::<u32>);
                 while let Ok((data, ts)) = drx.recv() {
                     if wait_idr.load(Ordering::SeqCst) && !crate::media::has_nal(&data, 5) {
                         continue; // restos de antes da perda, ainda na fila
@@ -705,24 +706,36 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, name: String,
                             stats.width = f.width;
                             stats.height = f.height;
                             frames += 1;
-                            // Geração de quadros: o do meio entre o anterior e este.
-                            let on = framegen.load(Ordering::Relaxed);
-                            if fg_on && !on {
+                            // Horário certo (absorve a variação da rede e do host).
+                            let at = playout.schedule(ts);
+                            let gap_ms = prev_ts.map(|p| ts.wrapping_sub(p) as f64 / 90.0);
+                            prev_ts = Some(ts);
+                            // fps escolhido para assistir: descarta, mostra ou gera quadros.
+                            let pacing = pacer.decide(at, gap_ms, view_fps.load(Ordering::Relaxed));
+                            let wants = matches!(pacing, crate::framegen::Pacing::Generate(_));
+                            if fg_active && !wants {
                                 fg.clear();
                             }
-                            fg_on = on;
-                            let mid = if on { fg.process(&f, ts) } else { None };
-                            // Mostra no horário certo (absorve a variação da rede e do host).
-                            let at = playout.schedule(ts);
-                            crate::playout::sleep_until(at);
-                            match mid {
-                                // O do meio agora, este meio intervalo depois.
-                                Some(m) => {
-                                    generated += 1;
-                                    let next_at = at.max(Instant::now()) + m.half_gap;
-                                    feed.push_mid(f, m, next_at);
+                            fg_active = wants;
+                            // Todo quadro mostrado passa pelo gerador enquanto ele está ativo
+                            // (o "anterior" dele tem que ser o que está na tela).
+                            let interp = if wants { fg.process(&f, ts) } else { None };
+                            match (pacing, interp) {
+                                (crate::framegen::Pacing::Skip, _) => {}
+                                (crate::framegen::Pacing::Generate(n), Some(m)) => {
+                                    crate::playout::sleep_until(at);
+                                    // n-1 quadros gerados ao longo do intervalo, depois o real.
+                                    let base = at.max(Instant::now());
+                                    let step = m.gap / n;
+                                    let steps = (1..n).map(|j| (base + step * (j - 1), j as f32 / n as f32)).collect();
+                                    feed.push_interp(f, m, steps, base + step * (n - 1));
+                                    shown += n;
                                 }
-                                None => feed.push(f),
+                                _ => {
+                                    crate::playout::sleep_until(at);
+                                    feed.push(f);
+                                    shown += 1;
+                                }
                             }
                         }
                     }
@@ -730,8 +743,8 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, name: String,
                     let el = win.elapsed();
                     if el >= Duration::from_secs(1) {
                         stats.fps = frames as f32 / el.as_secs_f32();
-                        stats.gen_fps = generated as f32 / el.as_secs_f32();
-                        generated = 0;
+                        stats.shown_fps = shown as f32 / el.as_secs_f32();
+                        shown = 0;
                         // Média móvel de ~3 s: a taxa real pula a cada keyframe e com o
                         // movimento da imagem; o número na tela não precisa pular junto.
                         let now_kbps = bytes_in.swap(0, Ordering::SeqCst) as f64 * 8.0 / el.as_secs_f64() / 1000.0;
@@ -891,11 +904,11 @@ pub fn player_rect(id: String, x: i32, y: i32, width: i32, height: i32, visible:
     });
 }
 
-/// Liga/desliga a geração de quadros de uma stream.
-pub fn viewer_framegen(id: &str, on: bool) {
+/// fps para assistir uma stream (0 = o da stream).
+pub fn viewer_view_fps(id: &str, fps: u32) {
     with_viewers(|m| {
         if let Some(v) = m.get(id) {
-            v.framegen.store(on, Ordering::Relaxed);
+            v.view_fps.store(fps, Ordering::Relaxed);
         }
     });
 }

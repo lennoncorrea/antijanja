@@ -430,9 +430,9 @@ fn relayout(c: &Ctl, ui: &AppWindow) {
             watching: v.watching,
             step: v.step,
             res: s(if stats.is_some() {
-                let (fps, gen) = (num("fps").round() as u32, num("gen_fps").round() as u32);
-                // Com geração de quadros: "30→60fps" (recebidos → mostrados).
-                if gen > 0 { format!("{}p {}→{}fps", num("height") as u32, fps, fps + gen) } else { format!("{}p {}fps", num("height") as u32, fps) }
+                let (fps, shown) = (num("fps").round() as u32, num("shown_fps").round() as u32);
+                // fps escolhido para assistir: "30→120fps" (recebidos → mostrados).
+                if shown.abs_diff(fps) > 2 { format!("{}p {}→{}fps", num("height") as u32, fps, shown) } else { format!("{}p {}fps", num("height") as u32, fps) }
             } else {
                 String::new()
             }),
@@ -747,9 +747,9 @@ fn join_with_code(c: &mut Ctl, ui: &AppWindow, raw: &str) {
     relayout(c, ui);
 
     let (app, name) = (c.app.clone(), my_name(c));
-    let framegen = c.s.framegen && c.framegen_available;
+    let view_fps = view_fps(c, ui);
     transport::tokio_rt().spawn(async move {
-        let r = session::viewer_join(app, id.clone(), code, name, volume, framegen).await;
+        let r = session::viewer_join(app, id.clone(), code, name, volume, view_fps).await;
         let _ = slint::invoke_from_event_loop(move || {
             with(|c, ui| match r {
                 Ok(host) => {
@@ -764,6 +764,38 @@ fn join_with_code(c: &mut Ctl, ui: &AppWindow, raw: &str) {
             });
         });
     });
+}
+
+/// fps para assistir que vale de verdade: o escolhido, sem passar do que o monitor
+/// mostra. (Sem placa NVIDIA compatível, o gerador desliga sozinho e só a redução vale.)
+fn view_fps(c: &Ctl, ui: &AppWindow) -> u32 {
+    match c.s.view_fps {
+        0 => 0,
+        f => f.min(monitor_hz(ui)),
+    }
+}
+
+/// Taxa de atualização (Hz) do monitor onde está a janela principal.
+fn monitor_hz(ui: &AppWindow) -> u32 {
+    use windows::Win32::Graphics::Gdi::*;
+    let fallback = 60;
+    let Some(hwnd) = hwnd_of(ui) else { return fallback };
+    unsafe {
+        let mon = MonitorFromWindow(windows::Win32::Foundation::HWND(hwnd as *mut _), MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if !GetMonitorInfoW(mon, &mut info as *mut _ as *mut MONITORINFO).as_bool() {
+            return fallback;
+        }
+        let mut mode = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
+        if !EnumDisplaySettingsW(windows::core::PCWSTR(info.szDevice.as_ptr()), ENUM_CURRENT_SETTINGS, &mut mode).as_bool() {
+            return fallback;
+        }
+        match mode.dmDisplayFrequency {
+            f if f >= 24 => f,
+            _ => fallback,
+        }
+    }
 }
 
 fn end_watching(c: &mut Ctl, ui: &AppWindow, id: &str, message: Option<&str>, is_error: bool) {
@@ -1085,16 +1117,19 @@ fn wire(ui: &AppWindow) {
         })
     });
     a.on_set_volume(|id, vol| later(move |c, ui| set_viewer_volume(c, ui, &id, vol.clamp(0, 100) as u32, false)));
-    a.on_toggle_framegen(|| {
-        later(|c, ui| {
-            c.s.framegen = !c.s.framegen;
+    a.on_set_view_fps(|v| {
+        later(move |c, ui| {
+            c.s.view_fps = v.parse().unwrap_or(0);
             settings::save(&c.s);
-            let on = c.s.framegen && c.framegen_available;
-            for v in &c.viewers {
-                session::viewer_framegen(&v.id, on);
+            let fps = view_fps(c, ui);
+            for x in &c.viewers {
+                session::viewer_view_fps(&x.id, fps);
             }
-            ui.global::<App>().set_framegen(c.s.framegen);
-            toast(c, ui, "", if on { "Suavizar movimento ligado: quadros gerados pela placa NVIDIA." } else { "Suavizar movimento desligado." });
+            ui.global::<App>().set_view_fps(s(c.s.view_fps.to_string()));
+            let hz = monitor_hz(ui);
+            if c.s.view_fps > 0 && fps < c.s.view_fps {
+                toast(c, ui, "", format!("Seu monitor mostra até {hz} quadros por segundo: assistindo a {fps} fps."));
+            }
         })
     });
     a.on_toggle_mute(|id| {
@@ -1274,7 +1309,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
     bg(session::framegen_available, |c, ui, ok| {
         c.framegen_available = ok;
         ui.global::<App>().set_framegen_available(ok);
-        ui.global::<App>().set_framegen(c.s.framegen);
+        ui.global::<App>().set_view_fps(s(c.s.view_fps.to_string()));
     });
     start_updater();
 

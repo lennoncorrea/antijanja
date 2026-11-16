@@ -1,10 +1,11 @@
-//! Geração de quadros no lado de quem assiste ("suavizar movimento").
+//! Geração de quadros no lado de quem assiste (assistir com mais fps que a stream).
 //!
-//! Com a stream a 30 fps, cada par de quadros consecutivos (A, B) ganha um quadro no
-//! meio: a NVIDIA Optical Flow (`nvof`) mede para onde cada bloco da imagem andou, e um
-//! shader desenha a imagem na metade do caminho, juntando A empurrada para frente e B
-//! puxada para trás. O quadro do meio aparece quando B chegaria, e B meio intervalo
-//! depois: ~16 ms a mais de atraso a 30 fps, em troca do dobro de fluidez.
+//! Entre cada par de quadros consecutivos (A, B), a NVIDIA Optical Flow (`nvof`) mede
+//! para onde cada bloco da imagem andou, e um shader desenha a imagem em qualquer ponto
+//! do caminho (fração `t` de 0 a 1), juntando A empurrada para frente e B puxada para
+//! trás. Para assistir a k vezes o fps da stream, cada intervalo ganha k-1 quadros
+//! gerados; o fluxo é calculado uma vez só por par. Custo: B aparece (k-1)/k de um
+//! intervalo mais tarde (a 30 fps: ~16 ms para 60, ~26 ms para 144).
 //!
 //! Em cada ponto, o shader testa alguns movimentos candidatos (os vetores de ida e de
 //! volta, o do bloco exato e "parado") e fica com o que faz A e B baterem melhor. Isso
@@ -15,18 +16,70 @@ use crate::media::Nv12Frame;
 use crate::nvof::{FlowField, FlowPair, OpticalFlow};
 use std::time::Duration;
 
-/// Só interpola streams entre ~14 e ~45 fps (intervalo entre quadros em ms). Acima disso
-/// o ganho é pequeno; abaixo, o movimento entre quadros é grande demais para ficar bom.
-const MIN_GAP_MS: f64 = 22.0;
+/// Intervalo entre quadros da stream que dá para interpolar (ms): até ~125 fps; abaixo de
+/// ~14 fps o movimento entre quadros é grande demais para ficar bom.
+const MIN_GAP_MS: f64 = 8.0;
 const MAX_GAP_MS: f64 = 70.0;
 /// Acima dessa fração de blocos inconsistentes, considera troca de cena.
 const MAX_INCONSISTENCY: f32 = 0.35;
 
-/// Quadro intermediário pronto para o player: o fluxo entre o quadro mostrado agora e
-/// `next`, e quanto tempo depois do quadro do meio o `next` deve aparecer.
+/// O que fazer com um quadro novo, dado o fps que quem assiste escolheu.
+#[derive(Debug, PartialEq)]
+pub enum Pacing {
+    /// Mostra como veio.
+    Show,
+    /// Descarta (fps escolhido menor que o da stream).
+    Skip,
+    /// Mostra com `n` quadros por intervalo da stream (n-1 gerados + o real).
+    Generate(u32),
+}
+
+/// Decide quadro a quadro como chegar ao fps escolhido por quem assiste.
+pub struct Pacer {
+    /// Próximo horário em que um quadro deve aparecer (ao reduzir o fps).
+    due: Option<std::time::Instant>,
+}
+
+impl Pacer {
+    pub fn new() -> Self {
+        Self { due: None }
+    }
+
+    /// `at`: quando este quadro apareceria. `gap_ms`: intervalo desde o quadro anterior da
+    /// stream. `target_fps`: o escolhido (0 = original).
+    pub fn decide(&mut self, at: std::time::Instant, gap_ms: Option<f64>, target_fps: u32) -> Pacing {
+        let (Some(gap), true) = (gap_ms.filter(|g| *g > 0.0), target_fps > 0) else {
+            self.due = None;
+            return Pacing::Show;
+        };
+        let target = Duration::from_secs_f64(1.0 / target_fps as f64);
+        let gap_d = Duration::from_secs_f64(gap / 1000.0);
+        if target.as_secs_f64() * 1000.0 > gap * 1.15 {
+            // Menos fps que a stream: mostra o quadro mais perto de cada horário marcado,
+            // e os horários andam de `target` em `target` (assim a média bate certinho,
+            // em vez de "um sim, um não").
+            return match self.due {
+                Some(due) if at + gap_d / 2 < due => Pacing::Skip,
+                Some(due) => {
+                    self.due = Some(if at > due + target { at + target } else { due + target });
+                    Pacing::Show
+                }
+                None => {
+                    self.due = Some(at + target);
+                    Pacing::Show
+                }
+            };
+        }
+        self.due = None;
+        let n = (gap / (target.as_secs_f64() * 1000.0)).round() as u32;
+        if n >= 2 { Pacing::Generate(n.min(8)) } else { Pacing::Show }
+    }
+}
+
+/// Movimento entre o quadro mostrado agora (A) e o novo (B), e o intervalo entre eles.
 pub struct Midpoint {
     pub flow: FlowPair,
-    pub half_gap: Duration,
+    pub gap: Duration,
 }
 
 /// Roda na thread de decodificação de cada stream.
@@ -41,8 +94,9 @@ impl FrameGen {
         Self { of: None, broken: false, prev_ts: None }
     }
 
-    /// Quadro novo decodificado (timestamp RTP de 90 kHz). Devolve o quadro do meio entre
-    /// o anterior e este, quando vale a pena.
+    /// Quadro novo decodificado (timestamp RTP de 90 kHz). Devolve o movimento entre o
+    /// anterior e este, quando dá para interpolar. Todo quadro mostrado tem que passar
+    /// por aqui (o "anterior" daqui tem que ser o que está na tela).
     pub fn process(&mut self, f: &Nv12Frame, ts: u32) -> Option<Midpoint> {
         if self.broken {
             return None;
@@ -76,7 +130,7 @@ impl FrameGen {
         if flow.inconsistency() > MAX_INCONSISTENCY {
             return None;
         }
-        Some(Midpoint { flow, half_gap: Duration::from_secs_f64(gap / 2000.0) })
+        Some(Midpoint { flow, gap: Duration::from_secs_f64(gap / 1000.0) })
     }
 
     /// Desligado pelo usuário: libera a placa e recomeça do zero quando ligar de novo.
@@ -108,6 +162,9 @@ fn vs(@builtin(vertex_index) i: u32) -> Out {
 @group(0) @binding(4) var flow_ab: texture_2d<i32>;
 @group(0) @binding(5) var flow_ba: texture_2d<i32>;
 @group(0) @binding(6) var samp: sampler;
+// Fração do caminho de A até B (0 = A, 1 = B).
+struct Params { t: f32, _p0: f32, _p1: f32, _p2: f32 };
+@group(0) @binding(7) var<uniform> params: Params;
 
 fn rgb(ty: texture_2d<f32>, tuv: texture_2d<f32>, uv: vec2<f32>) -> vec3<f32> {
     // BT.709, faixa limitada (16-235)
@@ -142,11 +199,11 @@ fn luma(t: texture_2d<f32>, p: vec2<f32>, size: vec2<f32>) -> f32 {
     return textureSampleLevel(t, samp, p / size, 0.0).r;
 }
 
-// Quanto A e B discordam se o movimento em `px` for `v` (A em px - v/2, B em px + v/2).
-// Compara uma cruz de 5 pontos (um pixel só é ruidoso demais).
+// Quanto A e B discordam se o movimento em `px` for `v` (A em px - t*v, B em
+// px + (1-t)*v). Compara uma cruz de 5 pontos (um pixel só é ruidoso demais).
 fn mismatch(px: vec2<f32>, v: vec2<f32>, size: vec2<f32>) -> f32 {
-    let pa = px - 0.5 * v;
-    let pb = px + 0.5 * v;
+    let pa = px - params.t * v;
+    let pb = px + (1.0 - params.t) * v;
     var e = 0.0;
     for (var i = 0; i < 5; i++) {
         var o = vec2(0.0, 0.0);
@@ -183,9 +240,10 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
             best = cands[i];
         }
     }
-    let ca = rgb(a_y, a_uv, (px - 0.5 * best) / size);
-    let cb = rgb(b_y, b_uv, (px + 0.5 * best) / size);
-    return vec4(mix(ca, cb, 0.5), 1.0);
+    let t = params.t;
+    let ca = rgb(a_y, a_uv, (px - t * best) / size);
+    let cb = rgb(b_y, b_uv, (px + (1.0 - t) * best) / size);
+    return vec4(mix(ca, cb, t), 1.0);
 }
 "#;
 
@@ -200,6 +258,7 @@ pub struct Interpolator {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    params: wgpu::Buffer,
     flows: Option<(wgpu::Texture, wgpu::Texture, u32, u32)>,
 }
 
@@ -229,6 +288,12 @@ impl Interpolator {
                     binding: 6,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
             ],
@@ -261,7 +326,13 @@ impl Interpolator {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        Self { pipeline, layout, sampler, flows: None }
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("framegen t"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self { pipeline, layout, sampler, params, flows: None }
     }
 
     /// Envia os vetores de ida e volta para a placa.
@@ -295,9 +366,21 @@ impl Interpolator {
         write(ba, &flow.backward);
     }
 
-    /// Desenha o quadro do meio entre `a` (mostrado agora) e `b` (o próximo) no passo atual.
-    pub fn draw(&self, device: &wgpu::Device, pass: &mut wgpu::RenderPass<'_>, a: PlaneViews<'_>, b: PlaneViews<'_>) -> bool {
+    /// Desenha o quadro na fração `t` do caminho entre `a` (mostrado agora) e `b` (o
+    /// próximo). Um desenho por envio à fila (o `t` vai num buffer compartilhado).
+    pub fn draw(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'_>,
+        a: PlaneViews<'_>,
+        b: PlaneViews<'_>,
+        t: f32,
+    ) -> bool {
         let Some((ab, ba, _, _)) = &self.flows else { return false };
+        let mut p = [0u8; 16];
+        p[..4].copy_from_slice(&t.clamp(0.0, 1.0).to_le_bytes());
+        queue.write_buffer(&self.params, 0, &p);
         let (ab, ba) = (ab.create_view(&Default::default()), ba.create_view(&Default::default()));
         let entry = |binding, view| wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(view) };
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -311,6 +394,7 @@ impl Interpolator {
                 entry(4, &ab),
                 entry(5, &ba),
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 7, resource: self.params.as_entire_binding() },
             ],
         });
         pass.set_pipeline(&self.pipeline);
@@ -328,6 +412,43 @@ fn bytemuck_i16(v: &[i16]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Simula `secs` segundos de uma stream a `src` fps vista a `target` fps; devolve
+    /// (quadros mostrados por segundo, decisões).
+    fn simulate(src: f64, target: u32, secs: f64) -> (f64, Vec<Pacing>) {
+        let t0 = std::time::Instant::now();
+        let mut p = Pacer::new();
+        let gap = 1000.0 / src;
+        let n = (src * secs) as usize;
+        let mut shown = 0.0;
+        let mut out = vec![];
+        for i in 0..n {
+            let at = t0 + Duration::from_secs_f64(i as f64 / src);
+            let d = p.decide(at, (i > 0).then_some(gap), target);
+            shown += match &d { Pacing::Show => 1.0, Pacing::Skip => 0.0, Pacing::Generate(k) => *k as f64 };
+            out.push(d);
+        }
+        (shown / secs, out)
+    }
+
+    #[test]
+    fn pacing_follows_the_chosen_fps() {
+        let fps = |src, target| simulate(src, target, 10.0).0;
+        let last = |src, target| simulate(src, target, 1.0).1.pop().unwrap();
+        assert!((fps(30.0, 0) - 30.0).abs() < 1.0, "original");
+        assert!((fps(30.0, 30) - 30.0).abs() < 1.0);
+        assert_eq!(last(30.0, 60), Pacing::Generate(2));
+        assert_eq!(last(30.0, 120), Pacing::Generate(4));
+        assert_eq!(last(30.0, 144), Pacing::Generate(5));
+        assert_eq!(last(60.0, 120), Pacing::Generate(2));
+        assert_eq!(last(60.0, 144), Pacing::Generate(2));
+        assert!((fps(30.0, 60) - 60.0).abs() < 2.0);
+        // Reduzindo: a média tem que bater, não "um sim, um não".
+        assert!((fps(60.0, 30) - 30.0).abs() < 1.0, "60 -> 30: {}", fps(60.0, 30));
+        assert!((fps(144.0, 60) - 60.0).abs() < 1.5, "144 -> 60: {}", fps(144.0, 60));
+        assert!((fps(144.0, 30) - 30.0).abs() < 1.0, "144 -> 30: {}", fps(144.0, 30));
+        assert!((fps(120.0, 60) - 60.0).abs() < 1.0, "120 -> 60: {}", fps(120.0, 60));
+    }
 
     /// Conteúdo real: captura a tela a 30 fps, codifica, decodifica e gera os quadros do
     /// meio, como acontece com quem assiste. Mede quantos saem e quanto custam.
@@ -411,7 +532,7 @@ mod tests {
         let mut fg = FrameGen::new();
         assert!(fg.process(&a, 0).is_none());
         let mid = fg.process(&b, 3000).expect("quadro do meio (33 ms entre A e B)");
-        assert!((mid.half_gap.as_secs_f64() * 1000.0 - 16.67).abs() < 0.1);
+        assert!((mid.gap.as_secs_f64() * 1000.0 - 33.33).abs() < 0.1);
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap();
@@ -457,34 +578,46 @@ mod tests {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mut enc = device.create_command_encoder(&Default::default());
-        {
-            let view = target.create_view(&Default::default());
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            assert!(interp.draw(&device, &mut pass, PlaneViews { y: &ay, uv: &auv }, PlaneViews { y: &by, uv: &buv }));
-        }
-        enc.copy_texture_to_buffer(
-            target.as_image_copy(),
-            wgpu::TexelCopyBufferInfo { buffer: &readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: None } },
-            target.size(),
-        );
-        queue.submit([enc.finish()]);
-        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        let px = readback.slice(..).get_mapped_range().unwrap().to_vec();
+        let render = |t: f32| -> Vec<u8> {
+            let mut enc = device.create_command_encoder(&Default::default());
+            {
+                let view = target.create_view(&Default::default());
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                assert!(interp.draw(&device, &queue, &mut pass, PlaneViews { y: &ay, uv: &auv }, PlaneViews { y: &by, uv: &buv }, t));
+            }
+            enc.copy_texture_to_buffer(
+                target.as_image_copy(),
+                wgpu::TexelCopyBufferInfo { buffer: &readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: None } },
+                target.size(),
+            );
+            queue.submit([enc.finish()]);
+            readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let px = readback.slice(..).get_mapped_range().unwrap().to_vec();
+            readback.unmap();
+            px
+        };
 
+        // Um quarto do caminho: quadrado de x 116 a 276.
+        let quarter = render(0.25);
+        let lq = |x: u32| quarter[((180 * w + x) * 4) as usize];
+        println!("t = 0,25: x=120 {}, x=272 {}, x=284 {}", lq(120), lq(272), lq(284));
+        assert!(lq(120) > 180 && lq(272) > 180, "quadrado devia ir de 116 a 276 em t = 0,25");
+        assert!(lq(284) < 140, "em t = 0,25 o quadrado ainda não chegou em x = 284");
+
+        let px = render(0.5);
         let lum = |x: u32, y: u32| px[((y * w + x) * 4) as usize];
         // Quadrado do meio: x de 132 a 292. Centro dele claro; bordas que só A ou só B
         // teriam (x 110 e x 310) devem ser fundo, não meio-termo de mistura.
