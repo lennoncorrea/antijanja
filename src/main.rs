@@ -20,6 +20,7 @@ mod congestion;
 mod gpu;
 mod media;
 mod nvof;
+mod pieces;
 mod player;
 mod playout;
 mod rendezvous;

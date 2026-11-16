@@ -31,6 +31,8 @@ bytes = "1.12.1"
 chacha20poly1305 = "0.11.0"
 # Mesma versão que o mainline usa (assinatura das respostas do host e do mural)
 ed25519-dalek = { version = "3", default-features = false }
+# Pedaços codificados da malha (docs/malha-p2p.md): qualquer k pedaços refazem o quadro
+raptorq = "2"
 flate2 = "1.1.11"
 futures = "0.3.34"
 getrandom = "0.4.3"

@@ -827,6 +827,114 @@ mod tests {
         assert!(r.qd > 50.0, "{r:?}");
     }
 
+    /// Etapa 0 da malha (docs/malha-p2p.md): o canal de dados do webrtc-rs aguenta o vídeo?
+    /// Canal fora de ordem e sem reenvio, mensagens de 1.100 bytes (um pedaço por pacote),
+    /// quadros a 60 fps soltos por um pacer. Mede taxa recebida, perda e atraso de cada
+    /// pedaço (mesma máquina: o atraso é só o da pilha SCTP/DTLS/ICE).
+    /// `cargo test datachannel_pieces -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn datachannel_pieces_throughput() {
+        use webrtc::data_channel::RTCDataChannelInit;
+        let t0 = Instant::now();
+        let got: Arc<Mutex<Vec<(u64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let (gtx_v, mut grx_v) = channel::<()>(1);
+        let (gtx_h, mut grx_h) = channel::<()>(1);
+        let host_dc: Arc<Mutex<Option<Arc<dyn DataChannel>>>> = Arc::new(Mutex::new(None));
+        let hd = host_dc.clone();
+        let on_dc: Arc<dyn Fn(Arc<dyn DataChannel>) + Send + Sync> = Arc::new(move |dc| {
+            *hd.lock().unwrap() = Some(dc);
+        });
+        let (ctx, crx) = std::sync::mpsc::channel();
+        let hh = Arc::new(Handler {
+            gathered: gtx_h,
+            on_state: Arc::new(move |e| { if e == PeerEvent::Connected { let _ = ctx.send(()); } }),
+            on_track: None,
+            on_dc: Some(on_dc),
+        });
+        let vh = Arc::new(Handler { gathered: gtx_v, on_state: Arc::new(|_| {}), on_track: None, on_dc: None });
+        let (host, viewer) = block_on(async { (build_pc(hh, false).await.unwrap(), build_pc(vh, false).await.unwrap()) });
+        let init = RTCDataChannelInit { ordered: false, max_retransmits: Some(0), ..Default::default() };
+        let vdc = block_on(viewer.create_data_channel("aj-p", Some(init))).unwrap();
+        let g = got.clone();
+        spawn(async move {
+            while let Some(ev) = vdc.poll().await {
+                if let DataChannelEvent::OnMessage(m) = ev {
+                    let d = &m.data;
+                    let seq = u64::from_le_bytes(d[0..8].try_into().unwrap());
+                    let sent = u64::from_le_bytes(d[8..16].try_into().unwrap());
+                    let now = t0.elapsed().as_micros() as u64;
+                    g.lock().unwrap().push((seq, now.saturating_sub(sent) as f64 / 1000.0));
+                }
+            }
+        });
+        block_on(async {
+            let offer = viewer.create_offer(None).await.unwrap();
+            viewer.set_local_description(offer).await.unwrap();
+            wait_gathering(&mut grx_v).await;
+            let o = viewer.local_description().await.unwrap().sdp;
+            host.set_remote_description(RTCSessionDescription::offer(o).unwrap()).await.unwrap();
+            let ans = host.create_answer(None).await.unwrap();
+            host.set_local_description(ans).await.unwrap();
+            wait_gathering(&mut grx_h).await;
+            let a = host.local_description().await.unwrap().sdp;
+            viewer.set_remote_description(RTCSessionDescription::answer(a).unwrap()).await.unwrap();
+        });
+        crx.recv_timeout(Duration::from_secs(10)).expect("não conectou");
+        let mut dc = None;
+        for _ in 0..100 {
+            dc = host_dc.lock().unwrap().clone();
+            if dc.is_some() { break; }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let dc = dc.expect("canal de dados não chegou no host");
+        std::thread::sleep(Duration::from_millis(300));
+
+        const PIECE: usize = 1100;
+        let mut seq = 0u64;
+        for mbps in [8u64, 20, 40] {
+            got.lock().unwrap().clear();
+            let first = seq;
+            let per_frame = ((mbps * 1_000_000 / 8 / 60) as usize).div_ceil(PIECE);
+            let pace = Duration::from_secs_f64((PIECE * 8) as f64 / (mbps as f64 * 2.5 * 1e6));
+            let secs = 4u32;
+            let start = Instant::now();
+            for f in 0..(60 * secs) {
+                let frame_at = start + Duration::from_micros(f as u64 * 16_667);
+                if let Some(w) = frame_at.checked_duration_since(Instant::now()) { std::thread::sleep(w); }
+                let dc = dc.clone();
+                let n = per_frame;
+                let s0 = seq;
+                seq += n as u64;
+                block_on(async move {
+                    let mut next = tokio::time::Instant::now();
+                    for i in 0..n as u64 {
+                        let mut b = BytesMut::zeroed(PIECE);
+                        b[0..8].copy_from_slice(&(s0 + i).to_le_bytes());
+                        b[8..16].copy_from_slice(&(t0.elapsed().as_micros() as u64).to_le_bytes());
+                        let _ = dc.send(b).await;
+                        next += pace;
+                        tokio::time::sleep_until(next).await;
+                    }
+                });
+            }
+            let sent = seq - first;
+            std::thread::sleep(Duration::from_millis(500));
+            let g = got.lock().unwrap();
+            let mut lat: Vec<f64> = g.iter().map(|x| x.1).collect();
+            lat.sort_by(|a, b| a.total_cmp(b));
+            let p = |q: f64| lat.get(((lat.len() as f64 * q) as usize).min(lat.len().saturating_sub(1))).copied().unwrap_or(f64::NAN);
+            let loss = 1.0 - g.len() as f64 / sent as f64;
+            let rate = g.len() as f64 * PIECE as f64 * 8.0 / secs as f64 / 1e6;
+            println!(
+                "{mbps:>2} Mb/s: recebido {rate:.1} Mb/s, perda {:.2}%, atraso p50 {:.2} ms, p99 {:.2} ms, máx {:.2} ms ({} de {sent} pedaços)",
+                loss * 100.0, p(0.5), p(0.99), p(1.0), g.len()
+            );
+        }
+        let _ = block_on(host.close());
+        let _ = block_on(viewer.close());
+    }
+
     /// Host e espectador na mesma máquina: vídeo codificado de verdade atravessa o WebRTC
     /// e é decodificado do outro lado.
     #[test]
