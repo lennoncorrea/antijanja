@@ -140,36 +140,37 @@ export component SourcePicker inherits Rectangle {
                 }
             }
 
-            // As miniaturas rolam dentro desta área; nada vaza para fora do diálogo.
-            Rectangle {
+            // Miniaturas e opções rolam juntas, cada uma no tamanho natural: numa janela
+            // baixa nada fica espremido ou cortado (antes as miniaturas ficavam com o que
+            // sobrava depois das opções).
+            ScrollView {
                 vertical-stretch: 1;
                 min-height: 160px;
-                if App.sources-loading : HorizontalLayout {
-                    alignment: center;
-                    spacing: 10px;
-                    VerticalLayout {
+                content-width: self.visible-width;
+                VerticalLayout {
+                    spacing: 14px;
+                    padding-bottom: 4px;
+                    if App.sources-loading : HorizontalLayout {
+                        height: 160px;
                         alignment: center;
-                        Spinner { }
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            Spinner { }
+                        }
+                        Text { text: "Procurando telas e janelas…"; font-size: 13px; color: Theme.muted-fg; vertical-alignment: center; }
                     }
-                    Text { text: "Procurando telas e janelas…"; font-size: 13px; color: Theme.muted-fg; vertical-alignment: center; }
-                }
-                if !App.sources-loading && App.source-rows.length == 0 : Text {
-                    width: 100%;
-                    height: 100%;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                    wrap: word-wrap;
-                    text: App.picker-tab == "window" ? "Nenhuma janela aberta para transmitir. Janelas minimizadas não aparecem." : "Nenhuma tela encontrada.";
-                    font-size: 13px;
-                    color: Theme.muted-fg;
-                }
-                if !App.sources-loading : ScrollView {
-                    width: 100%;
-                    height: 100%;
-                    content-width: self.visible-width;
-                    VerticalLayout {
+                    if !App.sources-loading && App.source-rows.length == 0 : Text {
+                        height: 120px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        wrap: word-wrap;
+                        text: App.picker-tab == "window" ? "Nenhuma janela aberta para transmitir. Janelas minimizadas não aparecem." : "Nenhuma tela encontrada.";
+                        font-size: 13px;
+                        color: Theme.muted-fg;
+                    }
+                    if !App.sources-loading : VerticalLayout {
                         spacing: 12px;
-                        padding-bottom: 4px;
                         for row in App.source-rows : HorizontalLayout {
                             spacing: 12px;
                             for s in row.items : SourceCard {
@@ -178,89 +179,87 @@ export component SourcePicker inherits Rectangle {
                             }
                         }
                     }
-                }
-            }
-
-            if App.picker == "start" : VerticalLayout {
-                vertical-stretch: 0;
-                spacing: 12px;
-                Divider { }
-                Text { text: "Áudio que vai junto"; font-size: 13px; font-weight: 500; color: Theme.fg; }
-                AudioSource {
-                    columns: 4;
-                }
-                Rectangle {
-                    border-radius: 10px;
-                    border-width: 1px;
-                    border-color: Theme.border;
-                    HorizontalLayout {
-                        padding: 12px;
-                        padding-left: 16px;
-                        spacing: 16px;
-                        VerticalLayout {
-                            spacing: 2px;
-                            Text { text: "Aparecer em “Ao vivo agora”"; font-size: 13px; font-weight: 500; color: Theme.fg; }
-                            Text {
-                                text: "Qualquer pessoa com o AntiJanja vê sua transmissão na lista e pode entrar. Desligado, só entra quem receber o código.";
-                                font-size: 12px;
-                                color: Theme.muted-fg;
-                                wrap: word-wrap;
+                    if App.picker == "start" : VerticalLayout {
+                        spacing: 12px;
+                        Divider { }
+                        Text { text: "Áudio que vai junto"; font-size: 13px; font-weight: 500; color: Theme.fg; }
+                        AudioSource {
+                            columns: 4;
+                        }
+                        Rectangle {
+                            border-radius: 10px;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            HorizontalLayout {
+                                padding: 12px;
+                                padding-left: 16px;
+                                spacing: 16px;
+                                VerticalLayout {
+                                    spacing: 2px;
+                                    Text { text: "Aparecer em “Ao vivo agora”"; font-size: 13px; font-weight: 500; color: Theme.fg; }
+                                    Text {
+                                        text: "Qualquer pessoa com o AntiJanja vê sua transmissão na lista e pode entrar. Desligado, só entra quem receber o código.";
+                                        font-size: 12px;
+                                        color: Theme.muted-fg;
+                                        wrap: word-wrap;
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Toggle {
+                                        checked: App.s-public;
+                                        toggled(v) => { App.set-setting("public", v ? "1" : "0"); }
+                                    }
+                                }
                             }
                         }
-                        VerticalLayout {
-                            alignment: center;
-                            Toggle {
-                                checked: App.s-public;
-                                toggled(v) => { App.set-setting("public", v ? "1" : "0"); }
-                            }
-                        }
-                    }
-                }
-                // Senha: quem assiste precisa do código e dela (na lista aparece um cadeado).
-                Rectangle {
-                    border-radius: 10px;
-                    border-width: 1px;
-                    border-color: Theme.border;
-                    VerticalLayout {
-                        padding: 12px;
-                        padding-left: 16px;
-                        spacing: 10px;
-                        HorizontalLayout {
-                            spacing: 16px;
+                        // Senha: quem assiste precisa do código e dela (na lista aparece um cadeado).
+                        Rectangle {
+                            border-radius: 10px;
+                            border-width: 1px;
+                            border-color: Theme.border;
                             VerticalLayout {
-                                spacing: 2px;
+                                padding: 12px;
+                                padding-left: 16px;
+                                spacing: 10px;
                                 HorizontalLayout {
-                                    spacing: 6px;
-                                    alignment: start;
+                                    spacing: 16px;
+                                    VerticalLayout {
+                                        spacing: 2px;
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            alignment: start;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Icon { source: @image-url("icons/lock.svg"); tint: App.picker-pw-on ? Theme.live-text : Theme.muted-fg; width: 13px; height: 13px; }
+                                            }
+                                            Text { text: "Pedir senha"; font-size: 13px; font-weight: 500; color: Theme.fg; }
+                                        }
+                                        Text {
+                                            text: App.picker-pw-on
+                                                ? "Só entra quem tiver o código e a senha. Na lista “Ao vivo agora” aparece um cadeado."
+                                                : "Desligado, qualquer pessoa com o código entra.";
+                                            font-size: 12px;
+                                            color: Theme.muted-fg;
+                                            wrap: word-wrap;
+                                        }
+                                    }
                                     VerticalLayout {
                                         alignment: center;
-                                        Icon { source: @image-url("icons/lock.svg"); tint: App.picker-pw-on ? Theme.live-text : Theme.muted-fg; width: 13px; height: 13px; }
+                                        Toggle {
+                                            checked: App.picker-pw-on;
+                                            toggled(v) => { App.picker-pw-toggled(v); }
+                                        }
                                     }
-                                    Text { text: "Pedir senha"; font-size: 13px; font-weight: 500; color: Theme.fg; }
                                 }
-                                Text {
-                                    text: App.picker-pw-on
-                                        ? "Só entra quem tiver o código e a senha. Na lista “Ao vivo agora” aparece um cadeado."
-                                        : "Desligado, qualquer pessoa com o código entra.";
-                                    font-size: 12px;
-                                    color: Theme.muted-fg;
-                                    wrap: word-wrap;
+                                if App.picker-pw-on : TextField {
+                                    secret: true;
+                                    placeholder: "Senha da transmissão";
+                                    text: App.picker-pw;
+                                    edited(t) => { App.picker-pw-edited(t); }
+                                    init => { self.focus-input(); }
                                 }
                             }
-                            VerticalLayout {
-                                alignment: center;
-                                Toggle {
-                                    checked: App.picker-pw-on;
-                                    toggled(v) => { App.picker-pw-toggled(v); }
-                                }
-                            }
-                        }
-                        if App.picker-pw-on : TextField {
-                            secret: true;
-                            placeholder: "Senha da transmissão";
-                            text: App.picker-pw;
-                            edited(t) => { App.picker-pw-edited(t); }
-                            init => { self.focus-input(); }
                         }
                     }
                 }
