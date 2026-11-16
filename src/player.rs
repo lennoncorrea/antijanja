@@ -48,7 +48,8 @@ pub struct Player {
     hwnd: isize,
     tx: SyncSender<Msg>,
     /// Retângulo recortado da janela (menu por cima do vídeo), para não refazer à toa.
-    hole: std::cell::Cell<Option<(i32, i32, i32, i32)>>,
+    /// (Junto com o tamanho da janela: a região é recalculada se ela mudar.)
+    hole: std::cell::Cell<Option<((i32, i32, i32, i32, i32), (i32, i32))>>,
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -146,23 +147,27 @@ impl Player {
 
     /// Recorta um retângulo da janela do vídeo (relativo a ela, pixels físicos): o que a
     /// interface desenha ali (um menu) aparece por cima do vídeo. None = sem recorte.
-    pub fn set_hole(&self, hole: Option<(i32, i32, i32, i32)>) {
-        if self.hole.get() == hole {
-            return;
-        }
-        self.hole.set(hole);
-        use windows::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, HRGN, RGN_DIFF};
+    /// `hole`: (x, y, largura, altura, raio dos cantos), em pixels físicos.
+    pub fn set_hole(&self, hole: Option<(i32, i32, i32, i32, i32)>) {
+        use windows::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, SetWindowRgn, HRGN, RGN_DIFF};
         unsafe {
             let hwnd = HWND(self.hwnd as *mut _);
+            let mut r = windows::Win32::Foundation::RECT::default();
+            let _ = GetClientRect(hwnd, &mut r);
+            let key = hole.map(|h| (h, (r.right, r.bottom)));
+            if self.hole.get() == key {
+                return;
+            }
+            self.hole.set(key);
             match hole {
                 None => {
                     SetWindowRgn(hwnd, None, true);
                 }
-                Some((x, y, w, h)) => {
-                    let mut r = windows::Win32::Foundation::RECT::default();
-                    let _ = GetClientRect(hwnd, &mut r);
+                Some((x, y, w, h, radius)) => {
                     let full = CreateRectRgn(0, 0, r.right.max(1), r.bottom.max(1));
-                    let cut = CreateRectRgn(x, y, x + w, y + h);
+                    // Cantos arredondados como os do menu (um buraco reto deixava aparecer
+                    // o fundo nos quatro cantos, fora da borda do menu).
+                    let cut = CreateRoundRectRgn(x, y, x + w + 1, y + h + 1, radius * 2, radius * 2);
                     CombineRgn(Some(full), Some(full), Some(cut), RGN_DIFF);
                     let _ = DeleteObject(cut.into());
                     // A janela passa a ser dona da região (não apagar `full`).
@@ -531,7 +536,17 @@ fn render_thread(hwnd: isize, rx: Receiver<Msg>, ready: SyncSender<Res<()>>) {
         }
     };
     let mut agenda: Agenda<Nv12Frame, Midpoint> = Agenda::new();
+    let trace = std::env::var_os("AJ_TRACE").is_some();
+    let (mut t_win, mut n_real, mut n_gen, mut lag_max, mut render_max) = (Instant::now(), 0u32, 0u32, 0f64, 0f64);
     loop {
+        if trace && t_win.elapsed() >= Duration::from_secs(1) {
+            eprintln!(
+                "[tela] reais {n_real}/s, gerados {n_gen}/s, gerados pulados {}, atraso máx do desenho {lag_max:.1} ms, desenho máx {render_max:.1} ms",
+                agenda.skipped
+            );
+            agenda.skipped = 0;
+            (t_win, n_real, n_gen, lag_max, render_max) = (Instant::now(), 0, 0, 0.0, 0.0);
+        }
         let msg = match agenda.wait(Instant::now()) {
             Some(w) => match rx.recv_timeout(w) {
                 Ok(m) => Some(m),
@@ -560,9 +575,20 @@ fn render_thread(hwnd: isize, rx: Receiver<Msg>, ready: SyncSender<Res<()>>) {
                 if step.is_none() {
                     gpu.advance();
                 }
+                let t0 = Instant::now();
+                if let Some(due) = agenda.last_due {
+                    lag_max = lag_max.max(t0.saturating_duration_since(due).as_secs_f64() * 1000.0);
+                }
                 gpu.render(step);
+                render_max = render_max.max(t0.elapsed().as_secs_f64() * 1000.0);
+                if step.is_some() { n_gen += 1 } else { n_real += 1 }
             }
-            Action::Show(f) => gpu.show(&f),
+            Action::Show(f) => {
+                let t0 = Instant::now();
+                gpu.show(&f);
+                render_max = render_max.max(t0.elapsed().as_secs_f64() * 1000.0);
+                n_real += 1;
+            }
             Action::Prepare(next, mid) => {
                 let ok = gpu.prepare_interp(&next, &mid);
                 agenda.prepared(ok, Instant::now());
@@ -722,7 +748,7 @@ mod tests {
         assert!(p.0[0] > 180 && p.0[1] < 80 && p.0[2] < 80, "esperava vermelho, veio {:?}", p.0);
 
         // Buraco para um menu: dentro dele aparece a janela de trás (não o vídeo vermelho).
-        player.set_hole(Some((300, 150, 120, 80)));
+        player.set_hole(Some((300, 150, 120, 80, 12)));
         pump(200);
         let inside = mon.capture_region((100 + 360 - mx) as u32, (100 + 190 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
         let outside = mon.capture_region((100 + 200 - mx) as u32, (100 + 190 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;

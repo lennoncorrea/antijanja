@@ -24,6 +24,8 @@ const HEADER: f32 = 44.0;
 const FOOTER: f32 = 40.0;
 /// Largura do menu de engrenagem (igual ao `GearMenu` do Slint).
 const MENU_W: f32 = 300.0;
+/// Raio dos cantos do menu de engrenagem (igual ao `border-radius` do GearMenu).
+const MENU_RADIUS: f32 = 12.0;
 
 const PUBLIC_REFRESH: Duration = Duration::from_secs(20);
 const TOAST_TIME: Duration = Duration::from_secs(4);
@@ -446,6 +448,7 @@ fn relayout(c: &Ctl, ui: &AppWindow) {
                 ((top + my - vy) * scale).round() as i32,
                 (MENU_W * scale).round() as i32,
                 (mh * scale).round() as i32,
+                (MENU_RADIUS * scale).round() as i32,
             ));
         }
         session::player_rect(
@@ -1198,6 +1201,10 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
         }
         "viewer-stats" => {
             let id = id_of(&v);
+            #[cfg(debug_assertions)]
+            if std::env::var_os("AJ_AUTOTEST").is_some() {
+                eprintln!("[stats] {v}");
+            }
             if let Some(x) = c.viewers.iter_mut().find(|x| x.id == id) {
                 x.stats = Some(v);
                 relayout(c, ui);
@@ -1514,6 +1521,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
         });
     }
 
+    #[cfg(debug_assertions)]
+    autotest();
+
     // Ao fechar: encerra a transmissão e as conexões antes de sair.
     ui.window().on_close_requested(|| {
         with(|c, _| {
@@ -1590,4 +1600,58 @@ pub fn run() -> Result<(), slint::PlatformError> {
     start_updater();
 
     slint::run_event_loop_until_quit()
+}
+
+/// Teste automático (só na versão de desenvolvimento), para ver uma stream de verdade sem
+/// ninguém clicar. Rodar com APPDATA apontando para uma pasta de teste (não mexe nas
+/// configurações de quem usa o app). `AJ_AUTOTEST=host`: transmite a tela principal (fora
+/// da lista "Ao vivo") e grava o código em `AJ_CODE_FILE`. `AJ_AUTOTEST=watch`: assiste o
+/// código desse arquivo a `AJ_VIEW_FPS`; com `AJ_MENU_AFTER` (s), abre o menu de engrenagem.
+#[cfg(debug_assertions)]
+fn autotest() {
+    let Ok(mode) = std::env::var("AJ_AUTOTEST") else { return };
+    let code_file = std::env::var("AJ_CODE_FILE").unwrap_or_else(|_| std::env::temp_dir().join("aj_autotest_code.txt").to_string_lossy().into_owned());
+    let timer = Box::leak(Box::new(slint::Timer::default()));
+    let started = Instant::now();
+    let mut done = false;
+    let mut menu_opened = false;
+    timer.start(slint::TimerMode::Repeated, Duration::from_millis(500), move || {
+        with(|c, ui| match mode.as_str() {
+            "host" => {
+                if !done {
+                    done = true;
+                    c.s.public = false;
+                    c.s.stream_password.clear();
+                    c.s.name = "Autoteste".into();
+                    let Some(src) = capture::list_sources().into_iter().find(|s| s.primary) else { return };
+                    start_sharing(c, ui, src, None);
+                } else if !c.code.is_empty() && std::fs::read_to_string(&code_file).ok().as_deref() != Some(c.code.as_str()) {
+                    let _ = std::fs::write(&code_file, &c.code);
+                    eprintln!("[autotest] código gravado");
+                }
+            }
+            "watch" => {
+                if !done {
+                    let Ok(code) = std::fs::read_to_string(&code_file) else { return };
+                    done = true;
+                    c.s.view_fps = std::env::var("AJ_VIEW_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    eprintln!("[autotest] assistindo a {} fps (monitor {} Hz)", view_fps(c, ui), monitor_hz(ui));
+                    start_watching(c, ui, code.trim().to_string(), None);
+                }
+                let menu_after = std::env::var("AJ_MENU_AFTER").ok().and_then(|v| v.parse::<u64>().ok());
+                if let (Some(after), false) = (menu_after, menu_opened) {
+                    if started.elapsed() >= Duration::from_secs(after) {
+                        if let Some(v) = c.viewers.iter().find(|v| v.watching) {
+                            menu_opened = true;
+                            c.menu = Some(v.id.clone());
+                            c.menu_panel = std::env::var("AJ_MENU_PANEL").unwrap_or_else(|_| "main".into());
+                            relayout(c, ui);
+                            eprintln!("[autotest] menu aberto");
+                        }
+                    }
+                }
+            }
+            _ => {}
+        });
+    });
 }

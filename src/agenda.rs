@@ -45,6 +45,9 @@ pub struct Agenda<F, P> {
     queue: VecDeque<Entry<F, P>>,
     /// Horários do par sendo preparado.
     plan: Option<(Vec<(Instant, f32)>, Instant)>,
+    /// Diagnóstico: horário marcado do último desenho e quantos gerados ficaram de fora.
+    pub last_due: Option<Instant>,
+    pub skipped: u32,
     /// Testes: o comportamento antigo (desenha tudo, desloca sem limite).
     #[cfg(test)]
     legacy: bool,
@@ -56,6 +59,8 @@ impl<F, P> Agenda<F, P> {
             schedule: VecDeque::new(),
             queue: VecDeque::new(),
             plan: None,
+            last_due: None,
+            skipped: 0,
             #[cfg(test)]
             legacy: false,
         }
@@ -103,6 +108,7 @@ impl<F, P> Agenda<F, P> {
             // fica de fora (o real nunca).
             while self.schedule.len() >= 2 && self.schedule[0].1.is_some() && self.schedule[1].0 <= now {
                 self.schedule.pop_front();
+                self.skipped += 1;
             }
         }
         if let Some(&(at, step)) = self.schedule.front() {
@@ -110,6 +116,7 @@ impl<F, P> Agenda<F, P> {
                 return Action::Idle;
             }
             self.schedule.pop_front();
+            self.last_due = Some(at);
             return Action::Draw(step);
         }
         match self.queue.pop_front() {

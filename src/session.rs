@@ -937,6 +937,13 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
                         kbps_avg = if kbps_avg == 0.0 { now_kbps } else { kbps_avg * 0.65 + now_kbps * 0.35 };
                         stats.kbps = kbps_avg as u32;
                         let _ = app.emit("viewer-stats", stats.clone());
+                        let (proc_max, late_max) = presenter.take_stats();
+                        if std::env::var_os("AJ_TRACE").is_some() {
+                            eprintln!(
+                                "[decode] {:.0} fps da stream, {:.0} na tela, buffer {} ms, gerador máx {proc_max:.1} ms, chegada atrasada máx {late_max:.1} ms, {}x{}",
+                                stats.fps, stats.shown_fps, stats.buffer_ms, stats.width, stats.height
+                            );
+                        }
                         frames = 0;
                         win = Instant::now();
                     }
@@ -1096,7 +1103,7 @@ pub async fn viewer_leave(app: AppHandle, id: String) {
 
 /// Área de vídeo de uma stream em pixels físicos (relativos à janela). Thread principal.
 /// `hole`: retângulo (relativo ao vídeo) recortado para um menu aparecer por cima.
-pub fn player_rect(id: String, x: i32, y: i32, width: i32, height: i32, visible: bool, hole: Option<(i32, i32, i32, i32)>) {
+pub fn player_rect(id: String, x: i32, y: i32, width: i32, height: i32, visible: bool, hole: Option<(i32, i32, i32, i32, i32)>) {
     with_viewers(|m| {
         if let Some(p) = m.get(&id).and_then(|v| v.player.as_ref()) {
             p.set_rect(x, y, width, height, visible);

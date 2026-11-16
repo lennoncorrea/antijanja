@@ -85,33 +85,69 @@ pub struct Midpoint {
 /// Roda na thread de decodificação de cada stream.
 pub struct FrameGen {
     of: Option<OpticalFlow>,
+    /// Sessão sendo criada em outra thread (tamanho e resposta). Criar leva ~170 ms: na
+    /// thread de decodificação, isso parava a imagem e o buffer de reprodução achava que
+    /// a rede tinha piorado (subia para 80 ms de atraso e levava uns 10 s para voltar).
+    pending: Option<((u32, u32), std::sync::mpsc::Receiver<Result<OpticalFlow, String>>)>,
     broken: bool,
     prev_ts: Option<u32>,
 }
 
+/// Libera a sessão em outra thread (também demora).
+fn drop_later(of: Option<OpticalFlow>) {
+    if let Some(of) = of {
+        std::thread::spawn(move || drop(of));
+    }
+}
+
 impl FrameGen {
     pub fn new() -> Self {
-        Self { of: None, broken: false, prev_ts: None }
+        Self { of: None, pending: None, broken: false, prev_ts: None }
+    }
+
+    /// A sessão do tamanho `size`, se já estiver pronta (senão começa a criar).
+    fn ready(&mut self, size: (u32, u32)) -> bool {
+        if self.of.as_ref().is_some_and(|of| of.size() == size) {
+            return true;
+        }
+        if !matches!(&self.pending, Some((s, _)) if *s == size) {
+            drop_later(self.of.take());
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(OpticalFlow::new(size.0, size.1));
+            });
+            self.pending = Some((size, rx));
+            return false;
+        }
+        let r = match &self.pending {
+            Some((_, rx)) => match rx.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+                Ok(r) => r,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("a criação da sessão falhou".into()),
+            },
+            None => return false,
+        };
+        self.pending = None;
+        match r {
+            Ok(of) => {
+                self.of = Some(of);
+                self.prev_ts = None;
+                true
+            }
+            Err(e) => {
+                eprintln!("geração de quadros desligada: {e}");
+                self.broken = true;
+                false
+            }
+        }
     }
 
     /// Quadro novo decodificado (timestamp RTP de 90 kHz). Devolve o movimento entre o
     /// anterior e este, quando dá para interpolar. Todo quadro mostrado tem que passar
     /// por aqui (o "anterior" daqui tem que ser o que está na tela).
     pub fn process(&mut self, f: &Nv12Frame, ts: u32) -> Option<Midpoint> {
-        if self.broken {
+        if self.broken || !self.ready((f.width, f.height)) {
             return None;
-        }
-        if self.of.as_ref().is_none_or(|of| of.size() != (f.width, f.height)) {
-            self.of = None;
-            match OpticalFlow::new(f.width, f.height) {
-                Ok(of) => self.of = Some(of),
-                Err(e) => {
-                    eprintln!("geração de quadros desligada: {e}");
-                    self.broken = true;
-                    return None;
-                }
-            }
-            self.prev_ts = None;
         }
         let gap_ms = self.prev_ts.map(|p| ts.wrapping_sub(p) as f64 / 90.0);
         self.prev_ts = Some(ts);
@@ -135,7 +171,8 @@ impl FrameGen {
 
     /// Desligado pelo usuário: libera a placa e recomeça do zero quando ligar de novo.
     pub fn clear(&mut self) {
-        self.of = None;
+        drop_later(self.of.take());
+        self.pending = None;
         self.prev_ts = None;
     }
 }
@@ -147,11 +184,23 @@ pub struct Presenter {
     pacer: Pacer,
     fg_active: bool,
     prev_ts: Option<u32>,
+    /// Diagnóstico: maior tempo do gerador e maior atraso de chegada (ms) desde o último
+    /// `take_stats`.
+    proc_max: f64,
+    late_max: f64,
 }
 
 impl Presenter {
     pub fn new() -> Self {
-        Self { fg: FrameGen::new(), pacer: Pacer::new(), fg_active: false, prev_ts: None }
+        Self { fg: FrameGen::new(), pacer: Pacer::new(), fg_active: false, prev_ts: None, proc_max: 0.0, late_max: 0.0 }
+    }
+
+    /// (maior tempo do gerador, maior atraso de chegada) em ms, e zera.
+    pub fn take_stats(&mut self) -> (f64, f64) {
+        let r = (self.proc_max, self.late_max);
+        self.proc_max = 0.0;
+        self.late_max = 0.0;
+        r
     }
 
     /// `at`: quando o quadro deve aparecer. Espera até lá e entrega. Devolve quantos
@@ -167,7 +216,11 @@ impl Presenter {
         self.fg_active = wants;
         // Todo quadro mostrado passa pelo gerador enquanto ele está ativo (o "anterior"
         // dele tem que ser o que está na tela).
+        let late = std::time::Instant::now().saturating_duration_since(at).as_secs_f64() * 1000.0;
+        self.late_max = self.late_max.max(late);
+        let t0 = std::time::Instant::now();
         let interp = if wants { self.fg.process(&f, ts) } else { None };
+        self.proc_max = self.proc_max.max(t0.elapsed().as_secs_f64() * 1000.0);
         match (pacing, interp) {
             (Pacing::Skip, _) => 0,
             (Pacing::Generate(n), Some(m)) => {
@@ -578,6 +631,11 @@ mod tests {
         let a = frame_with_square(w, h, 100, 100);
         let b = frame_with_square(w, h, 164, 100);
         let mut fg = FrameGen::new();
+        // A sessão é criada em outra thread: espera ficar pronta.
+        while !fg.ready((w, h)) {
+            assert!(!fg.broken, "NVOF");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(fg.process(&a, 0).is_none());
         let mid = fg.process(&b, 3000).expect("quadro do meio (33 ms entre A e B)");
         assert!((mid.gap.as_secs_f64() * 1000.0 - 33.33).abs() < 0.1);
