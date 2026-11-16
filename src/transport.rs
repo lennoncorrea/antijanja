@@ -66,7 +66,7 @@ const PACER_QUEUE: usize = 45;
 const PIECES_LABEL: &str = "aj-p";
 /// Folga de pedaços extras no caminho direto host → espectador (o RTP tem retransmissão;
 /// os pedaços não, a folga faz esse papel). Keyframes: o dobro (ver `pieces::overhead_for`).
-const PIECE_OVERHEAD: f32 = 0.25;
+pub const PIECE_OVERHEAD: f32 = 0.25;
 /// Vídeo em pedaços pelo canal de dados em vez de RTP (malha, etapa 1). Desligado por
 /// padrão; a sessão liga com AJ_PIECES=1.
 pub static USE_PIECES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -302,9 +302,9 @@ pub struct HostPeer {
     /// Canal dos pedaços (o espectador cria; None = versão antiga, só RTP).
     pieces_dc: Arc<Mutex<Option<Arc<dyn DataChannel>>>>,
     piece_tx: tokio::sync::mpsc::Sender<Vec<Vec<u8>>>,
-    /// Número do próximo quadro e timestamp (90 kHz) no caminho por pedaços.
-    piece_state: Mutex<(u32, u32)>,
-    use_pieces: bool,
+    /// Faixas que o host manda direto para este espectador (bit `l` = faixa `l`). As
+    /// outras ele recebe de outros espectadores (malha). Todas, no começo.
+    direct_lanes: std::sync::atomic::AtomicU32,
 }
 
 impl HostPeer {
@@ -373,8 +373,6 @@ impl HostPeer {
         spawn(pace(video.clone(), pacer_rx, pacing_bps.clone()));
         let (piece_tx, piece_rx) = tokio::sync::mpsc::channel(PACER_QUEUE);
         spawn(pace_pieces(pieces_slot.clone(), piece_rx, pacing_bps.clone()));
-        let mut seed = [0u8; 4];
-        let _ = getrandom::fill(&mut seed);
         let peer = Arc::new(HostPeer {
             pc, audio, assrc,
             packetizer: Mutex::new(packetizer),
@@ -385,8 +383,7 @@ impl HostPeer {
             dc: Mutex::new(None),
             pieces_dc: pieces_slot,
             piece_tx,
-            piece_state: Mutex::new((0, u32::from_le_bytes(seed))),
-            use_pieces: USE_PIECES.load(Ordering::Relaxed),
+            direct_lanes: std::sync::atomic::AtomicU32::new(u32::MAX),
         });
         // O canal de dados chega depois; guardamos quando aparecer.
         let p = peer.clone();
@@ -419,11 +416,6 @@ impl HostPeer {
     /// Entrega um quadro ao pacer. `Ok(false)`: a fila do pacer está cheia e o quadro foi
     /// descartado (o espectador vai precisar de um keyframe).
     pub async fn send_video(&self, data: Bytes, duration: Duration) -> Res<bool> {
-        if self.use_pieces {
-            if let Some(r) = self.send_pieces(&data, duration) {
-                return r;
-            }
-        }
         let (vpt, _) = self.payload_types().await.ok_or("sem codec negociado")?;
         let samples = (duration.as_secs_f64() * 90000.0).round() as u32;
         let mut packetizer = self.packetizer.lock().unwrap();
@@ -441,27 +433,30 @@ impl HostPeer {
         Ok(self.pacer.try_send(packets).is_ok())
     }
 
-    /// Vídeo em pedaços pelo canal "aj-p". None: o espectador não tem esse canal (vai RTP).
-    fn send_pieces(&self, data: &Bytes, duration: Duration) -> Option<Res<bool>> {
-        self.pieces_dc.lock().unwrap().as_ref()?;
-        let samples = (duration.as_secs_f64() * 90000.0).round() as u32;
-        // O número do quadro avança mesmo se ele for descartado: o espectador vê o buraco
-        // e pede keyframe (os seguintes dependem dele).
-        let (frame, ts) = {
-            let mut st = self.piece_state.lock().unwrap();
-            let cur = *st;
-            *st = (cur.0.wrapping_add(1), cur.1.wrapping_add(samples));
-            cur
-        };
+    /// O espectador recebe pedaços (tem o canal "aj-p")?
+    pub fn has_pieces(&self) -> bool {
+        self.pieces_dc.lock().unwrap().is_some()
+    }
+
+    /// Manda os pedaços das faixas que vão direto para este espectador. `false`: a fila
+    /// está cheia e o quadro ficou para trás (o espectador vai pedir keyframe).
+    pub fn send_pieces(&self, frame: &crate::pieces::PieceFrame) -> bool {
         if self.piece_tx.capacity() == 0 {
-            return Some(Ok(false));
+            return false;
         }
-        let keyframe = crate::media::has_nal(data, 5);
-        let Some(mut enc) = crate::pieces::FrameEncoder::new(crate::pieces::KIND_VIDEO, 0, frame, ts, data, keyframe, 1) else {
-            return Some(Ok(true));
-        };
-        let pieces = enc.pieces(crate::pieces::overhead_for(keyframe, PIECE_OVERHEAD));
-        Some(Ok(self.piece_tx.try_send(pieces).is_ok()))
+        let mask = self.direct_lanes.load(Ordering::Relaxed);
+        let pieces: Vec<Vec<u8>> = frame
+            .pieces
+            .iter()
+            .filter(|p| crate::pieces::lane_of(p).is_some_and(|l| mask & (1 << l) != 0))
+            .cloned()
+            .collect();
+        pieces.is_empty() || self.piece_tx.try_send(pieces).is_ok()
+    }
+
+    /// Faixas que o host manda direto (bit `l` = faixa `l`).
+    pub fn set_direct_lanes(&self, mask: u32) {
+        self.direct_lanes.store(mask, Ordering::Relaxed);
     }
 
     /// Bitrate alvo atual do vídeo (b/s): o pacer solta os pacotes com folga sobre ele.
@@ -681,6 +676,9 @@ async fn receive_pieces(pdc: Arc<dyn DataChannel>, sinks: ViewerSinks, dc: Arc<O
     use crate::pieces::{Assembler, Header, Ordered, KIND_VIDEO};
     let mut asm = Assembler::new();
     let mut ord = Ordered::new();
+    // Versão do vídeo que está chegando: a troca começa num keyframe da nova, com a
+    // numeração dela (cada versão conta os próprios quadros).
+    let mut rendition: Option<u16> = None;
     let mut meter = NetMeter::new(Instant::now());
     let mut last_request = Instant::now() - Duration::from_secs(10);
     // Perda pelo número sequencial do canal (estendido além dos 32 bits).
@@ -721,7 +719,13 @@ async fn receive_pieces(pdc: Arc<dyn DataChannel>, sinks: ViewerSinks, dc: Arc<O
                 }
                 if let Some(f) = asm.push(piece, now) {
                     if f.kind == KIND_VIDEO {
-                        out.extend(ord.push(f, now));
+                        if rendition != Some(f.rendition) && f.keyframe {
+                            rendition = Some(f.rendition);
+                            ord = Ordered::new();
+                        }
+                        if rendition == Some(f.rendition) {
+                            out.extend(ord.push(f, now));
+                        }
                     }
                 }
             }
@@ -1170,8 +1174,8 @@ mod tests {
             });
 
             let conv = crate::media::Converter::new(1280, 720, 1280, 720, 60).unwrap();
-            let enc = crate::media::Encoder::new(1280, 720, 60, 4_000_000, true, None).unwrap();
-            let mut enc = enc;
+            let mut enc = crate::media::Encoder::new(1280, 720, 60, 4_000_000, true, None).unwrap();
+            let mut source = crate::pieces::PieceSource::new(PIECE_OVERHEAD);
             let mut img = vec![0u8; 1280 * 720 * 4];
             let frames = 240u32;
             for i in 0..frames {
@@ -1181,7 +1185,9 @@ mod tests {
                 }
                 let nv12 = conv.convert(&img, i as i64 * 166_667, 166_667).unwrap();
                 for pkt in enc.encode(&nv12).unwrap() {
-                    block_on(peer.send_video(Bytes::from(pkt.data), Duration::from_micros(16_667))).unwrap();
+                    if let Some(f) = source.encode(0, &pkt.data, Duration::from_micros(16_667)) {
+                        peer.send_pieces(&f);
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(16));
             }

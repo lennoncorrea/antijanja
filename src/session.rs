@@ -421,6 +421,9 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
         let peers = peers.clone();
         let kf = keyframes.clone();
         transport::spawn(async move {
+            // Malha (etapa 2): cada quadro vira pedaços uma vez só, os mesmos para todos.
+            let mut source = crate::pieces::PieceSource::new(transport::PIECE_OVERHEAD);
+            let use_pieces = transport::USE_PIECES.load(Ordering::Relaxed);
             while let Some(m) = media_rx.recv().await {
                 let targets: Vec<Arc<HostPeer>> = {
                     let mut peers = peers.lock().unwrap();
@@ -442,11 +445,19 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
                         })
                         .collect()
                 };
+                let pieces = match &m {
+                    Media::Video(k, d, dur) if use_pieces => source.encode(*k, d, *dur),
+                    _ => None,
+                };
                 for p in targets {
                     match &m {
                         Media::Video(k, d, dur) => {
                             // Fila do pacer cheia: quadro descartado, quem perdeu precisa de keyframe.
-                            if let Ok(false) = p.send_video(d.clone(), *dur).await {
+                            let sent = match &pieces {
+                                Some(f) if p.has_pieces() => p.send_pieces(f),
+                                _ => !matches!(p.send_video(d.clone(), *dur).await, Ok(false)),
+                            };
+                            if !sent {
                                 kf.lock().unwrap().insert(*k);
                             }
                         }

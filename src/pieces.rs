@@ -231,6 +231,51 @@ impl FrameEncoder {
     }
 }
 
+/// Faixas da malha: os pedaços de cada quadro são repartidos entre elas.
+pub const LANES: u8 = 4;
+
+/// Faixa de um pedaço já serializado (sem validar o resto).
+pub fn lane_of(piece: &[u8]) -> Option<u8> {
+    piece.get(19).copied()
+}
+
+/// Um quadro já em pedaços, o mesmo para todos os espectadores (na malha, um pedaço
+/// repassado por alguém tem que servir no montador de qualquer outro).
+pub struct PieceFrame {
+    pub pieces: Vec<Vec<u8>>,
+    pub keyframe: bool,
+}
+
+/// Numera e codifica os quadros de cada versão do vídeo, uma vez só para todos.
+pub struct PieceSource {
+    /// Por versão: (próximo quadro, timestamp de 90 kHz).
+    state: std::collections::HashMap<u32, (u32, u32)>,
+    seed: u32,
+    pub overhead: f32,
+}
+
+impl PieceSource {
+    pub fn new(overhead: f32) -> Self {
+        let mut b = [0u8; 4];
+        let _ = getrandom::fill(&mut b);
+        Self { state: Default::default(), seed: u32::from_le_bytes(b), overhead }
+    }
+
+    /// `key`: versão (0 = principal, senão a altura). None só se o quadro for inválido;
+    /// mesmo assim o número do quadro avança (quem recebe vê o buraco e pede keyframe).
+    pub fn encode(&mut self, key: u32, data: &[u8], duration: Duration) -> Option<std::sync::Arc<PieceFrame>> {
+        let samples = (duration.as_secs_f64() * 90000.0).round() as u32;
+        let seed = self.seed;
+        let st = self.state.entry(key).or_insert((0, seed));
+        let (frame, ts) = *st;
+        *st = (frame.wrapping_add(1), ts.wrapping_add(samples));
+        let keyframe = crate::media::has_nal(data, 5);
+        let mut enc = FrameEncoder::new(KIND_VIDEO, key.min(u16::MAX as u32) as u16, frame, ts, data, keyframe, LANES)?;
+        let pieces = enc.pieces(overhead_for(keyframe, self.overhead));
+        Some(std::sync::Arc::new(PieceFrame { pieces, keyframe }))
+    }
+}
+
 /// Folga de pedaços extras por tipo de quadro: keyframes são grandes e, se um se perde, a
 /// imagem fica estragada até o próximo.
 pub fn overhead_for(keyframe: bool, base: f32) -> f32 {
