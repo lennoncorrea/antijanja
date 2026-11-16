@@ -161,7 +161,8 @@ component TileView inherits Rectangle {
                     alignment: center;
                     HorizontalLayout {
                         spacing: 2px;
-                        Btn {
+                        // Em tela cheia só há uma stream: "ampliar" não faz sentido.
+                        if !App.fullscreen : Btn {
                             width: 32px;
                             height: 32px;
                             kind: "ghost";
@@ -170,6 +171,16 @@ component TileView inherits Rectangle {
                             has-icon: true;
                             accessible-label: root.t.focused ? "Voltar para a grade" : "Ampliar";
                             clicked => { App.toggle-focus(root.t.id); }
+                        }
+                        Btn {
+                            width: 32px;
+                            height: 32px;
+                            kind: "ghost";
+                            icon-only: true;
+                            icon: App.fullscreen ? @image-url("icons/fullscreen-exit.svg") : @image-url("icons/fullscreen.svg");
+                            has-icon: true;
+                            accessible-label: App.fullscreen ? "Sair da tela cheia (Esc)" : "Tela cheia (F11 ou duplo clique)";
+                            clicked => { App.toggle-fullscreen(root.t.id); }
                         }
                         Btn {
                             width: 32px;

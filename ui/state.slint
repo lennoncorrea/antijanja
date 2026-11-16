@@ -183,6 +183,8 @@ export global App {
     in property <bool> has-focus;
     callback leave(string);
     callback toggle-focus(string);
+    // Tela cheia com esta stream (ou sai da tela cheia).
+    callback toggle-fullscreen(string);
     callback set-volume(string, int);
     callback toggle-mute(string);
     callback unfocus();

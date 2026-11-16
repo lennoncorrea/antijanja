@@ -482,6 +482,18 @@ fn set_fullscreen(c: &mut Ctl, ui: &AppWindow, on: bool) {
     relayout(c, ui);
 }
 
+/// Tela cheia só com a stream `id`; se já estiver em tela cheia, volta para a grade.
+fn toggle_stream_fullscreen(c: &mut Ctl, ui: &AppWindow, id: &str) {
+    if c.fullscreen {
+        c.focus = None;
+        set_fullscreen(c, ui, false);
+    } else {
+        c.focus = Some(id.to_string());
+        set_fullscreen(c, ui, true);
+    }
+    relayout(c, ui);
+}
+
 fn refresh_public(c: &mut Ctl, ui: &AppWindow) {
     if c.public_busy || c.net != "ok" {
         return;
@@ -927,12 +939,7 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
         "player-input" => {
             let id = id_of(&v);
             match v["kind"].as_str().unwrap_or("") {
-                "dblclick" => {
-                    let focused = c.focus.as_deref() == Some(id.as_str());
-                    c.focus = if focused { None } else { Some(id) };
-                    set_fullscreen(c, ui, !focused);
-                    relayout(c, ui);
-                }
+                "dblclick" => toggle_stream_fullscreen(c, ui, &id),
                 "move" if c.fullscreen => {
                     let was_hidden = !c.controls_until.is_some_and(|t| t > Instant::now());
                     c.controls_until = Some(Instant::now() + CONTROLS_TIME);
@@ -1053,6 +1060,7 @@ fn wire(ui: &AppWindow) {
             relayout(c, ui);
         })
     });
+    a.on_toggle_fullscreen(|id| later(move |c, ui| toggle_stream_fullscreen(c, ui, &id)));
     a.on_unfocus(|| {
         later(|c, ui| {
             c.focus = None;
