@@ -39,7 +39,7 @@ use webrtc::peer_connection::{
 use webrtc::runtime::{channel, default_runtime, Runtime, Sender};
 
 pub type Res<T> = Result<T, String>;
-fn err<E: std::fmt::Display>(e: E) -> String {
+pub(crate) fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
@@ -59,9 +59,20 @@ const RTP_MTU: usize = 1200;
 const PACING_FACTOR: f64 = 2.5;
 const MIN_PACING_BPS: u64 = 2_000_000;
 /// Rajada máxima que o pacer solta de uma vez depois de ficar parado.
-const PACER_BURST: Duration = Duration::from_millis(5);
+pub(crate) const PACER_BURST: Duration = Duration::from_millis(5);
 /// Quadros esperando no pacer (~0,75 s a 60 fps). Cheio: a rede não está dando conta.
 const PACER_QUEUE: usize = 45;
+/// Quanto uma mensagem de controle espera o canal abrir antes de desistir.
+const CONTROL_WAIT: Duration = Duration::from_secs(5);
+
+/// Manda texto pelo canal, esperando ele abrir (até `CONTROL_WAIT`).
+pub(crate) async fn send_reliably(dc: &Arc<dyn DataChannel>, text: &str) {
+    let until = Instant::now() + CONTROL_WAIT;
+    while dc.send_text(text).await.is_err() && Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Canal de dados dos pedaços.
 const PIECES_LABEL: &str = "aj-p";
 /// Folga de pedaços extras no caminho direto host → espectador (o RTP tem retransmissão;
@@ -125,7 +136,7 @@ fn audio_codec() -> RTCRtpCodec {
 }
 
 /// Monta a PeerConnection com nossos codecs e STUN.
-async fn build_pc(handler: Arc<dyn PeerConnectionEventHandler>, stun: bool) -> Res<Arc<dyn PeerConnection>> {
+pub(crate) async fn build_pc(handler: Arc<dyn PeerConnectionEventHandler>, stun: bool) -> Res<Arc<dyn PeerConnection>> {
     let mut me = MediaEngine::default();
     me.register_codec(
         RTCRtpCodecParameters { rtp_codec: video_codec(), payload_type: H264_PT, ..Default::default() },
@@ -168,11 +179,11 @@ pub enum PeerEvent {
     Closed,
 }
 
-struct Handler {
-    gathered: Sender<()>,
-    on_state: Arc<dyn Fn(PeerEvent) + Send + Sync>,
-    on_track: Option<Arc<dyn Fn(Arc<dyn TrackRemote>) + Send + Sync>>,
-    on_dc: Option<Arc<dyn Fn(Arc<dyn DataChannel>) + Send + Sync>>,
+pub(crate) struct Handler {
+    pub(crate) gathered: Sender<()>,
+    pub(crate) on_state: Arc<dyn Fn(PeerEvent) + Send + Sync>,
+    pub(crate) on_track: Option<Arc<dyn Fn(Arc<dyn TrackRemote>) + Send + Sync>>,
+    pub(crate) on_dc: Option<Arc<dyn Fn(Arc<dyn DataChannel>) + Send + Sync>>,
 }
 
 #[async_trait::async_trait]
@@ -204,7 +215,7 @@ impl PeerConnectionEventHandler for Handler {
     }
 }
 
-async fn wait_gathering(rx: &mut webrtc::runtime::Receiver<()>) {
+pub(crate) async fn wait_gathering(rx: &mut webrtc::runtime::Receiver<()>) {
     let timeout = runtime().sleep(ICE_TIMEOUT);
     futures::pin_mut!(timeout);
     let recv = rx.recv();
@@ -305,6 +316,8 @@ pub struct HostPeer {
     /// Faixas que o host manda direto para este espectador (bit `l` = faixa `l`). As
     /// outras ele recebe de outros espectadores (malha). Todas, no começo.
     direct_lanes: std::sync::atomic::AtomicU32,
+    /// Pedaços entregues ao pacer (diagnóstico e testes: upload do host).
+    pub pieces_sent: AtomicU64,
 }
 
 impl HostPeer {
@@ -384,6 +397,7 @@ impl HostPeer {
             pieces_dc: pieces_slot,
             piece_tx,
             direct_lanes: std::sync::atomic::AtomicU32::new(u32::MAX),
+            pieces_sent: AtomicU64::new(0),
         });
         // O canal de dados chega depois; guardamos quando aparecer.
         let p = peer.clone();
@@ -451,7 +465,12 @@ impl HostPeer {
             .filter(|p| crate::pieces::lane_of(p).is_some_and(|l| mask & (1 << l) != 0))
             .cloned()
             .collect();
-        pieces.is_empty() || self.piece_tx.try_send(pieces).is_ok()
+        let n = pieces.len() as u64;
+        let ok = pieces.is_empty() || self.piece_tx.try_send(pieces).is_ok();
+        if ok {
+            self.pieces_sent.fetch_add(n, Ordering::Relaxed);
+        }
+        ok
     }
 
     /// Faixas que o host manda direto (bit `l` = faixa `l`).
@@ -474,10 +493,22 @@ impl HostPeer {
             .map_err(err)
     }
 
+    /// Manda pelo canal "aj". Logo depois de conectar o canal pode ainda não ter chegado
+    /// ou aberto: espera até 5 s em vez de perder a mensagem (as da malha não podem se
+    /// perder: uma oferta perdida deixava a ligação entre espectadores sem nascer).
     pub async fn send_message(&self, text: &str) {
-        let dc = self.dc.lock().unwrap().clone();
-        if let Some(dc) = dc {
-            let _ = dc.send_text(text).await;
+        let until = Instant::now() + CONTROL_WAIT;
+        loop {
+            let dc = self.dc.lock().unwrap().clone();
+            if let Some(dc) = dc {
+                if dc.send_text(text).await.is_ok() {
+                    return;
+                }
+            }
+            if Instant::now() >= until {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 }
@@ -489,6 +520,7 @@ impl HostPeer {
 pub struct ViewerSession {
     pub pc: Arc<dyn PeerConnection>,
     dc: Arc<dyn DataChannel>,
+    pub mesh: Arc<crate::meshnet::ViewerMesh>,
 }
 
 /// Callbacks de mídia do espectador.
@@ -529,27 +561,51 @@ impl ViewerSession {
         // Pedaços: fora de ordem e sem reenvio (a folga dos pedaços extras cobre a perda).
         let init = webrtc::data_channel::RTCDataChannelInit { ordered: false, max_retransmits: Some(0), ..Default::default() };
         let pdc = pc.create_data_channel(PIECES_LABEL, Some(init)).await.map_err(err)?;
+        // Pedaços do host (fonte 0) e dos vizinhos da malha (fonte = id) num receptor só.
+        let (ptx, prx) = tokio::sync::mpsc::channel::<(u64, Vec<u8>)>(4096);
+        let mesh = crate::meshnet::ViewerMesh::new(stun, dc_cell.clone(), ptx.clone());
         {
-            let (s, cell) = (sinks.clone(), dc_cell.clone());
-            spawn(async move { receive_pieces(pdc, s, cell).await });
+            let tx = ptx.clone();
+            spawn(async move {
+                while let Some(ev) = pdc.poll().await {
+                    match ev {
+                        DataChannelEvent::OnMessage(m) => {
+                            let _ = tx.try_send((0, m.data.to_vec()));
+                        }
+                        DataChannelEvent::OnClose => break,
+                        _ => {}
+                    }
+                }
+            });
+            let (s, cell, m) = (sinks.clone(), dc_cell.clone(), mesh.clone());
+            spawn(async move { receive_pieces(prx, s, cell, m).await });
         }
         let on_message = sinks.on_message.clone();
         let dcc = dc.clone();
+        let m = mesh.clone();
         spawn(async move {
             while let Some(ev) = dcc.poll().await {
                 match ev {
-                    DataChannelEvent::OnMessage(m) => on_message(String::from_utf8_lossy(&m.data).into_owned()),
+                    DataChannelEvent::OnMessage(msg) => {
+                        let text = String::from_utf8_lossy(&msg.data).into_owned();
+                        // Rotas e oferta/resposta da malha ficam aqui; o resto sobe.
+                        let mine = serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|v| m.on_host_message(&v));
+                        if !mine {
+                            on_message(text);
+                        }
+                    }
                     DataChannelEvent::OnClose => break,
                     _ => {}
                 }
             }
+            m.close();
         });
 
         let offer = pc.create_offer(None).await.map_err(err)?;
         pc.set_local_description(offer).await.map_err(err)?;
         wait_gathering(&mut grx).await;
         let sdp = pc.local_description().await.ok_or("sem descrição local")?.sdp;
-        Ok((Arc::new(ViewerSession { pc, dc }), sdp))
+        Ok((Arc::new(ViewerSession { pc, dc, mesh }), sdp))
     }
 
     pub async fn accept_answer(&self, sdp: String) -> Res<()> {
@@ -557,7 +613,7 @@ impl ViewerSession {
     }
 
     pub async fn send_message(&self, text: &str) {
-        let _ = self.dc.send_text(text).await;
+        send_reliably(&self.dc, text).await;
     }
 
     /// Tempo de ida e volta até o host (ms), do par ICE em uso.
@@ -672,7 +728,12 @@ async fn receive_track(track: Arc<dyn TrackRemote>, sinks: ViewerSinks, dc: Arc<
 
 /// Recebe o vídeo em pedaços (canal "aj-p"): monta os quadros, entrega na ordem, pede
 /// keyframe quando perde um e manda os relatórios para o bitrate adaptativo do host.
-async fn receive_pieces(pdc: Arc<dyn DataChannel>, sinks: ViewerSinks, dc: Arc<OnceLock<Arc<dyn DataChannel>>>) {
+async fn receive_pieces(
+    mut rx: tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>,
+    sinks: ViewerSinks,
+    dc: Arc<OnceLock<Arc<dyn DataChannel>>>,
+    mesh: Arc<crate::meshnet::ViewerMesh>,
+) {
     use crate::pieces::{Assembler, Header, Ordered, KIND_VIDEO};
     let mut asm = Assembler::new();
     let mut ord = Ordered::new();
@@ -687,7 +748,7 @@ async fn receive_pieces(pdc: Arc<dyn DataChannel>, sinks: ViewerSinks, dc: Arc<O
     let mut rng: u32 = 0x2545_f491;
     loop {
         // Sem pedaços chegando, ainda acorda para dar quadros atrasados como perdidos.
-        let ev = match tokio::time::timeout(Duration::from_millis(20), pdc.poll()).await {
+        let ev = match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
             Ok(Some(ev)) => Some(ev),
             Ok(None) => break,
             Err(_) => None,
@@ -695,8 +756,24 @@ async fn receive_pieces(pdc: Arc<dyn DataChannel>, sinks: ViewerSinks, dc: Arc<O
         let now = Instant::now();
         let mut out = vec![];
         match ev {
-            Some(DataChannelEvent::OnMessage(m)) if m.data.len() > 4 => {
-                let d = &m.data;
+            // Pedaço repassado por um vizinho: o número sequencial é da ligação dele (a
+            // perda medida para o bitrate do host é só a do caminho direto).
+            Some((src, d)) if src != 0 && d.len() > 4 => {
+                let piece = &d[4..];
+                mesh.on_piece(src, piece, now).await;
+                if let Some(f) = asm.push(piece, now) {
+                    if f.kind == KIND_VIDEO {
+                        if rendition != Some(f.rendition) && f.keyframe {
+                            rendition = Some(f.rendition);
+                            ord = Ordered::new();
+                        }
+                        if rendition == Some(f.rendition) {
+                            out.extend(ord.push(f, now));
+                        }
+                    }
+                }
+            }
+            Some((_, d)) if d.len() > 4 => {
                 let loss = TEST_PIECE_LOSS_PERMILLE.load(Ordering::Relaxed);
                 if loss > 0 {
                     rng ^= rng << 13;
@@ -717,6 +794,7 @@ async fn receive_pieces(pdc: Arc<dyn DataChannel>, sinks: ViewerSinks, dc: Arc<O
                 if let Some(h) = Header::read(piece) {
                     meter.on_packet(now, d.len(), h.ts);
                 }
+                mesh.on_piece(0, piece, now).await;
                 if let Some(f) = asm.push(piece, now) {
                     if f.kind == KIND_VIDEO {
                         if rendition != Some(f.rendition) && f.keyframe {
@@ -729,9 +807,9 @@ async fn receive_pieces(pdc: Arc<dyn DataChannel>, sinks: ViewerSinks, dc: Arc<O
                     }
                 }
             }
-            Some(DataChannelEvent::OnClose) => break,
             _ => {}
         }
+        mesh.tick(now);
         out.extend(ord.tick(now));
         for f in out {
             (sinks.on_video)(f.data, f.ts);

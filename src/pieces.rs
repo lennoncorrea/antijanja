@@ -221,10 +221,25 @@ impl FrameEncoder {
     /// Originais + extras com `overhead` de folga em cada bloco (0,4 = 40% a mais, pelo
     /// menos 1 extra por bloco).
     pub fn pieces(&mut self, overhead: f32) -> Vec<Vec<u8>> {
+        self.pieces_with(overhead, false)
+    }
+
+    /// Como `pieces`; com `survive_lane`, a folga também garante que perder uma faixa
+    /// inteira (um vizinho da malha que caiu) ainda deixa pedaços para fechar cada bloco,
+    /// com 1 de sobra. Com 4 faixas e quadros pequenos, isso pede ~+40% em vez de +25%.
+    pub fn pieces_with(&mut self, overhead: f32, survive_lane: bool) -> Vec<Vec<u8>> {
         let mut out = self.source();
+        let lanes = self.lanes as u32;
         for b in 0..self.blocks.len() {
             let kb = self.header.block_pieces(b as u32);
-            let extra = ((kb as f32 * overhead).ceil() as u32).max(1);
+            let mut extra = ((kb as f32 * overhead).ceil() as u32).max(1);
+            if survive_lane && lanes > 1 {
+                // Os pedaços se repartem igualmente entre as faixas: perder a maior parte
+                // (ceil(n/faixas)) ainda deixa kb+1.
+                while (kb + extra) - (kb + extra).div_ceil(lanes) < kb + 1 {
+                    extra += 1;
+                }
+            }
             out.extend(self.repair_block(b, extra));
         }
         out
@@ -252,13 +267,15 @@ pub struct PieceSource {
     state: std::collections::HashMap<u32, (u32, u32)>,
     seed: u32,
     pub overhead: f32,
+    /// Malha: folga suficiente para perder uma faixa inteira.
+    pub survive_lane: bool,
 }
 
 impl PieceSource {
     pub fn new(overhead: f32) -> Self {
         let mut b = [0u8; 4];
         let _ = getrandom::fill(&mut b);
-        Self { state: Default::default(), seed: u32::from_le_bytes(b), overhead }
+        Self { state: Default::default(), seed: u32::from_le_bytes(b), overhead, survive_lane: false }
     }
 
     /// `key`: versão (0 = principal, senão a altura). None só se o quadro for inválido;
@@ -271,7 +288,7 @@ impl PieceSource {
         *st = (frame.wrapping_add(1), ts.wrapping_add(samples));
         let keyframe = crate::media::has_nal(data, 5);
         let mut enc = FrameEncoder::new(KIND_VIDEO, key.min(u16::MAX as u32) as u16, frame, ts, data, keyframe, LANES)?;
-        let pieces = enc.pieces(overhead_for(keyframe, self.overhead));
+        let pieces = enc.pieces_with(overhead_for(keyframe, self.overhead), self.survive_lane);
         Some(std::sync::Arc::new(PieceFrame { pieces, keyframe }))
     }
 }
@@ -715,6 +732,22 @@ mod tests {
         let now = Instant::now();
         let f = pieces[..keep].iter().find_map(|p| a.push(p, now));
         assert!(f.is_some_and(|f| f.keyframe && f.data == d));
+    }
+
+    /// Na malha, perder uma faixa inteira (qualquer uma) não pode impedir nenhum quadro.
+    #[test]
+    fn losing_any_whole_lane_still_rebuilds_every_frame() {
+        for len in [500usize, 3_000, 9_000, 40_000, 300_000] {
+            let d = data(len, len as u32);
+            for lost in 0..LANES {
+                let mut enc = FrameEncoder::new(KIND_VIDEO, 0, 1, 0, &d, len > 100_000, LANES).unwrap();
+                let pieces = enc.pieces_with(0.25, true);
+                let mut a = Assembler::new();
+                let now = Instant::now();
+                let f = pieces.iter().filter(|p| lane_of(p) != Some(lost)).find_map(|p| a.push(p, now));
+                assert!(f.is_some_and(|f| f.data == d), "{len} bytes sem a faixa {lost}");
+            }
+        }
     }
 
     #[test]

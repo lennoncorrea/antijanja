@@ -20,6 +20,7 @@ mod congestion;
 mod gpu;
 mod media;
 mod mesh;
+mod meshnet;
 mod nvof;
 mod pieces;
 mod player;

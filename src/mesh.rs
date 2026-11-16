@@ -84,6 +84,117 @@ pub fn host_lanes(routes: &BTreeMap<u64, Route>) -> usize {
     routes.values().map(|r| r.direct_mask().count_ones() as usize).sum()
 }
 
+/// Mensagem do coordenador para um espectador.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Out {
+    /// A rota dele mudou (de quem recebe e para quem repassa cada faixa).
+    Route { to: u64, route: Route },
+    /// As faixas que o host manda direto para ele mudaram.
+    Direct { to: u64, mask: u32 },
+}
+
+/// Mantém as rotas da malha no host. Regra de segurança: o host só para de mandar uma
+/// faixa direto depois que o espectador avisa que já recebe essa faixa do vizinho
+/// (`fed`); se o vizinho parar de mandar (`starve`), o host volta a mandar e evita aquela
+/// ligação nas próximas rotas.
+pub struct Coordinator {
+    lanes: usize,
+    members: BTreeMap<u64, bool>,
+    routes: BTreeMap<u64, Route>,
+    fed: HashSet<(u64, usize)>,
+    bad: HashSet<(u64, u64)>,
+    masks: BTreeMap<u64, u32>,
+}
+
+impl Coordinator {
+    pub fn new(lanes: usize) -> Self {
+        Self { lanes, members: BTreeMap::new(), routes: BTreeMap::new(), fed: HashSet::new(), bad: HashSet::new(), masks: BTreeMap::new() }
+    }
+
+    pub fn route(&self, id: u64) -> Option<&Route> {
+        self.routes.get(&id)
+    }
+
+    /// Faixas que o host manda direto para `id` (todas, se ele não está na malha).
+    pub fn direct_mask(&self, id: u64) -> u32 {
+        self.masks.get(&id).copied().unwrap_or(u32::MAX)
+    }
+
+    pub fn join(&mut self, id: u64, relay: bool) -> Vec<Out> {
+        self.members.insert(id, relay);
+        self.recompute()
+    }
+
+    pub fn leave(&mut self, id: u64) -> Vec<Out> {
+        self.members.remove(&id);
+        self.masks.remove(&id);
+        self.fed.retain(|&(c, _)| c != id);
+        self.bad.retain(|&(a, b)| a != id && b != id);
+        self.recompute()
+    }
+
+    /// `child` já recebe a faixa `lane` do pai `from`: o host pode parar de mandá-la
+    /// direto. Ignorado se `from` não é mais o pai dessa faixa (aviso de uma rota antiga).
+    pub fn fed(&mut self, child: u64, lane: usize, from: u64) -> Vec<Out> {
+        if self.parent_of(child, lane) != Some(from) || !self.fed.insert((child, lane)) {
+            return vec![];
+        }
+        self.update_masks()
+    }
+
+    /// `child` parou de receber a faixa `lane` do pai `from`: volta a receber do host e a
+    /// ligação sai das rotas. Ignorado se `from` não é mais o pai dessa faixa.
+    pub fn starve(&mut self, child: u64, lane: usize, from: u64) -> Vec<Out> {
+        if self.parent_of(child, lane) != Some(from) {
+            return vec![];
+        }
+        self.bad.insert((from, child));
+        self.recompute()
+    }
+
+    fn parent_of(&self, child: u64, lane: usize) -> Option<u64> {
+        self.routes.get(&child).and_then(|r| r.parent.get(lane).copied().flatten())
+    }
+
+    fn recompute(&mut self) -> Vec<Out> {
+        let members: Vec<Member> = self.members.iter().map(|(&id, &relay)| Member { id, relay }).collect();
+        let new = routes(&members, self.lanes, &self.bad);
+        let mut out = vec![];
+        for (id, r) in &new {
+            if self.routes.get(id) != Some(r) {
+                out.push(Out::Route { to: *id, route: r.clone() });
+            }
+            // Pai novo numa faixa: até ele confirmar, a faixa volta a vir do host.
+            let old = self.routes.get(id);
+            for lane in 0..self.lanes {
+                if old.map(|o| o.parent[lane]) != Some(r.parent[lane]) {
+                    self.fed.remove(&(*id, lane));
+                }
+            }
+        }
+        self.routes = new;
+        out.extend(self.update_masks());
+        out
+    }
+
+    fn update_masks(&mut self) -> Vec<Out> {
+        let mut out = vec![];
+        for (id, r) in &self.routes {
+            let mut mask = r.direct_mask();
+            for lane in 0..self.lanes {
+                if r.parent[lane].is_some() && !self.fed.contains(&(*id, lane)) {
+                    mask |= 1 << lane;
+                }
+            }
+            if self.masks.get(id) != Some(&mask) {
+                self.masks.insert(*id, mask);
+                out.push(Out::Direct { to: *id, mask });
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +222,80 @@ mod tests {
                 assert!(route.children.iter().all(|c| c.is_empty()), "{} não repassa e tem filhos", mem.id);
             }
         }
+    }
+
+    /// Todos confirmam todas as faixas que recebem de um pai.
+    fn feed_all(c: &mut Coordinator, ids: std::ops::RangeInclusive<u64>) {
+        for id in ids {
+            for l in 0..4 {
+                if let Some(p) = c.route(id).unwrap().parent[l] {
+                    c.fed(id, l, p);
+                }
+            }
+        }
+    }
+
+    fn masks(out: &[Out]) -> BTreeMap<u64, u32> {
+        out.iter().filter_map(|o| match o { Out::Direct { to, mask } => Some((*to, *mask)), _ => None }).collect()
+    }
+
+    #[test]
+    fn coordinator_keeps_sending_direct_until_the_neighbor_delivers() {
+        let mut c = Coordinator::new(4);
+        for id in 1..=4 {
+            c.join(id, true);
+        }
+        // Rotas prontas, mas ninguém confirmou: o host ainda manda tudo para todos.
+        for id in 1..=4 {
+            assert_eq!(c.direct_mask(id), 0b1111);
+        }
+        let r2 = c.route(2).unwrap().clone();
+        let lane = (0..4).find(|&l| r2.parent[l].is_some()).unwrap();
+        let parent = r2.parent[lane].unwrap();
+        assert!(c.fed(2, lane, parent + 100).is_empty(), "aviso de quem não é o pai: ignorado");
+        let out = c.fed(2, lane, parent);
+        assert_eq!(masks(&out).get(&2), Some(&(0b1111 & !(1 << lane))), "só essa faixa deixa de vir direto");
+        // Confirmando tudo, o host manda a cada um só a faixa que ele repassa: 1 stream no total.
+        feed_all(&mut c, 1..=4);
+        let total: u32 = (1..=4).map(|id| c.direct_mask(id).count_ones()).sum();
+        assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn coordinator_reroutes_when_a_neighbor_stops_or_leaves() {
+        let mut c = Coordinator::new(4);
+        for id in 1..=8 {
+            c.join(id, true);
+        }
+        feed_all(&mut c, 1..=8);
+        let parent = c.route(6).unwrap().parent[0].unwrap();
+        // O pai parou de mandar a faixa 0 para o 6: rota nova sem essa ligação, e a faixa
+        // volta direto até o pai novo confirmar.
+        let out = c.starve(6, 0, parent);
+        assert!(out.iter().any(|o| matches!(o, Out::Route { to: 6, .. })));
+        assert_ne!(c.route(6).unwrap().parent[0], Some(parent));
+        assert!(c.direct_mask(6) & 1 != 0);
+        // Um repassador sai: quem dependia dele volta a receber direto aquela faixa.
+        let leaving = 1u64;
+        let deps: Vec<u64> = (2..=8).filter(|&id| c.route(id).unwrap().parent.contains(&Some(leaving))).collect();
+        assert!(!deps.is_empty());
+        c.leave(leaving);
+        for id in deps {
+            let r = c.route(id).unwrap();
+            for l in 0..4 {
+                assert_ne!(r.parent[l], Some(leaving));
+            }
+        }
+        assert!(c.route(leaving).is_none());
+    }
+
+    #[test]
+    fn coordinator_ignores_confirmations_for_lanes_without_a_parent() {
+        let mut c = Coordinator::new(4);
+        c.join(1, true);
+        assert!(c.fed(1, 0, 2).is_empty(), "sozinho, tudo vem do host");
+        assert_eq!(c.direct_mask(1), 0b1111);
+        assert!(c.starve(1, 0, 2).is_empty());
     }
 
     #[test]
