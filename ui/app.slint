@@ -1,7 +1,7 @@
 // Janela principal do AntiJanja.
 import { Theme } from "theme.slint";
 import { App, Stream, StreamRow, WatchingItem, Source, SourceRow, Peer, AudioApp, SelectOption, MenuOption, Tile, Toast } from "state.slint";
-import { Btn, Icon } from "widgets.slint";
+import { Btn, Icon, TextField } from "widgets.slint";
 import { HomeView } from "home.slint";
 import { HostView } from "host.slint";
 import { WatchView } from "watch.slint";
@@ -252,6 +252,51 @@ component UpdateOverlay inherits Rectangle {
     }
 }
 
+// Senha para assistir uma transmissão com senha.
+component PasswordDialog inherits Rectangle {
+    background: Theme.overlay;
+    TouchArea { clicked => { App.cancel-password(); } }
+    Rectangle {
+        width: 380px;
+        height: box.preferred-height;
+        background: Theme.card;
+        border-radius: 14px;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 28px;
+        drop-shadow-offset-y: 8px;
+        drop-shadow-color: #00000066;
+        TouchArea { }
+        box := VerticalLayout {
+            padding: 22px;
+            spacing: 14px;
+            HorizontalLayout {
+                spacing: 10px;
+                alignment: start;
+                VerticalLayout {
+                    alignment: center;
+                    Icon { source: @image-url("icons/lock.svg"); tint: Theme.primary; width: 18px; height: 18px; }
+                }
+                Text { text: "Essa transmissão tem senha"; font-size: 16px; font-weight: 600; color: Theme.fg; vertical-alignment: center; }
+            }
+            Text { text: "Peça a senha para quem está transmitindo."; font-size: 13px; color: Theme.muted-fg; wrap: word-wrap; }
+            field := TextField {
+                secret: true;
+                placeholder: "Senha";
+                accepted(t) => { App.submit-password(t); }
+                init => { self.focus-input(); }
+            }
+            if App.password-error != "" : Text { text: App.password-error; font-size: 12px; color: Theme.destructive; }
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+                Btn { kind: "ghost"; text: "Cancelar"; clicked => { App.cancel-password(); } }
+                Btn { kind: "primary"; text: "Assistir"; clicked => { App.submit-password(field.text); } }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: App.title;
     icon: @image-url("../assets/icons/128x128.png");
@@ -298,6 +343,11 @@ export component AppWindow inherits Window {
         x: 0;
         y: 56px;
         width: root.width;
+    }
+
+    if App.password-prompt : PasswordDialog {
+        width: 100%;
+        height: 100%;
     }
 
     if App.update-version != "" : UpdateOverlay {

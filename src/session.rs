@@ -44,9 +44,16 @@ pub struct HostConfig {
     /// Nome da tela/janela transmitida (aparece na lista pública).
     #[serde(default)]
     pub title: String,
+    /// Senha da transmissão (vazia = sem senha).
+    #[serde(default)]
+    pub password: String,
 }
 
 impl HostConfig {
+    fn password(&self) -> Option<&str> {
+        Some(self.password.as_str()).filter(|p| !p.is_empty())
+    }
+
     fn quality(&self) -> String {
         if self.res == 0 { format!("original {}fps", self.fps) } else { format!("{}p{}", self.res, self.fps) }
     }
@@ -176,6 +183,7 @@ fn start_public(state: &RdvState, cfg: &HostConfig, code: &str, since: i64, view
         since,
         ts: rendezvous::now_ms(),
         gone: false,
+        locked: cfg.password().is_some(),
     };
     rendezvous::PublicAnnouncer::start(state, entry).ok()
 }
@@ -376,7 +384,7 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
         })
     };
 
-    let code = rendezvous::host_listen(&state, on_offer.clone())?;
+    let code = rendezvous::host_listen(&state, on_offer.clone(), config.password())?;
     let since = rendezvous::now_ms();
     let public = start_public(&state, &config, &code, since, 0);
     *HOST.lock().unwrap() = Some(HostSession { code: code.clone(), config, shared: shared.clone(), video, audio, opus, peers, media_tx, on_offer, public, since });
@@ -542,13 +550,19 @@ pub fn host_update(app: AppHandle, config: HostConfig) -> Res<()> {
 /// Gera outro código; quem já está assistindo continua.
 pub fn host_new_code(app: &AppHandle) -> Res<String> {
     let state = app.rdv();
-    let on_offer = HOST.lock().unwrap().as_ref().map(|h| h.on_offer.clone()).ok_or("não está transmitindo")?;
-    let code = rendezvous::host_listen(&state, on_offer)?;
+    let (on_offer, password) = HOST
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|h| (h.on_offer.clone(), h.config.password.clone()))
+        .ok_or("não está transmitindo")?;
+    let password = Some(password.as_str()).filter(|p| !p.is_empty());
+    let code = rendezvous::host_listen(&state, on_offer, password)?;
     if let Some(h) = HOST.lock().unwrap().as_mut() {
         h.code = code.clone();
         if let Some(a) = &h.public {
-            let c = code.clone();
-            a.update(|e| e.code = c, true);
+            let (c, locked) = (code.clone(), password.is_some());
+            a.update(|e| { e.code = c; e.locked = locked; }, true);
         }
     }
     Ok(code)
@@ -644,7 +658,7 @@ fn emit_viewer(app: &AppHandle, event: &str, id: &str, value: serde_json::Value)
 
 /// Entra numa transmissão pelo código. `id` identifica o tile na interface.
 /// Volta com o nome do host quando a conexão é montada.
-pub async fn viewer_join(app: AppHandle, id: String, code: String, name: String, volume: u32, view_fps: u32) -> Res<String> {
+pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Option<String>, name: String, volume: u32, view_fps: u32) -> Res<String> {
     leave_viewer(&app, &id).await;
     let gen = VIEWER_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let stop = Arc::new(AtomicBool::new(false));
@@ -803,14 +817,23 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, name: String,
     let sid: String = sid_bytes.iter().map(|b| format!("{b:02x}")).collect();
     let payload = serde_json::json!({ "t": "offer", "sid": sid, "sdp": offer, "name": name }).to_string();
     let (app2, id_wait, stop2) = (app.clone(), id.clone(), stop.clone());
+    let has_password = password.is_some();
     let answer = tokio::task::spawn_blocking(move || {
         let state = app2.rdv();
-        rendezvous::join(&state, &code, &sid, &payload, JOIN_TIMEOUT_S, &stop2, || {
+        rendezvous::join(&state, &code, password.as_deref(), &sid, &payload, JOIN_TIMEOUT_S, &stop2, || {
             emit_viewer(&app2, "viewer-step", &id_wait, "wait".into())
         })
     })
     .await
-    .map_err(|e| e.to_string())??;
+    .map_err(|e| e.to_string())?
+    .map_err(|e| {
+        // Com senha errada o host nem vê o pedido: o sintoma é ele não responder.
+        if has_password && e.starts_with("O host não respondeu") {
+            "O host não respondeu. Confira a senha e se a transmissão ainda está ativa.".to_string()
+        } else {
+            e
+        }
+    })?;
     if !viewer_alive(&id, gen) {
         return Err("cancelado".into());
     }

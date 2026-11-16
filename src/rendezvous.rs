@@ -85,8 +85,11 @@ impl Role {
     }
 }
 
-/// Confere um código colado e devolve a chave pública do host que ele carrega.
-fn parse_code(code: &str) -> Result<VerifyingKey, String> {
+/// Marcador no 33º byte do código: a transmissão tem senha.
+const FLAG_PASSWORD: u8 = 1;
+
+/// Confere um código colado. Devolve a chave pública do host e se a transmissão tem senha.
+fn parse_code(code: &str) -> Result<(VerifyingKey, bool), String> {
     let cleaned: String = code.chars().filter(|c| !c.is_whitespace()).collect();
     if cleaned.starts_with(OLD_PREFIX) {
         return Err("Esse código é de uma versão antiga do AntiJanja. Peça para quem está transmitindo atualizar o app.".into());
@@ -94,17 +97,34 @@ fn parse_code(code: &str) -> Result<VerifyingKey, String> {
     let body = cleaned
         .strip_prefix(CODE_PREFIX)
         .ok_or(format!("Esse não é um código do AntiJanja. Ele começa com {CODE_PREFIX}"))?;
-    let bytes: [u8; 32] = URL_SAFE_NO_PAD
-        .decode(body)
-        .ok()
-        .and_then(|b| b.try_into().ok())
-        .ok_or("Código incompleto ou digitado errado.")?;
-    VerifyingKey::from_bytes(&bytes).map_err(|_| "Código incompleto ou digitado errado.".to_string())
+    let bad = || "Código incompleto ou digitado errado.".to_string();
+    let raw = URL_SAFE_NO_PAD.decode(body).map_err(|_| bad())?;
+    // 32 bytes: sem senha. 33: o último é um marcador.
+    let locked = match raw.len() {
+        32 => false,
+        33 if raw[32] == FLAG_PASSWORD => true,
+        _ => return Err(bad()),
+    };
+    let pk: [u8; 32] = raw[..32].try_into().map_err(|_| bad())?;
+    Ok((VerifyingKey::from_bytes(&pk).map_err(|_| bad())?, locked))
 }
 
-/// O código parece válido? (para avisar na interface antes de tentar entrar)
-pub fn check_code(code: &str) -> Result<(), String> {
-    parse_code(code).map(|_| ())
+/// O código parece válido? Devolve se a transmissão pede senha.
+pub fn check_code(code: &str) -> Result<bool, String> {
+    parse_code(code).map(|(_, locked)| locked)
+}
+
+/// Segredo tirado da senha. Argon2id (64 MiB, 3 passadas): lento de propósito, para
+/// testar senhas uma a uma ficar caro mesmo para quem tem o código. O sal é a chave
+/// pública do host (cada transmissão tem a sua).
+fn password_secret(password: &str, host_pk: &[u8; 32]) -> Result<[u8; 32], String> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    let params = Params::new(64 * 1024, 3, 1, Some(32)).map_err(|e| e.to_string())?;
+    let mut out = [0u8; 32];
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+        .hash_password_into(password.as_bytes(), host_pk, &mut out)
+        .map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 struct Keys {
@@ -117,22 +137,41 @@ struct Keys {
 }
 
 impl Keys {
-    /// Espectador: chaves a partir do código colado.
-    fn from_code(code: &str) -> Result<Self, String> {
-        Ok(Self::derive(parse_code(code)?.to_bytes(), None))
+    /// Espectador: chaves a partir do código colado (e da senha, se a transmissão tiver).
+    fn from_code(code: &str, password: Option<&str>) -> Result<Self, String> {
+        let (pk, locked) = parse_code(code)?;
+        let pk = pk.to_bytes();
+        let secret = match (locked, password.filter(|p| !p.is_empty())) {
+            (false, _) => None,
+            (true, Some(p)) => Some(password_secret(p, &pk)?),
+            (true, None) => return Err("Essa transmissão tem senha.".into()),
+        };
+        Ok(Self::derive(pk, secret, None))
     }
 
     /// Host: sorteia um par de chaves novo. Devolve (código, chaves).
-    fn new_host() -> Result<(String, Self), String> {
+    fn new_host(password: Option<&str>) -> Result<(String, Self), String> {
         let mut seed = [0u8; 32];
         getrandom::fill(&mut seed).map_err(|e| e.to_string())?;
         let sk = SigningKey::from_bytes(&seed);
         let pk = sk.verifying_key().to_bytes();
-        Ok((format!("{CODE_PREFIX}{}", URL_SAFE_NO_PAD.encode(pk)), Self::derive(pk, Some(sk))))
+        let password = password.filter(|p| !p.is_empty());
+        let mut raw = pk.to_vec();
+        if password.is_some() {
+            raw.push(FLAG_PASSWORD);
+        }
+        let secret = password.map(|p| password_secret(p, &pk)).transpose()?;
+        Ok((format!("{CODE_PREFIX}{}", URL_SAFE_NO_PAD.encode(raw)), Self::derive(pk, secret, Some(sk))))
     }
 
-    fn derive(host_pk: [u8; 32], host: Option<SigningKey>) -> Self {
-        let derive = |ctx: &str| blake3::derive_key(ctx, &host_pk);
+    /// Com senha, as chaves dependem também do segredo dela: sem a senha não dá para
+    /// ler nem mandar mensagens, nem tendo o código.
+    fn derive(host_pk: [u8; 32], secret: Option<[u8; 32]>, host: Option<SigningKey>) -> Self {
+        let mut material = host_pk.to_vec();
+        if let Some(s) = secret {
+            material.extend_from_slice(&s);
+        }
+        let derive = |ctx: &str| blake3::derive_key(ctx, &material);
         Keys {
             host_pk,
             host,
@@ -323,11 +362,11 @@ pub type OfferFn = Arc<dyn Fn(&str, u8, String) + Send + Sync>;
 
 /// Cria um novo código e começa a escutar pedidos de espectadores.
 /// `on_offer` é chamado para cada pedido novo.
-pub fn host_listen(state: &RdvState, on_offer: OfferFn) -> Result<String, String> {
+pub fn host_listen(state: &RdvState, on_offer: OfferFn, password: Option<&str>) -> Result<String, String> {
     raise_stop(&state.hosting);
     let dht = get_dht(state)?;
 
-    let (code, keys) = Keys::new_host()?;
+    let (code, keys) = Keys::new_host(password)?;
     let keys = Arc::new(keys);
     state.host_keys.lock().unwrap().insert(code.clone(), keys.clone());
 
@@ -403,6 +442,7 @@ fn pick_slot(dht: &Dht, keys: &Keys) -> Result<(u8, i64), String> {
 pub fn join(
     state: &RdvState,
     code: &str,
+    password: Option<&str>,
     sid: &str,
     payload: &str,
     timeout_secs: u64,
@@ -411,7 +451,7 @@ pub fn join(
 ) -> Result<String, String> {
     // Cada espectador tem a própria flag de cancelamento: várias entradas podem
     // acontecer ao mesmo tempo (assistir várias transmissões).
-    let keys = Keys::from_code(code)?;
+    let keys = Keys::from_code(code, password)?;
     let dht = get_dht(state)?;
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs.clamp(10, 600));
@@ -513,6 +553,9 @@ pub struct PublicEntry {
     pub ts: i64,
     #[serde(default)]
     pub gone: bool,
+    /// A transmissão pede senha (cadeado na lista).
+    #[serde(default)]
+    pub locked: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -525,7 +568,8 @@ pub struct PublicStream {
 fn valid(e: &PublicEntry) -> bool {
     !e.gone
         && e.code.len() < 80
-        && parse_code(&e.code).is_ok()
+        // O cadeado tem que bater com o código (ninguém anuncia "sem senha" errado).
+        && parse_code(&e.code).is_ok_and(|(_, locked)| locked == e.locked)
         && !e.name.trim().is_empty()
         && e.name.chars().count() <= 40
         && e.title.chars().count() <= 80
@@ -548,7 +592,7 @@ fn open_entry(value: &[u8]) -> Option<PublicEntry> {
     let (sig, json) = value.split_at(Signature::BYTE_SIZE);
     let entry: PublicEntry = serde_json::from_slice(json).ok()?;
     let sig = Signature::from_slice(sig).ok()?;
-    parse_code(&entry.code).ok()?.verify_strict(&[MURAL_CONTEXT, json].concat(), &sig).ok()?;
+    parse_code(&entry.code).ok()?.0.verify_strict(&[MURAL_CONTEXT, json].concat(), &sig).ok()?;
     Some(entry)
 }
 
@@ -728,14 +772,14 @@ mod tests {
     use super::*;
 
     fn host() -> (String, Keys) {
-        Keys::new_host().unwrap()
+        Keys::new_host(None).unwrap()
     }
 
     #[test]
     fn code_roundtrip_and_crypto() {
         let (code, a) = host();
         assert!(code.starts_with(CODE_PREFIX));
-        let b = Keys::from_code(&format!("  {code}\n")).unwrap();
+        let b = Keys::from_code(&format!("  {code}\n"), None).unwrap();
         assert_eq!(a.host_pk, b.host_pk);
         assert_eq!(a.viewer.to_bytes(), b.viewer.to_bytes());
         assert_ne!(a.public(Role::Host), a.public(Role::Viewer));
@@ -752,7 +796,7 @@ mod tests {
     #[test]
     fn viewer_cannot_sign_as_host() {
         let (code, a) = host();
-        let b = Keys::from_code(&code).unwrap();
+        let b = Keys::from_code(&code, None).unwrap();
         assert!(a.signer(Role::Host).is_ok());
         assert!(b.signer(Role::Host).is_err());
         assert!(b.signer(Role::Viewer).is_ok());
@@ -760,8 +804,8 @@ mod tests {
 
     #[test]
     fn rejects_bad_codes() {
-        assert!(Keys::from_code("hello").is_err());
-        assert!(Keys::from_code("AJ3.abc").is_err());
+        assert!(Keys::from_code("hello", None).is_err());
+        assert!(Keys::from_code("AJ3.abc", None).is_err());
         let old = format!("{OLD_PREFIX}{}", URL_SAFE_NO_PAD.encode([7u8; 32]));
         assert!(check_code(&old).unwrap_err().contains("versão antiga"));
     }
@@ -769,7 +813,7 @@ mod tests {
     fn entry(code: &str, ts: i64, gone: bool) -> PublicEntry {
         PublicEntry {
             id: "x".into(), name: "Fulano".into(), title: "Jogo".into(), code: code.into(),
-            viewers: 1, quality: "1080p60".into(), since: ts, ts, gone,
+            viewers: 1, quality: "1080p60".into(), since: ts, ts, gone, locked: false,
         }
     }
 
@@ -791,7 +835,7 @@ mod tests {
         assert_eq!(open_entry(&seal_entry(&attacker, &e).unwrap()), None);
 
         // Quem só tem o código nem consegue assinar.
-        assert!(seal_entry(&Keys::from_code(&code).unwrap(), &e).is_err());
+        assert!(seal_entry(&Keys::from_code(&code, None).unwrap(), &e).is_err());
         assert_eq!(open_entry(b"lixo"), None);
     }
 
@@ -802,6 +846,40 @@ mod tests {
         let list = latest_per_code([entry(&code, t - 30_000, false), entry(&code, t, true), entry(&code, t - 10_000, false)]);
         assert_eq!(list.len(), 1);
         assert!(list[0].gone, "um \"encerrou\" mais novo não pode ser escondido por uma entrada antiga");
+    }
+
+    #[test]
+    fn password_changes_the_keys() {
+        let (code, host) = Keys::new_host(Some("pizza")).unwrap();
+        assert_eq!(check_code(&code), Ok(true), "código marca que tem senha");
+        assert_eq!(check_code(&Keys::new_host(None).unwrap().0), Ok(false));
+        let right = Keys::from_code(&code, Some("pizza")).unwrap();
+        assert_eq!(host.viewer.to_bytes(), right.viewer.to_bytes());
+        let msg = r#"{"t":"offer"}"#;
+        assert_eq!(right.open(&host.seal(msg).unwrap()).as_deref(), Some(msg));
+        // Senha errada: chaves diferentes, não lê nem escreve onde o host olha.
+        let wrong = Keys::from_code(&code, Some("pizzA")).unwrap();
+        assert_ne!(host.viewer.to_bytes(), wrong.viewer.to_bytes());
+        assert!(wrong.open(&host.seal(msg).unwrap()).is_none());
+        // Sem senha: recusa antes de tentar.
+        assert!(Keys::from_code(&code, None).err().unwrap().contains("senha"));
+        // A mesma chave pública sem a senha dá chaves diferentes (o segredo entra na conta).
+        let pk = URL_SAFE_NO_PAD.encode(host.host_pk);
+        let open_keys = Keys::from_code(&format!("{CODE_PREFIX}{pk}"), None).unwrap();
+        assert_ne!(open_keys.viewer.to_bytes(), host.viewer.to_bytes());
+    }
+
+    #[test]
+    fn mural_padlock_must_match_the_code() {
+        let (code, _) = Keys::new_host(Some("x")).unwrap();
+        let mut e = entry(&code, now_ms(), false);
+        assert!(!valid(&e), "transmissão com senha anunciada sem cadeado");
+        e.locked = true;
+        assert!(valid(&e));
+        let (open, _) = Keys::new_host(None).unwrap();
+        let mut f = entry(&open, now_ms(), false);
+        f.locked = true;
+        assert!(!valid(&f), "cadeado num código sem senha");
     }
 
     #[test]
@@ -843,7 +921,7 @@ mod tests {
         assert!(dht.bootstrapped());
         let (code, host_keys) = host();
         let host_keys = Arc::new(host_keys);
-        let viewer_keys = Arc::new(Keys::from_code(&code).unwrap());
+        let viewer_keys = Arc::new(Keys::from_code(&code, None).unwrap());
         let start = Instant::now();
 
         // Host: uma thread por slot, como em host_listen.
@@ -899,13 +977,41 @@ mod tests {
             let sid = serde_json::from_str::<serde_json::Value>(&offer).unwrap()["sid"].as_str().unwrap().to_string();
             host_reply(&h, code, slot, &serde_json::json!({ "t": "answer", "sid": sid }).to_string()).unwrap();
         });
-        let code = host_listen(&host, on_offer).unwrap();
+        let code = host_listen(&host, on_offer, None).unwrap();
         let t = Instant::now();
-        let answer = join(&viewer, &code, "s1", r#"{"t":"offer","sid":"s1"}"#, 90, &AtomicBool::new(false), || {}).unwrap();
+        let answer = join(&viewer, &code, None, "s1", r#"{"t":"offer","sid":"s1"}"#, 90, &AtomicBool::new(false), || {}).unwrap();
         println!("resposta em {:?}", t.elapsed());
         assert!(answer.contains("answer"));
         host_stop(&host);
         assert!(host_reply(&host, &code, 0, "{}").is_err(), "depois de parar, o código não responde mais");
+    }
+
+    /// Com senha, pela DHT real: a senha certa recebe resposta; a errada, não.
+    #[test]
+    #[ignore]
+    fn live_join_with_password() {
+        let dht = Dht::client().unwrap();
+        assert!(dht.bootstrapped());
+        let host = Arc::new(RdvState::default());
+        let viewer = RdvState::default();
+        let _ = host.dht.set(dht.clone());
+        let _ = viewer.dht.set(dht);
+        let h = host.clone();
+        let on_offer: OfferFn = Arc::new(move |code: &str, slot: u8, offer: String| {
+            let sid = serde_json::from_str::<serde_json::Value>(&offer).unwrap()["sid"].as_str().unwrap().to_string();
+            host_reply(&h, code, slot, &serde_json::json!({ "t": "answer", "sid": sid }).to_string()).unwrap();
+        });
+        let t = Instant::now();
+        let code = host_listen(&host, on_offer, Some("pizza")).unwrap();
+        println!("código com senha gerado em {:?}: {code}", t.elapsed());
+        let stop = AtomicBool::new(false);
+        let wrong = join(&viewer, &code, Some("errada"), "s1", r#"{"t":"offer","sid":"s1"}"#, 25, &stop, || {});
+        assert!(wrong.is_err(), "senha errada não pode receber resposta");
+        let t = Instant::now();
+        let right = join(&viewer, &code, Some("pizza"), "s2", r#"{"t":"offer","sid":"s2"}"#, 90, &stop, || {}).unwrap();
+        println!("resposta com a senha certa em {:?}", t.elapsed());
+        assert!(right.contains("answer"));
+        host_stop(&host);
     }
 
     /// Trava 7 dos 8 slots (seq absurdo) e confere que o espectador escolhe o que sobrou.

@@ -54,6 +54,8 @@ struct Ctl {
     /// Stream com o menu de engrenagem aberto, e qual painel ("main", "fps", "quality").
     menu: Option<String>,
     menu_panel: String,
+    /// Código esperando a senha (janela de senha aberta).
+    password_for: Option<String>,
     view: String,
     net: String,
     live: bool,
@@ -216,6 +218,7 @@ fn render_general(c: &Ctl, ui: &AppWindow) {
 fn render_settings(c: &Ctl, ui: &AppWindow) {
     let a = ui.global::<App>();
     let st = &c.s;
+    a.set_s_password_set(!st.stream_password.is_empty());
     a.set_s_res(s(st.res.to_string()));
     a.set_s_fps(s(st.fps.to_string()));
     a.set_s_bitrate(s(st.bitrate.to_string()));
@@ -269,6 +272,7 @@ fn render_public(c: &Ctl, ui: &AppWindow) {
             cover: cover_index(&e.name),
             watching: c.viewers.iter().any(|v| v.code == e.code),
             blank: false,
+            locked: e.locked,
         }
     };
     a.set_has_featured(!others.is_empty());
@@ -408,7 +412,7 @@ fn relayout(c: &Ctl, ui: &AppWindow) {
     let (cols, rows) = grid_for(shown.len());
     let tile_w = (area_w - gap * (cols as f32 - 1.0)) / cols as f32;
     let tile_h = (area_h - gap * (rows as f32 - 1.0)) / rows as f32;
-    let players_visible = c.view == "watch" && c.picker.is_empty() && !c.updating;
+    let players_visible = c.view == "watch" && c.picker.is_empty() && !c.updating && c.password_for.is_none();
 
     let mut tiles = Vec::new();
     let mut menu_tile = false;
@@ -699,6 +703,7 @@ fn host_config(c: &Ctl) -> Option<session::HostConfig> {
         volume: c.s.volume,
         public: c.s.public,
         title: src.name.clone(),
+        password: c.s.stream_password.clone(),
     })
 }
 
@@ -730,6 +735,32 @@ fn set_setting(c: &mut Ctl, ui: &AppWindow, key: &str, value: &str) {
         "abitrate" => c.s.abitrate = num().unwrap_or(c.s.abitrate),
         "volume" => c.s.volume = num().unwrap_or(c.s.volume),
         "cursor" => c.s.cursor = on,
+        "password" => {
+            let new = value.trim().to_string();
+            if new == c.s.stream_password {
+                return;
+            }
+            c.s.stream_password = new;
+            settings::save(&c.s);
+            render_settings(c, ui);
+            push_config(c, ui);
+            let msg = if c.s.stream_password.is_empty() { "Senha removida." } else { "Senha definida." };
+            if c.live {
+                // A senha entra nas chaves do código: gera outro (quem já assiste continua).
+                let app = c.app.clone();
+                bg(move || session::host_new_code(&app), move |c, ui, r| match r {
+                    Ok(code) => {
+                        c.code = code;
+                        render_host_code(c, ui);
+                        toast(c, ui, "ok", format!("{msg} Código novo gerado; quem já está assistindo continua."));
+                    }
+                    Err(e) => toast(c, ui, "err", e),
+                });
+            } else {
+                toast(c, ui, "ok", msg);
+            }
+            return;
+        }
         "public" => c.s.public = on,
         "audio-app" => c.s.audio_app = value.to_string(),
         "audio-mode" => {
@@ -860,9 +891,10 @@ fn join_with_code(c: &mut Ctl, ui: &AppWindow, raw: &str) {
     if code.is_empty() {
         return toast(c, ui, "err", "Cole o código da transmissão primeiro.");
     }
-    if let Err(e) = rendezvous::check_code(&code) {
-        return toast(c, ui, "err", e);
-    }
+    let locked = match rendezvous::check_code(&code) {
+        Ok(l) => l,
+        Err(e) => return toast(c, ui, "err", e),
+    };
     if c.live && c.code == code {
         return toast(c, ui, "err", "Esse é o código da sua própria transmissão.");
     }
@@ -870,6 +902,30 @@ fn join_with_code(c: &mut Ctl, ui: &AppWindow, raw: &str) {
         set_view(c, ui, "watch");
         return toast(c, ui, "", "Você já está assistindo essa transmissão.");
     }
+    if locked {
+        // Pede a senha antes (os vídeos nativos cobririam a janela: ficam escondidos).
+        c.password_for = Some(code);
+        let a = ui.global::<App>();
+        a.set_password_error(s(""));
+        a.set_password_prompt(true);
+        relayout(c, ui);
+        return;
+    }
+    start_watching(c, ui, code, None);
+}
+
+fn submit_password(c: &mut Ctl, ui: &AppWindow, password: &str) {
+    let Some(code) = c.password_for.clone() else { return };
+    if password.is_empty() {
+        ui.global::<App>().set_password_error(s("Digite a senha."));
+        return;
+    }
+    c.password_for = None;
+    ui.global::<App>().set_password_prompt(false);
+    start_watching(c, ui, code, Some(password.to_string()));
+}
+
+fn start_watching(c: &mut Ctl, ui: &AppWindow, code: String, password: Option<String>) {
     let id = random_id();
     let volume = c.s.view_volume.min(100);
     c.viewers.push(Viewer {
@@ -895,7 +951,7 @@ fn join_with_code(c: &mut Ctl, ui: &AppWindow, raw: &str) {
     let (app, name) = (c.app.clone(), my_name(c));
     let view_fps = view_fps(c, ui);
     transport::tokio_rt().spawn(async move {
-        let r = session::viewer_join(app, id.clone(), code, name, volume, view_fps).await;
+        let r = session::viewer_join(app, id.clone(), code, password, name, volume, view_fps).await;
         let _ = slint::invoke_from_event_loop(move || {
             with(|c, ui| match r {
                 Ok(host) => {
@@ -1286,6 +1342,14 @@ fn wire(ui: &AppWindow) {
             }
         })
     });
+    a.on_submit_password(|p| later(move |c, ui| submit_password(c, ui, &p)));
+    a.on_cancel_password(|| {
+        later(|c, ui| {
+            c.password_for = None;
+            ui.global::<App>().set_password_prompt(false);
+            relayout(c, ui);
+        })
+    });
     a.on_toggle_menu(|id| {
         later(move |c, ui| {
             c.menu = if c.menu.as_deref() == Some(id.as_str()) { None } else { Some(id.to_string()) };
@@ -1401,6 +1465,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
             framegen_available: false,
             menu: None,
             menu_panel: "main".into(),
+            password_for: None,
             controls_until: None,
             toasts: Vec::new(),
             toast_seq: 0,

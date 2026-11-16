@@ -23,6 +23,8 @@ pub struct Settings {
     /// fps para assistir (0 = o da stream). Acima do da stream, gera quadros
     /// intermediários (placa NVIDIA); abaixo, descarta.
     pub view_fps: u32,
+    /// Senha da transmissão (vazia = sem senha). Quem assiste precisa do código e dela.
+    pub stream_password: String,
 }
 
 impl Default for Settings {
@@ -41,6 +43,7 @@ impl Default for Settings {
             public: true,
             view_volume: 100,
             view_fps: 0,
+            stream_password: String::new(),
         }
     }
 }
