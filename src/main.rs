@@ -14,9 +14,11 @@
 mod app;
 mod audio;
 mod capture;
+mod framegen;
 mod congestion;
 mod gpu;
 mod media;
+mod nvof;
 mod player;
 mod playout;
 mod rendezvous;

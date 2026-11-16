@@ -43,6 +43,8 @@ struct Ctl {
     ui: slint::Weak<AppWindow>,
     app: AppHandle,
     s: settings::Settings,
+    /// Placa NVIDIA com Optical Flow (geração de quadros possível).
+    framegen_available: bool,
     view: String,
     net: String,
     live: bool,
@@ -427,7 +429,13 @@ fn relayout(c: &Ctl, ui: &AppWindow) {
             initials: s(initials(if v.host_name.is_empty() { "?" } else { &v.host_name })),
             watching: v.watching,
             step: v.step,
-            res: s(if stats.is_some() { format!("{}p {}fps", num("height") as u32, num("fps").round() as u32) } else { String::new() }),
+            res: s(if stats.is_some() {
+                let (fps, gen) = (num("fps").round() as u32, num("gen_fps").round() as u32);
+                // Com geração de quadros: "30→60fps" (recebidos → mostrados).
+                if gen > 0 { format!("{}p {}→{}fps", num("height") as u32, fps, fps + gen) } else { format!("{}p {}fps", num("height") as u32, fps) }
+            } else {
+                String::new()
+            }),
             rate: s(format_rate(num("kbps"))),
             ping: s(v.ping.map(|p| if buffer > 0 { format!("{p} ms +{buffer}") } else { format!("{p} ms") }).unwrap_or_default()),
             ping_warn: v.ping.is_some_and(|p| p > 150),
@@ -739,8 +747,9 @@ fn join_with_code(c: &mut Ctl, ui: &AppWindow, raw: &str) {
     relayout(c, ui);
 
     let (app, name) = (c.app.clone(), my_name(c));
+    let framegen = c.s.framegen && c.framegen_available;
     transport::tokio_rt().spawn(async move {
-        let r = session::viewer_join(app, id.clone(), code, name, volume).await;
+        let r = session::viewer_join(app, id.clone(), code, name, volume, framegen).await;
         let _ = slint::invoke_from_event_loop(move || {
             with(|c, ui| match r {
                 Ok(host) => {
@@ -1076,6 +1085,18 @@ fn wire(ui: &AppWindow) {
         })
     });
     a.on_set_volume(|id, vol| later(move |c, ui| set_viewer_volume(c, ui, &id, vol.clamp(0, 100) as u32, false)));
+    a.on_toggle_framegen(|| {
+        later(|c, ui| {
+            c.s.framegen = !c.s.framegen;
+            settings::save(&c.s);
+            let on = c.s.framegen && c.framegen_available;
+            for v in &c.viewers {
+                session::viewer_framegen(&v.id, on);
+            }
+            ui.global::<App>().set_framegen(c.s.framegen);
+            toast(c, ui, "", if on { "Suavizar movimento ligado: quadros gerados pela placa NVIDIA." } else { "Suavizar movimento desligado." });
+        })
+    });
     a.on_toggle_mute(|id| {
         later(move |c, ui| {
             let Some((vol, muted)) = c.viewers.iter().find(|v| v.id == id.as_str()).map(|v| (v.volume, v.muted)) else { return };
@@ -1163,6 +1184,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
             viewers: Vec::new(),
             focus: None,
             fullscreen: false,
+            framegen_available: false,
             controls_until: None,
             toasts: Vec::new(),
             toast_seq: 0,
@@ -1248,6 +1270,12 @@ pub fn run() -> Result<(), slint::PlatformError> {
     });
 
     with(|c, ui| refresh_apps(c, ui));
+    // A geração de quadros precisa de placa NVIDIA: descobre em segundo plano (inicia o CUDA).
+    bg(session::framegen_available, |c, ui, ok| {
+        c.framegen_available = ok;
+        ui.global::<App>().set_framegen_available(ok);
+        ui.global::<App>().set_framegen(c.s.framegen);
+    });
     start_updater();
 
     slint::run_event_loop_until_quit()

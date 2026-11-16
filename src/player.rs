@@ -4,6 +4,7 @@
 //! A janela-filha fica por cima da área de vídeo da interface; a interface (WebView) informa
 //! o retângulo dessa área. Eventos de mouse/teclado na janela-filha viram eventos Tauri.
 
+use crate::framegen::{Interpolator, Midpoint, PlaneViews};
 use crate::media::Nv12Frame;
 use std::num::NonZeroIsize;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -30,6 +31,9 @@ static LAST_MOVE: AtomicIsize = AtomicIsize::new(0);
 
 enum Msg {
     Frame(Nv12Frame),
+    /// Geração de quadros: mostra já o quadro do meio entre o atual e `next`, e o `next`
+    /// em `show_next_at`.
+    Mid { next: Nv12Frame, mid: Midpoint, show_next_at: Instant },
     Resize(u32, u32),
     Stop,
 }
@@ -180,6 +184,11 @@ impl PlayerFeed {
     pub fn push(&self, frame: Nv12Frame) {
         let _ = self.tx.try_send(Msg::Frame(frame));
     }
+
+    /// Mostra agora o quadro do meio e `next` em `show_next_at` (ver `framegen`).
+    pub fn push_mid(&self, next: Nv12Frame, mid: Midpoint, show_next_at: Instant) {
+        let _ = self.tx.try_send(Msg::Mid { next, mid, show_next_at });
+    }
 }
 
 const SHADER: &str = r#"
@@ -210,6 +219,17 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Um quadro na placa de vídeo (planos Y e UV).
+struct Planes {
+    y: wgpu::Texture,
+    uv: wgpu::Texture,
+    y_view: wgpu::TextureView,
+    uv_view: wgpu::TextureView,
+    bind: wgpu::BindGroup,
+    w: u32,
+    h: u32,
+}
+
 struct Gpu {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -218,7 +238,10 @@ struct Gpu {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    planes: Option<(wgpu::Texture, wgpu::Texture, wgpu::BindGroup, u32, u32)>,
+    /// Dois quadros: o mostrado (`cur`) e o próximo (para o quadro do meio).
+    sets: [Option<Planes>; 2],
+    cur: usize,
+    interp: Interpolator,
 }
 
 fn init_gpu(hwnd: isize) -> Res<Gpu> {
@@ -315,7 +338,8 @@ fn init_gpu(hwnd: isize) -> Res<Gpu> {
         min_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
-    Ok(Gpu { surface, device, queue, config, pipeline, layout, sampler, planes: None })
+    let interp = Interpolator::new(&device, format);
+    Ok(Gpu { surface, device, queue, config, pipeline, layout, sampler, sets: [None, None], cur: 0, interp })
 }
 
 impl Gpu {
@@ -327,10 +351,10 @@ impl Gpu {
         }
     }
 
-    fn upload(&mut self, f: &Nv12Frame) {
+    /// Envia o quadro para o conjunto de texturas `slot`.
+    fn upload(&mut self, f: &Nv12Frame, slot: usize) {
         let (w, h) = (f.width, f.height);
-        let recreate = !matches!(&self.planes, Some((_, _, _, pw, ph)) if (*pw, *ph) == (w, h));
-        if recreate {
+        if !matches!(&self.sets[slot], Some(p) if (p.w, p.h) == (w, h)) {
             let mk = |w, h, format| {
                 self.device.create_texture(&wgpu::TextureDescriptor {
                     label: None,
@@ -343,37 +367,62 @@ impl Gpu {
                     view_formats: &[],
                 })
             };
-            let ty = mk(w, h, wgpu::TextureFormat::R8Unorm);
-            let tuv = mk(w / 2, h / 2, wgpu::TextureFormat::Rg8Unorm);
+            let y = mk(w, h, wgpu::TextureFormat::R8Unorm);
+            let uv = mk(w / 2, h / 2, wgpu::TextureFormat::Rg8Unorm);
+            let (y_view, uv_view) = (y.create_view(&Default::default()), uv.create_view(&Default::default()));
             let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &self.layout,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&ty.create_view(&Default::default())) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&tuv.create_view(&Default::default())) },
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&y_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&uv_view) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                 ],
             });
-            self.planes = Some((ty, tuv, bind, w, h));
+            self.sets[slot] = Some(Planes { y, uv, y_view, uv_view, bind, w, h });
         }
-        let (ty, tuv, _, _, _) = self.planes.as_ref().unwrap();
+        let p = self.sets[slot].as_ref().unwrap();
         let stride = f.stride;
         let y_size = (stride * h) as usize;
         self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: ty, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &p.y, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             &f.data[..y_size],
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(stride), rows_per_image: Some(h) },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
         self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: tuv, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &p.uv, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             &f.data[y_size..],
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(stride), rows_per_image: Some(h / 2) },
             wgpu::Extent3d { width: w / 2, height: h / 2, depth_or_array_layers: 1 },
         );
     }
 
-    fn render(&mut self) {
+    /// Quadro novo normal: substitui o mostrado.
+    fn show(&mut self, f: &Nv12Frame) {
+        self.upload(f, self.cur);
+        self.render(false);
+    }
+
+    /// Quadro do meio entre o mostrado e `next`; `next` passa a ser o atual (aparece no
+    /// próximo `render(false)`). Devolve false se não deu para interpolar (aí `next` já
+    /// foi mostrado direto).
+    fn show_mid(&mut self, next: &Nv12Frame, mid: &Midpoint) -> bool {
+        let same_size = matches!(&self.sets[self.cur], Some(p) if (p.w, p.h) == (next.width, next.height));
+        if !same_size {
+            self.show(next);
+            return false;
+        }
+        let other = 1 - self.cur;
+        self.upload(next, other);
+        self.interp.upload_flow(&self.device, &self.queue, &mid.flow);
+        self.render(true);
+        self.cur = other;
+        true
+    }
+
+    /// Desenha o quadro atual, ou (`mid`) o do meio entre o atual e o outro conjunto.
+    fn render(&mut self, mid: bool) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             _ => {
@@ -397,15 +446,27 @@ impl Gpu {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if let Some((_, _, bind, w, h)) = &self.planes {
+            if let Some(p) = &self.sets[self.cur] {
                 // Mantém a proporção (barras pretas onde sobrar).
                 let (sw, sh) = (self.config.width as f32, self.config.height as f32);
-                let scale = (sw / *w as f32).min(sh / *h as f32);
-                let (vw, vh) = (*w as f32 * scale, *h as f32 * scale);
+                let scale = (sw / p.w as f32).min(sh / p.h as f32);
+                let (vw, vh) = (p.w as f32 * scale, p.h as f32 * scale);
                 pass.set_viewport((sw - vw) / 2.0, (sh - vh) / 2.0, vw, vh, 0.0, 1.0);
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, bind, &[]);
-                pass.draw(0..3, 0..1);
+                let drew_mid = mid
+                    && match &self.sets[1 - self.cur] {
+                        Some(next) => self.interp.draw(
+                            &self.device,
+                            &mut pass,
+                            PlaneViews { y: &p.y_view, uv: &p.uv_view },
+                            PlaneViews { y: &next.y_view, uv: &next.uv_view },
+                        ),
+                        None => false,
+                    };
+                if !drew_mid {
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(0, &p.bind, &[]);
+                    pass.draw(0..3, 0..1);
+                }
             }
         }
         self.queue.submit([enc.finish()]);
@@ -424,45 +485,65 @@ fn render_thread(hwnd: isize, rx: Receiver<Msg>, ready: SyncSender<Res<()>>) {
             return;
         }
     };
-    let mut last_render = Instant::now();
-    while let Ok(msg) = rx.recv() {
-        let mut latest: Option<Nv12Frame> = None;
+    // Quadro real esperando a vez depois de um quadro do meio.
+    let mut show_next_at: Option<Instant> = None;
+    loop {
+        let first = match show_next_at {
+            Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                Ok(m) => m,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    show_next_at = None;
+                    gpu.render(false);
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() {
+                Ok(m) => m,
+                Err(_) => break,
+            },
+        };
+        // Junta as mensagens pendentes: só o quadro mais novo importa.
+        let mut pending = vec![first];
+        while let Ok(m) = rx.try_recv() {
+            pending.push(m);
+        }
         let mut redraw = false;
-        let mut handle = |m: Msg, gpu: &mut Gpu, latest: &mut Option<Nv12Frame>| -> bool {
+        let mut latest: Option<Msg> = None;
+        let mut frames = 0;
+        for m in pending {
             match m {
-                Msg::Frame(f) => *latest = Some(f),
+                Msg::Stop => return,
                 Msg::Resize(w, h) => {
                     gpu.resize(w, h);
                     redraw = true;
                 }
-                Msg::Stop => return false,
-            }
-            true
-        };
-        if !handle(msg, &mut gpu, &mut latest) {
-            break;
-        }
-        // Junta mensagens pendentes: só o quadro mais novo importa.
-        let mut stop = false;
-        while let Ok(m) = rx.try_recv() {
-            if !handle(m, &mut gpu, &mut latest) {
-                stop = true;
-                break;
+                m => {
+                    frames += 1;
+                    latest = Some(m);
+                }
             }
         }
-        if stop {
-            break;
-        }
-        if let Some(f) = latest {
-            gpu.upload(&f);
-            redraw = true;
-        }
-        if redraw {
-            gpu.render();
-            last_render = Instant::now();
+        match latest {
+            Some(Msg::Frame(f)) => {
+                show_next_at = None;
+                gpu.show(&f);
+            }
+            // Atrasado (mais de um quadro na fila): o quadro do meio seria entre quadros
+            // que não são vizinhos; mostra o mais novo direto.
+            Some(Msg::Mid { next, .. }) if frames > 1 => {
+                show_next_at = None;
+                gpu.show(&next);
+            }
+            // Se ainda havia um quadro real esperando (do quadro do meio anterior), ele já
+            // está no conjunto atual e vira o "A" deste.
+            Some(Msg::Mid { next, mid, show_next_at: at }) => {
+                show_next_at = gpu.show_mid(&next, &mid).then_some(at);
+            }
+            _ if redraw => gpu.render(false),
+            _ => {}
         }
     }
-    let _ = last_render;
 }
 
 #[cfg(test)]
@@ -510,8 +591,26 @@ mod tests {
         let img = mon.capture_region((420 - mx) as u32, (280 - my) as u32, 1, 1).unwrap();
         let p = img.get_pixel(0, 0);
         println!("pixel no centro do player: {:?}", p.0);
+        assert!(p.0[0] > 180 && p.0[1] < 80 && p.0[2] < 80, "esperava vermelho, veio {:?}", p.0);
+
+        // Geração de quadros: o do meio entre vermelho e azul (sem movimento) é a mistura,
+        // e o azul aparece no horário marcado.
+        let mut blue = vec![32u8; (w * h) as usize];
+        for _ in 0..(w * h / 4) { blue.push(240); blue.push(118); }
+        let zero = crate::nvof::FlowField { width: w / 4, height: h / 4, grid: 4, data: vec![0; (w / 4 * h / 4 * 2) as usize] };
+        let mid = crate::framegen::Midpoint {
+            flow: crate::nvof::FlowPair { forward: zero.clone(), backward: zero },
+            half_gap: Duration::from_millis(400),
+        };
+        player.feed().push_mid(Nv12Frame { width: w, height: h, stride: w, data: blue }, mid, Instant::now() + Duration::from_millis(400));
+        pump(150);
+        let between = mon.capture_region((420 - mx) as u32, (280 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
+        pump(600);
+        let after = mon.capture_region((420 - mx) as u32, (280 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
+        println!("quadro do meio: {between:?}, depois: {after:?}");
         player.destroy();
         unsafe { let _ = DestroyWindow(parent); }
-        assert!(p.0[0] > 180 && p.0[1] < 80 && p.0[2] < 80, "esperava vermelho, veio {:?}", p.0);
+        assert!(between[0] > 70 && between[2] > 70, "o quadro do meio devia misturar vermelho e azul: {between:?}");
+        assert!(after[2] > 180 && after[0] < 80, "depois devia ficar azul: {after:?}");
     }
 }

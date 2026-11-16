@@ -20,6 +20,8 @@ pub struct Settings {
     pub volume: u32,
     pub public: bool,
     pub view_volume: u32,
+    /// Gerar quadros intermediários nas streams assistidas (NVIDIA Optical Flow).
+    pub framegen: bool,
 }
 
 impl Default for Settings {
@@ -37,6 +39,7 @@ impl Default for Settings {
             volume: 100,
             public: true,
             view_volume: 100,
+            framegen: false,
         }
     }
 }

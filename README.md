@@ -18,6 +18,15 @@ trocadas na DHT. Os nós da DHT só veem dados criptografados; sem o código nin
 mensagens. A chave privada fica só no computador do host: quem tem o código pode pedir para
 assistir, mas não consegue responder no lugar do host.
 
+**Bitrate adaptativo:** quem assiste manda a cada 500 ms a taxa recebida, a perda de pacotes e o
+atraso de fila; o host estima quanto a rede de cada um aguenta e ajusta o encoder para a pior
+conexão (sem passar do bitrate escolhido). Com pouca banda, cai para 30 fps. Os pacotes de vídeo
+saem espaçados (pacer) e keyframes forçados são no máximo um por segundo.
+
+**Suavizar movimento:** com placa NVIDIA (GTX 16xx / RTX 20xx em diante), quem assiste pode gerar
+quadros intermediários: a NVIDIA Optical Flow do driver mede o movimento entre dois quadros e um
+shader desenha o quadro do meio. Uma stream de 30 fps aparece a 60, com ~16 ms a mais de atraso.
+
 **Lista pública:** cada entrada é assinada pela chave do host da transmissão anunciada (ninguém
 anuncia, encerra ou renomeia a transmissão de outra pessoa) e as vagas mudam de endereço a cada
 10 min (quem travar uma vaga só a trava até a próxima troca). Sem servidor, não dá para impedir

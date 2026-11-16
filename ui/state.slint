@@ -189,6 +189,10 @@ export global App {
     callback toggle-fullscreen(string);
     callback set-volume(string, int);
     callback toggle-mute(string);
+    // Geração de quadros (NVIDIA Optical Flow): vale para todas as streams.
+    in property <bool> framegen-available;
+    in property <bool> framegen;
+    callback toggle-framegen();
     callback unfocus();
 
     // ------------------------------------------------- Avisos e atualização

@@ -256,6 +256,24 @@ component TileView inherits Rectangle {
                     font-family: Theme.mono;
                     vertical-alignment: center;
                 }
+                // Geração de quadros: só com placa NVIDIA compatível.
+                if App.framegen-available : VerticalLayout {
+                    alignment: center;
+                    Btn {
+                        height: 28px;
+                        kind: App.framegen ? "primary" : "ghost";
+                        font-size: 12px;
+                        pad: 10px;
+                        text: "Suavizar";
+                        icon: @image-url("icons/gauge.svg");
+                        has-icon: true;
+                        icon-size: 14px;
+                        accessible-label: App.framegen
+                            ? "Suavizar movimento ligado: gera quadros intermediários com a placa NVIDIA (streams de até 45 fps viram o dobro)"
+                            : "Suavizar movimento: gera quadros intermediários com a placa NVIDIA (streams de até 45 fps viram o dobro)";
+                        clicked => { App.toggle-framegen(); }
+                    }
+                }
             }
         }
     }
