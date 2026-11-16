@@ -45,6 +45,47 @@ struct Viewer {
     quality: String,
     /// Alturas que o host oferece além da principal (vazio = só uma).
     renditions: Vec<u32>,
+    /// fps da stream para o menu: o medido oscila (57, 60, 61...) e mudava os textos do
+    /// menu a cada segundo. Arredondado para uma taxa comum e só troca depois de 2
+    /// medições seguidas concordarem.
+    nominal_fps: u32,
+    fps_candidate: (u32, u8),
+}
+
+/// Taxa comum mais perto do fps medido (dentro de 10%), senão o múltiplo de 5 mais perto.
+fn snap_fps(measured: f64) -> u32 {
+    const COMMON: [u32; 13] = [24, 25, 30, 48, 50, 60, 75, 90, 100, 120, 144, 165, 240];
+    if measured < 1.0 {
+        return 0;
+    }
+    COMMON
+        .iter()
+        .copied()
+        .min_by(|a, b| (*a as f64 - measured).abs().total_cmp(&(*b as f64 - measured).abs()))
+        .filter(|c| (*c as f64 - measured).abs() <= *c as f64 * 0.1)
+        .unwrap_or(((measured / 5.0).round() * 5.0).max(1.0) as u32)
+}
+
+impl Viewer {
+    fn update_nominal_fps(&mut self, measured: f64) {
+        let snapped = snap_fps(measured);
+        if self.nominal_fps == 0 {
+            self.nominal_fps = snapped;
+        }
+        if snapped == self.nominal_fps {
+            self.fps_candidate = (0, 0);
+            return;
+        }
+        if self.fps_candidate.0 == snapped {
+            self.fps_candidate.1 += 1;
+        } else {
+            self.fps_candidate = (snapped, 1);
+        }
+        if self.fps_candidate.1 >= 2 {
+            self.nominal_fps = snapped;
+            self.fps_candidate = (0, 0);
+        }
+    }
 }
 
 struct Ctl {
@@ -83,6 +124,8 @@ struct Ctl {
     /// Gravar as configurações / mandar a configuração ao host já está marcado.
     save_pending: bool,
     push_pending: bool,
+    /// Altura de cada painel do menu de engrenagem, medida pelo Slint.
+    menu_heights: HashMap<String, f32>,
 }
 
 thread_local! {
@@ -120,6 +163,19 @@ fn bg<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static, done: impl F
 
 fn s(text: impl AsRef<str>) -> SharedString {
     SharedString::from(text.as_ref())
+}
+
+/// Grava a propriedade só se o valor mudou. Gravar o mesmo valor também avisa o Slint,
+/// que reavalia o que depende dela: com `if` (como os painéis do menu de engrenagem), os
+/// itens eram recriados a cada atualização, e no meio disso o menu chegou a medir 12 px
+/// (o recorte no vídeo ficava desse tamanho e o vídeo cobria o menu).
+macro_rules! set_if_changed {
+    ($a:expr, $get:ident, $set:ident, $v:expr) => {{
+        let v = $v;
+        if $a.$get() != v {
+            $a.$set(v);
+        }
+    }};
 }
 
 fn model<T: Clone + 'static>(v: Vec<T>) -> ModelRc<T> {
@@ -253,28 +309,28 @@ fn paint_titlebar(hwnd: isize, dark: bool) {
 
 fn render_general(c: &Ctl, ui: &AppWindow) {
     let a = ui.global::<App>();
-    a.set_view(s(&c.view));
-    a.set_net(s(&c.net));
-    a.set_live(c.live);
-    a.set_host_viewers(c.host_viewers as i32);
-    a.set_watch_count(c.viewers.len() as i32);
-    a.set_fullscreen(c.fullscreen);
-    a.set_title(s(if c.host_viewers > 0 { format!("AntiJanja ({} assistindo)", c.host_viewers) } else { "AntiJanja".into() }));
+    set_if_changed!(a, get_view, set_view, s(&c.view));
+    set_if_changed!(a, get_net, set_net, s(&c.net));
+    set_if_changed!(a, get_live, set_live, c.live);
+    set_if_changed!(a, get_host_viewers, set_host_viewers, c.host_viewers as i32);
+    set_if_changed!(a, get_watch_count, set_watch_count, c.viewers.len() as i32);
+    set_if_changed!(a, get_fullscreen, set_fullscreen, c.fullscreen);
+    set_if_changed!(a, get_title, set_title, s(if c.host_viewers > 0 { format!("AntiJanja ({} assistindo)", c.host_viewers) } else { "AntiJanja".into() }));
 }
 
 fn render_settings(c: &Ctl, ui: &AppWindow) {
     let a = ui.global::<App>();
     let st = &c.s;
-    a.set_s_password_set(!st.stream_password.is_empty());
-    a.set_s_res(s(st.res.to_string()));
-    a.set_s_fps(s(st.fps.to_string()));
-    a.set_s_bitrate(s(st.bitrate.to_string()));
-    a.set_s_cursor(st.cursor);
-    a.set_s_audio_mode(s(if st.audio_mode.is_empty() { "system" } else { &st.audio_mode }));
-    a.set_s_audio_app(s(&st.audio_app));
-    a.set_s_abitrate(s(st.abitrate.to_string()));
-    a.set_s_volume(st.volume as i32);
-    a.set_s_public(st.public);
+    set_if_changed!(a, get_s_password_set, set_s_password_set, !st.stream_password.is_empty());
+    set_if_changed!(a, get_s_res, set_s_res, s(st.res.to_string()));
+    set_if_changed!(a, get_s_fps, set_s_fps, s(st.fps.to_string()));
+    set_if_changed!(a, get_s_bitrate, set_s_bitrate, s(st.bitrate.to_string()));
+    set_if_changed!(a, get_s_cursor, set_s_cursor, st.cursor);
+    set_if_changed!(a, get_s_audio_mode, set_s_audio_mode, s(if st.audio_mode.is_empty() { "system" } else { &st.audio_mode }));
+    set_if_changed!(a, get_s_audio_app, set_s_audio_app, s(&st.audio_app));
+    set_if_changed!(a, get_s_abitrate, set_s_abitrate, s(st.abitrate.to_string()));
+    set_if_changed!(a, get_s_volume, set_s_volume, st.volume as i32);
+    set_if_changed!(a, get_s_public, set_s_public, st.public);
 
     let mut options: Vec<SelectOption> = c
         .apps
@@ -290,8 +346,8 @@ fn render_settings(c: &Ctl, ui: &AppWindow) {
 
 fn render_public(c: &Ctl, ui: &AppWindow) {
     let a = ui.global::<App>();
-    a.set_public_busy(c.public_busy);
-    a.set_public_loading(c.public.is_none());
+    set_if_changed!(a, get_public_busy, set_public_busy, c.public_busy);
+    set_if_changed!(a, get_public_loading, set_public_loading, c.public.is_none());
     a.set_public_updated(s(if c.public_busy {
         "Atualizando".to_string()
     } else {
@@ -303,9 +359,9 @@ fn render_public(c: &Ctl, ui: &AppWindow) {
     }));
     let list = c.public.as_deref().unwrap_or(&[]);
     let others: Vec<&rendezvous::PublicStream> = list.iter().filter(|p| !p.own).collect();
-    a.set_public_mine(list.iter().any(|p| p.own));
-    a.set_public_count(others.len() as i32);
-    a.set_public_watching(others.iter().map(|p| p.entry.viewers as i32).sum());
+    set_if_changed!(a, get_public_mine, set_public_mine, list.iter().any(|p| p.own));
+    set_if_changed!(a, get_public_count, set_public_count, others.len() as i32);
+    set_if_changed!(a, get_public_watching, set_public_watching, others.iter().map(|p| p.entry.viewers as i32).sum());
     let to_stream = |p: &rendezvous::PublicStream| {
         let e = &p.entry;
         Stream {
@@ -322,9 +378,9 @@ fn render_public(c: &Ctl, ui: &AppWindow) {
             locked: e.locked,
         }
     };
-    a.set_has_featured(!others.is_empty());
+    set_if_changed!(a, get_has_featured, set_has_featured, !others.is_empty());
     if let Some(first) = others.first() {
-        a.set_featured(to_stream(first));
+        set_if_changed!(a, get_featured, set_featured, to_stream(first));
     }
     let rows: Vec<Vec<Stream>> = others
         .iter()
@@ -368,13 +424,13 @@ fn render_watching_list(c: &Ctl, ui: &AppWindow) {
 
 fn render_picker(c: &mut Ctl, ui: &AppWindow) {
     let a = ui.global::<App>();
-    a.set_picker(s(&c.picker));
-    a.set_picker_tab(s(&c.picker_tab));
-    a.set_picker_selected(s(&c.picker_selected));
-    a.set_sources_loading(c.sources.is_none());
+    set_if_changed!(a, get_picker, set_picker, s(&c.picker));
+    set_if_changed!(a, get_picker_tab, set_picker_tab, s(&c.picker_tab));
+    set_if_changed!(a, get_picker_selected, set_picker_selected, s(&c.picker_selected));
+    set_if_changed!(a, get_sources_loading, set_sources_loading, c.sources.is_none());
     let list = c.sources.as_deref().unwrap_or(&[]);
-    a.set_count_monitors(list.iter().filter(|x| x.kind == "monitor").count() as i32);
-    a.set_count_windows(list.iter().filter(|x| x.kind == "window").count() as i32);
+    set_if_changed!(a, get_count_monitors, set_count_monitors, list.iter().filter(|x| x.kind == "monitor").count() as i32);
+    set_if_changed!(a, get_count_windows, set_count_windows, list.iter().filter(|x| x.kind == "window").count() as i32);
     let shown: Vec<&capture::Source> = list.iter().filter(|x| x.kind == c.picker_tab).collect();
     let cols = if c.picker_tab == "monitor" && shown.len() <= 2 { 2 } else { 3 };
     let current = if c.picker == "switch" { c.source.as_ref().map(|x| x.id.clone()) } else { None };
@@ -407,12 +463,12 @@ fn render_picker(c: &mut Ctl, ui: &AppWindow) {
 
 fn render_host_code(c: &Ctl, ui: &AppWindow) {
     let a = ui.global::<App>();
-    a.set_code(s(&c.code));
+    set_if_changed!(a, get_code, set_code, s(&c.code));
     let (prefix, body) = if c.code.len() > 4 { c.code.split_at(4) } else { (c.code.as_str(), "") };
-    a.set_code_prefix(s(prefix));
+    set_if_changed!(a, get_code_prefix, set_code_prefix, s(prefix));
     let groups: Vec<String> = body.chars().collect::<Vec<_>>().chunks(4).map(|g| g.iter().collect()).collect();
-    a.set_code_body(s(groups.join(" ")));
-    a.set_source_name(s(c.source.as_ref().map(|x| x.name.as_str()).unwrap_or("")));
+    set_if_changed!(a, get_code_body, set_code_body, s(groups.join(" ")));
+    set_if_changed!(a, get_source_name, set_source_name, s(c.source.as_ref().map(|x| x.name.as_str()).unwrap_or("")));
 }
 
 fn render_toasts(c: &Ctl, ui: &AppWindow) {
@@ -442,6 +498,26 @@ fn grid_for(n: usize) -> (usize, usize) {
 
 /// Recalcula a grade da tela "Assistindo" e reposiciona os players nativos.
 fn relayout(c: &Ctl, ui: &AppWindow) {
+    let t0 = Instant::now();
+    relayout_inner(c, ui);
+    if trace() {
+        eprintln!("[ui {:.0}] relayout {:.2} ms", tms(), t0.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
+/// Milissegundos desde o início (para alinhar as linhas do diagnóstico).
+fn tms() -> f64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+}
+
+/// Diagnóstico de tempos da interface (AJ_TRACE).
+fn trace() -> bool {
+    thread_local! { static ON: bool = std::env::var_os("AJ_TRACE").is_some(); }
+    ON.with(|x| *x)
+}
+
+fn relayout_inner(c: &Ctl, ui: &AppWindow) {
     let a = ui.global::<App>();
     let scale = ui.window().scale_factor();
     let size = ui.window().size();
@@ -483,12 +559,13 @@ fn relayout(c: &Ctl, ui: &AppWindow) {
         if c.menu.as_deref() == Some(v.id.as_str()) && v.watching {
             menu_tile = true;
             let m = gear_menu(c, ui, v);
-            let mh = m.height;
+            // Altura medida pelo próprio menu (a estimativa só vale até ele avisar).
+            let mh = c.menu_heights.get(&m.panel).copied().unwrap_or(m.height);
             let mx = (x + tile_w - MENU_W - 8.0).max(4.0);
-            let my = (y + tile_h - foot - 6.0 - mh).max(4.0);
-            a.set_menu_x(mx);
-            a.set_menu_y(my);
-            a.set_menu_h(mh);
+            let bottom = (y + tile_h - foot - 6.0).max(4.0 + mh);
+            let my = bottom - mh;
+            set_if_changed!(a, get_menu_x, set_menu_x, mx);
+            set_if_changed!(a, get_menu_bottom, set_menu_bottom, bottom);
             m.apply(&a);
             hole = Some((
                 ((mx - vx) * scale).round() as i32,
@@ -540,9 +617,9 @@ fn relayout(c: &Ctl, ui: &AppWindow) {
     for v in c.viewers.iter().filter(|v| !shown.iter().any(|x| x.id == v.id)) {
         session::player_rect(v.id.clone(), 0, 0, 1, 1, false, None);
     }
-    a.set_menu_tile(s(if menu_tile { c.menu.clone().unwrap_or_default() } else { String::new() }));
+    set_if_changed!(a, get_menu_tile, set_menu_tile, s(if menu_tile { c.menu.clone().unwrap_or_default() } else { String::new() }));
     sync(a.get_tiles(), tiles, |m| a.set_tiles(m));
-    a.set_has_focus(c.focus.is_some());
+    set_if_changed!(a, get_has_focus, set_has_focus, c.focus.is_some());
 }
 
 /// Multiplicador da geração de quadros que está acontecendo ("2x"), pelo fps recebido e
@@ -566,14 +643,14 @@ struct GearMenu {
 
 impl GearMenu {
     fn apply(&self, a: &App) {
-        a.set_menu_panel(s(&self.panel));
+        set_if_changed!(a, get_menu_panel, set_menu_panel, s(&self.panel));
         sync(a.get_menu_fps(), self.fps.clone(), |m| a.set_menu_fps(m));
         sync(a.get_menu_quality(), self.quality.clone(), |m| a.set_menu_quality(m));
-        a.set_menu_fps_label(s(&self.fps_label));
-        a.set_menu_quality_label(s(&self.quality_label));
-        a.set_menu_gen_tag(s(&self.gen_tag));
-        a.set_menu_info(s(&self.info));
-        a.set_menu_fps_hint(s(&self.fps_hint));
+        set_if_changed!(a, get_menu_fps_label, set_menu_fps_label, s(&self.fps_label));
+        set_if_changed!(a, get_menu_quality_label, set_menu_quality_label, s(&self.quality_label));
+        set_if_changed!(a, get_menu_gen_tag, set_menu_gen_tag, s(&self.gen_tag));
+        set_if_changed!(a, get_menu_info, set_menu_info, s(&self.info));
+        set_if_changed!(a, get_menu_fps_hint, set_menu_fps_hint, s(&self.fps_hint));
     }
 }
 
@@ -583,7 +660,7 @@ fn option(value: &str, label: String, tag: String, note: &str, selected: bool) -
 
 fn gear_menu(c: &Ctl, ui: &AppWindow, v: &Viewer) -> GearMenu {
     let num = |k: &str| v.stats.as_ref().and_then(|st| st[k].as_f64()).unwrap_or(0.0);
-    let stream = num("fps").round() as u32;
+    let stream = v.nominal_fps;
     let height = num("height") as u32;
     let hz = monitor_hz(ui);
     let chosen = c.s.view_fps;
@@ -640,6 +717,12 @@ fn gear_menu(c: &Ctl, ui: &AppWindow, v: &Viewer) -> GearMenu {
         fps,
         quality,
     }
+}
+
+fn toggle_menu(c: &mut Ctl, ui: &AppWindow, id: &str) {
+    c.menu = if c.menu.as_deref() == Some(id) { None } else { Some(id.to_string()) };
+    c.menu_panel = "main".into();
+    relayout(c, ui);
 }
 
 fn close_menu(c: &mut Ctl, ui: &AppWindow) {
@@ -873,8 +956,8 @@ fn open_picker(c: &mut Ctl, ui: &AppWindow, mode: &str) {
         settings::save(&c.s);
         render_settings(c, ui);
         let a = ui.global::<App>();
-        a.set_picker_pw_on(false);
-        a.set_picker_pw(s(""));
+        set_if_changed!(a, get_picker_pw_on, set_picker_pw_on, false);
+        set_if_changed!(a, get_picker_pw, set_picker_pw, s(""));
     }
     render_general(c, ui);
     relayout(c, ui);
@@ -945,12 +1028,12 @@ fn start_sharing(c: &mut Ctl, ui: &AppWindow, src: capture::Source, preview: Opt
     c.host_viewers = 0;
     c.view = "host".into();
     let a = ui.global::<App>();
-    a.set_has_preview(preview.is_some());
+    set_if_changed!(a, get_has_preview, set_has_preview, preview.is_some());
     if let Some(p) = preview {
-        a.set_preview(p);
+        set_if_changed!(a, get_preview, set_preview, p);
     }
-    a.set_has_info(false);
-    a.set_peers(model(Vec::new()));
+    set_if_changed!(a, get_has_info, set_has_info, false);
+    set_if_changed!(a, get_peers, set_peers, model(Vec::new()));
     render_general(c, ui);
     render_host_code(c, ui);
     relayout(c, ui);
@@ -1010,8 +1093,8 @@ fn join_with_code(c: &mut Ctl, ui: &AppWindow, raw: &str) {
         // Pede a senha antes (os vídeos nativos cobririam a janela: ficam escondidos).
         c.password_for = Some(code);
         let a = ui.global::<App>();
-        a.set_password_error(s(""));
-        a.set_password_prompt(true);
+        set_if_changed!(a, get_password_error, set_password_error, s(""));
+        set_if_changed!(a, get_password_prompt, set_password_prompt, true);
         relayout(c, ui);
         return;
     }
@@ -1044,6 +1127,8 @@ fn start_watching(c: &mut Ctl, ui: &AppWindow, code: String, password: Option<St
         muted: false,
         quality: "auto".into(),
         renditions: vec![],
+        nominal_fps: 0,
+        fps_candidate: (0, 0),
     });
     c.focus = None;
     c.view = "watch".into();
@@ -1197,11 +1282,11 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
         "host-info" => {
             let f = |k: &str| v[k].as_f64().unwrap_or(0.0);
             let hw = v["hardware"].as_bool().unwrap_or(false);
-            a.set_has_info(true);
-            a.set_hardware(hw);
-            a.set_stat_res(s(format!("{}×{}", f("width") as u32, f("height") as u32)));
-            a.set_stat_fps(s((f("fps").round() as u32).to_string()));
-            a.set_stat_rate(s(format!("{} de {}", format_rate(f("kbps")), format_rate(f("target_kbps")))));
+            set_if_changed!(a, get_has_info, set_has_info, true);
+            set_if_changed!(a, get_hardware, set_hardware, hw);
+            set_if_changed!(a, get_stat_res, set_stat_res, s(format!("{}×{}", f("width") as u32, f("height") as u32)));
+            set_if_changed!(a, get_stat_fps, set_stat_fps, s((f("fps").round() as u32).to_string()));
+            set_if_changed!(a, get_stat_rate, set_stat_rate, s(format!("{} de {}", format_rate(f("kbps")), format_rate(f("target_kbps")))));
             // Bitrate adaptativo: a rede de alguém que assiste não aguenta o escolhido.
             let (net_kbps, net_fps) = (f("net_kbps"), f("net_fps") as u32);
             a.set_stat_net(s(match (net_kbps > 0.0, net_fps > 0) {
@@ -1224,8 +1309,8 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
         }
         "host-preview" => {
             if let Some(buf) = v.as_str().and_then(decode_data_url) {
-                a.set_preview(Image::from_rgba8(buf));
-                a.set_has_preview(true);
+                set_if_changed!(a, get_preview, set_preview, Image::from_rgba8(buf));
+                set_if_changed!(a, get_has_preview, set_has_preview, true);
             }
         }
         "host-audio-level" => a.set_audio_level(v.as_f64().unwrap_or(0.0) as f32),
@@ -1244,12 +1329,12 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
                 "waiting" => (format!("Esperando {detail} abrir"), ""),
                 "error" => (format!("Erro no áudio: {detail}"), "err"),
                 _ => {
-                    a.set_audio_level(0.0);
+                    set_if_changed!(a, get_audio_level, set_audio_level, 0.0);
                     ("Sem áudio".to_string(), "")
                 }
             };
-            a.set_audio_status(s(text));
-            a.set_audio_status_kind(s(kind));
+            set_if_changed!(a, get_audio_status, set_audio_status, s(text));
+            set_if_changed!(a, get_audio_status_kind, set_audio_status_kind, s(kind));
         }
         "host-error" => toast(c, ui, "err", v.as_str().unwrap_or("Erro na transmissão")),
         "host-source-closed" => {
@@ -1302,6 +1387,7 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
                 eprintln!("[stats] {v}");
             }
             if let Some(x) = c.viewers.iter_mut().find(|x| x.id == id) {
+                x.update_nominal_fps(v["fps"].as_f64().unwrap_or(0.0));
                 x.stats = Some(v);
                 relayout(c, ui);
             }
@@ -1484,13 +1570,23 @@ fn wire(ui: &AppWindow) {
         })
     });
     a.on_toggle_menu(|id| {
-        later(move |c, ui| {
-            c.menu = if c.menu.as_deref() == Some(id.as_str()) { None } else { Some(id.to_string()) };
-            c.menu_panel = "main".into();
-            relayout(c, ui);
-        })
+        if trace() {
+            eprintln!("[ui {:.0}] clique na engrenagem", tms());
+        }
+        later(move |c, ui| toggle_menu(c, ui, &id))
     });
     a.on_close_menu(|| later(|c, ui| close_menu(c, ui)));
+    a.on_menu_resized(|h| {
+        later(move |c, ui| {
+            let h = h as f32;
+            // Durante a montagem o menu pode medir só a borda; o menu real tem pelo menos
+            // duas linhas (~90 px).
+            if h >= 60.0 && c.menu_heights.get(&c.menu_panel).is_none_or(|old| (old - h).abs() > 0.5) {
+                c.menu_heights.insert(c.menu_panel.clone(), h);
+                relayout(c, ui);
+            }
+        })
+    });
     a.on_menu_go(|panel| {
         later(move |c, ui| {
             c.menu_panel = panel.to_string();
@@ -1605,6 +1701,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
             updating: false,
             save_pending: false,
             push_pending: false,
+            menu_heights: HashMap::new(),
         });
     });
 
@@ -1642,6 +1739,19 @@ pub fn run() -> Result<(), slint::PlatformError> {
     });
 
     ui.show()?;
+    if trace() {
+        // Quanto cada quadro da interface leva para desenhar.
+        let start = std::cell::Cell::new(None::<Instant>);
+        let _ = ui.window().set_rendering_notifier(move |state, _| match state {
+            slint::RenderingState::BeforeRendering => start.set(Some(Instant::now())),
+            slint::RenderingState::AfterRendering => {
+                if let Some(t) = start.take() {
+                    eprintln!("[ui {:.0}] quadro desenhado em {:.1} ms", tms(), t.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            _ => {}
+        });
+    }
 
     // A janela nativa só existe depois que o loop começa: pega o HWND e pinta a barra.
     let hwnd_timer = slint::Timer::default();
@@ -1716,6 +1826,7 @@ fn autotest() {
     let started = Instant::now();
     let mut done = false;
     let mut menu_opened = false;
+    let mut last_toggle = 0u64;
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(500), move || {
         with(|c, ui| match mode.as_str() {
             "host" => {
@@ -1738,6 +1849,17 @@ fn autotest() {
                     c.s.view_fps = std::env::var("AJ_VIEW_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
                     eprintln!("[autotest] assistindo a {} fps (monitor {} Hz)", view_fps(c, ui), monitor_hz(ui));
                     start_watching(c, ui, code.trim().to_string(), None);
+                }
+                // Abre e fecha o menu a cada 2 s, pelo mesmo caminho do clique (medir com AJ_TRACE).
+                if std::env::var_os("AJ_MENU_TOGGLE").is_some() && started.elapsed() >= Duration::from_secs(40) {
+                    let tick = (started.elapsed().as_millis() / 2000) as u64;
+                    if tick != last_toggle {
+                        last_toggle = tick;
+                        if let Some(id) = c.viewers.iter().find(|v| v.watching).map(|v| v.id.clone()) {
+                            eprintln!("[ui {:.0}] (autoteste) alterna o menu", tms());
+                            toggle_menu(c, ui, &id);
+                        }
+                    }
                 }
                 let menu_after = std::env::var("AJ_MENU_AFTER").ok().and_then(|v| v.parse::<u64>().ok());
                 if let (Some(after), false) = (menu_after, menu_opened) {
@@ -1778,6 +1900,30 @@ mod tests {
         let r = replaced.clone();
         sync(ModelRc::<i32>::default(), vec![7], move |_| r.set(true));
         assert!(replaced.get());
+    }
+
+    #[test]
+    fn stream_fps_in_the_menu_is_stable() {
+        assert_eq!(snap_fps(57.4), 60);
+        assert_eq!(snap_fps(61.0), 60);
+        assert_eq!(snap_fps(29.2), 30);
+        assert_eq!(snap_fps(118.0), 120);
+        assert_eq!(snap_fps(40.0), 40);
+        assert_eq!(snap_fps(0.0), 0);
+        let mut v = Viewer {
+            id: String::new(), code: String::new(), host_name: String::new(), step: 0, watching: true,
+            stats: None, ping: None, volume: 100, muted: false, quality: "auto".into(), renditions: vec![],
+            nominal_fps: 0, fps_candidate: (0, 0),
+        };
+        for m in [58.0, 61.0, 57.0, 60.0, 62.0] {
+            v.update_nominal_fps(m);
+            assert_eq!(v.nominal_fps, 60);
+        }
+        // Uma medição fora não muda; duas seguidas mudam (o host baixou para 30).
+        v.update_nominal_fps(31.0);
+        assert_eq!(v.nominal_fps, 60);
+        v.update_nominal_fps(30.0);
+        assert_eq!(v.nominal_fps, 30);
     }
 
     #[test]

@@ -161,6 +161,9 @@ impl Player {
                 return;
             }
             self.hole.set(key);
+            if std::env::var_os("AJ_TRACE").is_some() {
+                eprintln!("[player] recorte {hole:?} (janela {}x{})", r.right, r.bottom);
+            }
             match hole {
                 None => {
                     SetWindowRgn(hwnd, None, true);

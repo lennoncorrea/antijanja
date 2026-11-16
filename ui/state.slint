@@ -223,8 +223,8 @@ export global App {
     in property <string> menu-tile;
     in property <string> menu-panel: "main";
     in property <length> menu-x;
-    in property <length> menu-y;
-    in property <length> menu-h;
+    // Onde fica a base do menu; a altura é a do conteúdo (o menu avisa com menu-resized).
+    in property <length> menu-bottom;
     in property <[MenuOption]> menu-fps;
     in property <[MenuOption]> menu-quality;
     in property <string> menu-fps-label;
@@ -233,6 +233,7 @@ export global App {
     in property <string> menu-info;
     in property <string> menu-fps-hint;
     callback toggle-menu(string);
+    callback menu-resized(length);
     callback close-menu();
     callback menu-go(string);
     callback pick-quality(string);
