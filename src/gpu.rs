@@ -192,20 +192,18 @@ fn texture_sample(tex: &ID3D11Texture2D, time_hns: i64, dur_hns: i64) -> Res<IMF
 }
 
 /// Video Processor na GPU: textura BGRA → textura NV12 no tamanho de saída.
-pub struct GpuConverter {
+/// Video Processor na GPU com saída em texturas NV12 nossas: a saída do VP é copiada
+/// para o nosso estoque e devolvida na hora (o estoque interno do VP é pequeno e
+/// esgotaria com o encoder segurando quadros).
+struct VpRunner {
     mft: IMFTransform,
-    /// Cópias comuns da entrada (o VP não aceita texturas com keyed mutex).
-    inputs: Vec<ID3D11Texture2D>,
-    next_in: usize,
-    in_size: (u32, u32),
-    out: (u32, u32),
     provides: bool,
     pool: Vec<ID3D11Texture2D>,
     next: usize,
 }
 
-impl GpuConverter {
-    pub fn new(gpu: &GpuDevice, in_w: u32, in_h: u32, out_w: u32, out_h: u32, fps: u32) -> Res<Self> {
+impl VpRunner {
+    fn new(gpu: &GpuDevice, input: &IMFMediaType, out_w: u32, out_h: u32, fps: u32) -> Res<Self> {
         unsafe {
             let mft: IMFTransform = windows::Win32::System::Com::CoCreateInstance(
                 &CLSID_VideoProcessorMFT,
@@ -214,8 +212,7 @@ impl GpuConverter {
             )
             .map_err(e("VideoProcessorMFT"))?;
             mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, gpu.manager.as_raw() as usize).map_err(e("VP SET_D3D_MANAGER"))?;
-            let input = crate::media::video_type(&MFVideoFormat_ARGB32, in_w, in_h, fps)?;
-            mft.SetInputType(0, &input, 0).map_err(e("VP GPU SetInputType"))?;
+            mft.SetInputType(0, input, 0).map_err(e("VP GPU SetInputType"))?;
             let output = crate::media::video_type(&MFVideoFormat_NV12, out_w, out_h, fps)?;
             mft.SetOutputType(0, &output, 0).map_err(e("VP GPU SetOutputType"))?;
             // As texturas que o VP aloca precisam servir de alvo de render e de entrada do encoder.
@@ -227,18 +224,88 @@ impl GpuConverter {
             let info = mft.GetOutputStreamInfo(0).map_err(e("VP stream info"))?;
             // Só deixa o VP alocar quando ele exige; senão usamos nossas texturas NV12.
             let provides = info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0;
-            // Nossas texturas NV12: a saída do VP é copiada para cá e devolvida na hora
-            // (o estoque interno do VP é pequeno e esgotaria com o encoder segurando quadros).
             let mut pool = Vec::new();
             for _ in 0..6 {
                 pool.push(nv12_texture(&gpu.device, out_w, out_h)?);
             }
-            let mut inputs = Vec::new();
-            for _ in 0..3 {
-                inputs.push(bgra_texture(&gpu.device, in_w, in_h)?);
-            }
-            Ok(Self { mft, inputs, next_in: 0, in_size: (in_w, in_h), out: (out_w, out_h), provides, pool, next: 0 })
+            Ok(Self { mft, provides, pool, next: 0 })
         }
+    }
+
+    fn process(&mut self, gpu: &GpuDevice, input: &IMFSample, time_hns: i64, dur_hns: i64) -> Res<IMFSample> {
+        unsafe { self.mft.ProcessInput(0, input, 0).map_err(e("VP GPU ProcessInput"))? };
+        let mut last = None;
+        loop {
+            let out_sample = if self.provides {
+                None
+            } else {
+                let t = &self.pool[self.next];
+                self.next = (self.next + 1) % self.pool.len();
+                Some(texture_sample(t, time_hns, dur_hns)?)
+            };
+            let mut buffers = [MFT_OUTPUT_DATA_BUFFER {
+                dwStreamID: 0,
+                pSample: ManuallyDrop::new(out_sample),
+                dwStatus: 0,
+                pEvents: ManuallyDrop::new(None),
+            }];
+            let mut status = 0u32;
+            let r = unsafe { self.mft.ProcessOutput(0, &mut buffers, &mut status) };
+            let s = unsafe { ManuallyDrop::take(&mut buffers[0].pSample) };
+            unsafe { drop(ManuallyDrop::take(&mut buffers[0].pEvents)) };
+            match r {
+                Ok(()) => last = s,
+                Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
+                // Com amostras próprias, o VP recusa a segunda leitura em vez de pedir entrada.
+                Err(_) if last.is_some() => break,
+                Err(err) => return Err(format!("VP GPU ProcessOutput: {err} ({:#x})", err.code().0)),
+            }
+        }
+        let vp_out = last.ok_or("VP GPU sem saída")?;
+        if !self.provides {
+            unsafe {
+                vp_out.SetSampleTime(time_hns).ok();
+                vp_out.SetSampleDuration(dur_hns).ok();
+            }
+            return Ok(vp_out);
+        }
+        // Copia para uma textura nossa e solta a amostra do VP.
+        let src: ID3D11Texture2D = unsafe {
+            let buf = vp_out.GetBufferByIndex(0).map_err(e("VP buffer"))?;
+            let dxgi: IMFDXGIBuffer = buf.cast().map_err(e("IMFDXGIBuffer"))?;
+            let mut ptr = std::ptr::null_mut();
+            dxgi.GetResource(&ID3D11Texture2D::IID, &mut ptr).map_err(e("GetResource"))?;
+            let sub = dxgi.GetSubresourceIndex().unwrap_or(0);
+            let tex = ID3D11Texture2D::from_raw(ptr);
+            let dst = self.pool[self.next].clone();
+            self.next = (self.next + 1) % self.pool.len();
+            gpu.ctx.CopySubresourceRegion(&dst, 0, 0, 0, 0, &tex, sub, None);
+            drop(tex);
+            dst
+        };
+        drop(vp_out);
+        texture_sample(&src, time_hns, dur_hns)
+    }
+}
+
+pub struct GpuConverter {
+    vp: VpRunner,
+    /// Cópias comuns da entrada (o VP não aceita texturas com keyed mutex).
+    inputs: Vec<ID3D11Texture2D>,
+    next_in: usize,
+    in_size: (u32, u32),
+    out: (u32, u32),
+}
+
+impl GpuConverter {
+    pub fn new(gpu: &GpuDevice, in_w: u32, in_h: u32, out_w: u32, out_h: u32, fps: u32) -> Res<Self> {
+        let input = crate::media::video_type(&MFVideoFormat_ARGB32, in_w, in_h, fps)?;
+        let vp = VpRunner::new(gpu, &input, out_w, out_h, fps)?;
+        let mut inputs = Vec::new();
+        for _ in 0..3 {
+            inputs.push(bgra_texture(&gpu.device, in_w, in_h)?);
+        }
+        Ok(Self { vp, inputs, next_in: 0, in_size: (in_w, in_h), out: (out_w, out_h) })
     }
 
     pub fn input_size(&self) -> (u32, u32) {
@@ -262,62 +329,24 @@ impl GpuConverter {
             gpu.ctx.CopyResource(&tex, &shared);
             let _ = km.ReleaseSync(0);
         }
-        let result = (|| -> Res<IMFSample> {
-            let input = texture_sample(&tex, time_hns, dur_hns)?;
-            unsafe { self.mft.ProcessInput(0, &input, 0).map_err(e("VP GPU ProcessInput"))? };
-            let mut last = None;
-            loop {
-                let out_sample = if self.provides {
-                    None
-                } else {
-                    let t = &self.pool[self.next];
-                    self.next = (self.next + 1) % self.pool.len();
-                    Some(texture_sample(t, time_hns, dur_hns)?)
-                };
-                let mut buffers = [MFT_OUTPUT_DATA_BUFFER {
-                    dwStreamID: 0,
-                    pSample: ManuallyDrop::new(out_sample),
-                    dwStatus: 0,
-                    pEvents: ManuallyDrop::new(None),
-                }];
-                let mut status = 0u32;
-                let r = unsafe { self.mft.ProcessOutput(0, &mut buffers, &mut status) };
-                let s = unsafe { ManuallyDrop::take(&mut buffers[0].pSample) };
-                unsafe { drop(ManuallyDrop::take(&mut buffers[0].pEvents)) };
-                match r {
-                    Ok(()) => last = s,
-                    Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
-                    // Com amostras próprias, o VP recusa a segunda leitura em vez de pedir entrada.
-                    Err(_) if last.is_some() => break,
-                    Err(err) => return Err(format!("VP GPU ProcessOutput: {err} ({:#x})", err.code().0)),
-                }
-            }
-            let vp_out = last.ok_or("VP GPU sem saída")?;
-            if !self.provides {
-                unsafe {
-                    vp_out.SetSampleTime(time_hns).ok();
-                    vp_out.SetSampleDuration(dur_hns).ok();
-                }
-                return Ok(vp_out);
-            }
-            // Copia para uma textura nossa e solta a amostra do VP.
-            let src: ID3D11Texture2D = unsafe {
-                let buf = vp_out.GetBufferByIndex(0).map_err(e("VP buffer"))?;
-                let dxgi: IMFDXGIBuffer = buf.cast().map_err(e("IMFDXGIBuffer"))?;
-                let mut ptr = std::ptr::null_mut();
-                dxgi.GetResource(&ID3D11Texture2D::IID, &mut ptr).map_err(e("GetResource"))?;
-                let sub = dxgi.GetSubresourceIndex().unwrap_or(0);
-                let tex = ID3D11Texture2D::from_raw(ptr);
-                let dst = self.pool[self.next].clone();
-                self.next = (self.next + 1) % self.pool.len();
-                gpu.ctx.CopySubresourceRegion(&dst, 0, 0, 0, 0, &tex, sub, None);
-                drop(tex);
-                dst
-            };
-            drop(vp_out);
-            texture_sample(&src, time_hns, dur_hns)
-        })();
-        result
+        let input = texture_sample(&tex, time_hns, dur_hns)?;
+        self.vp.process(gpu, &input, time_hns, dur_hns)
+    }
+}
+
+/// Redimensiona um quadro NV12 que já está na GPU (versões menores da transmissão).
+pub struct GpuScaler {
+    vp: VpRunner,
+}
+
+impl GpuScaler {
+    pub fn new(gpu: &GpuDevice, in_w: u32, in_h: u32, out_w: u32, out_h: u32, fps: u32) -> Res<Self> {
+        let input = crate::media::video_type(&MFVideoFormat_NV12, in_w, in_h, fps)?;
+        Ok(Self { vp: VpRunner::new(gpu, &input, out_w, out_h, fps)? })
+    }
+
+    pub fn scale(&mut self, gpu: &GpuDevice, input: &IMFSample, time_hns: i64, dur_hns: i64) -> Res<IMFSample> {
+        self.vp.process(gpu, input, time_hns, dur_hns)
     }
 }
 
@@ -375,7 +404,7 @@ mod tests {
         assert!(acquire(&slot.km, 0, 0));
         unsafe { let _ = slot.km.ReleaseSync(1); }
         let mut conv = GpuConverter::new(&gpu, 1920, 1080, 1280, 720, 60).expect("conv");
-        println!("VP provides samples: {}", conv.provides);
+        println!("VP provides samples: {}", conv.vp.provides);
         let frame = GpuFrame { handle: slot.handle, width: 1920, height: 1080 };
         match conv.convert(&mut gpu, &frame, 0, 166_667) {
             Ok(_) => println!("conversão OK"),
@@ -407,10 +436,10 @@ mod tests {
                 assert!(acquire(&km, 0, 0));
             }
             let input = texture_sample(&tex, 0, 166_667).unwrap();
-            let r_in = unsafe { conv.mft.ProcessInput(0, &input, 0) };
+            let r_in = unsafe { conv.vp.mft.ProcessInput(0, &input, 0) };
             let mut buffers = [MFT_OUTPUT_DATA_BUFFER { dwStreamID: 0, pSample: ManuallyDrop::new(None), dwStatus: 0, pEvents: ManuallyDrop::new(None) }];
             let mut status = 0u32;
-            let r_out = unsafe { conv.mft.ProcessOutput(0, &mut buffers, &mut status) };
+            let r_out = unsafe { conv.vp.mft.ProcessOutput(0, &mut buffers, &mut status) };
             unsafe { drop(ManuallyDrop::take(&mut buffers[0].pSample)); drop(ManuallyDrop::take(&mut buffers[0].pEvents)); }
             println!("{name}: input {:?} output {:?}", r_in.map_err(|e| e.code().0), r_out.map_err(|e| format!("{:#x}", e.code().0)));
         }

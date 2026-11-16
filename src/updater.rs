@@ -133,10 +133,13 @@ mod tests {
 
     /// Confere o instalador gerado por `scripts/release.ps1` contra a chave embutida:
     /// `cargo test -- --ignored verifies_release_signature`
+    /// (`AJ_BUNDLE_DIR=<pasta>` confere outra pasta, ex.: uma release baixada do GitHub).
     #[test]
     #[ignore]
     fn verifies_release_signature() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/bundle");
+        let dir = std::env::var_os("AJ_BUNDLE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/bundle"));
         let latest: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("latest.json")).unwrap()).unwrap();
         let version = release_version(&latest).unwrap();
         let sig = latest["platforms"]["windows-x86_64"]["signature"].as_str().unwrap();

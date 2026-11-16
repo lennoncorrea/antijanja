@@ -46,6 +46,8 @@ enum Msg {
 pub struct Player {
     hwnd: isize,
     tx: SyncSender<Msg>,
+    /// Retângulo recortado da janela (menu por cima do vídeo), para não refazer à toa.
+    hole: std::cell::Cell<Option<(i32, i32, i32, i32)>>,
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -58,6 +60,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_ERASEBKGND => LRESULT(1),
         WM_LBUTTONDOWN => {
             let _ = SetFocus(Some(hwnd));
+            emit("player-input", "down");
             LRESULT(0)
         }
         WM_LBUTTONDBLCLK => {
@@ -137,7 +140,35 @@ impl Player {
             .spawn(move || render_thread(raw, rx, ready_tx))
             .map_err(|e| e.to_string())?;
         ready_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| "o player não iniciou".to_string())??;
-        Ok(Player { hwnd: raw, tx })
+        Ok(Player { hwnd: raw, tx, hole: std::cell::Cell::new(None) })
+    }
+
+    /// Recorta um retângulo da janela do vídeo (relativo a ela, pixels físicos): o que a
+    /// interface desenha ali (um menu) aparece por cima do vídeo. None = sem recorte.
+    pub fn set_hole(&self, hole: Option<(i32, i32, i32, i32)>) {
+        if self.hole.get() == hole {
+            return;
+        }
+        self.hole.set(hole);
+        use windows::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, HRGN, RGN_DIFF};
+        unsafe {
+            let hwnd = HWND(self.hwnd as *mut _);
+            match hole {
+                None => {
+                    SetWindowRgn(hwnd, None, true);
+                }
+                Some((x, y, w, h)) => {
+                    let mut r = windows::Win32::Foundation::RECT::default();
+                    let _ = GetClientRect(hwnd, &mut r);
+                    let full = CreateRectRgn(0, 0, r.right.max(1), r.bottom.max(1));
+                    let cut = CreateRectRgn(x, y, x + w, y + h);
+                    CombineRgn(Some(full), Some(full), Some(cut), RGN_DIFF);
+                    let _ = DeleteObject(cut.into());
+                    // A janela passa a ser dona da região (não apagar `full`).
+                    SetWindowRgn(hwnd, Some(HRGN(full.0)), true);
+                }
+            }
+        }
     }
 
     /// Posiciona a área de vídeo (pixels físicos, relativos à janela). Thread principal.
@@ -629,7 +660,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, Duration)>();
         let src = crate::capture::list_sources().into_iter().find(|s| s.primary).unwrap();
         let pipe = VideoPipeline::start(src.id, VideoSettings { res: 1080, fps: 30, bitrate: 8000, cursor: true }, Callbacks {
-            on_packet: Arc::new(move |d, dur| { let _ = tx.send((d, dur)); }),
+            on_packet: Arc::new(move |_, d, dur| { let _ = tx.send((d, dur)); }),
             on_info: Arc::new(|_| {}), on_preview: Arc::new(|_| {}),
             on_error: Arc::new(|e| println!("ERRO {e}")), on_source_closed: Arc::new(|| {}),
         }).unwrap();
@@ -729,6 +760,19 @@ mod tests {
         let p = img.get_pixel(0, 0);
         println!("pixel no centro do player: {:?}", p.0);
         assert!(p.0[0] > 180 && p.0[1] < 80 && p.0[2] < 80, "esperava vermelho, veio {:?}", p.0);
+
+        // Buraco para um menu: dentro dele aparece a janela de trás (não o vídeo vermelho).
+        player.set_hole(Some((300, 150, 120, 80)));
+        pump(200);
+        let inside = mon.capture_region((100 + 360 - mx) as u32, (100 + 190 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
+        let outside = mon.capture_region((100 + 200 - mx) as u32, (100 + 190 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
+        println!("com buraco: dentro {inside:?}, fora {outside:?}");
+        assert!(!(inside[0] > 180 && inside[1] < 80), "o buraco devia mostrar a janela de trás: {inside:?}");
+        assert!(outside[0] > 180 && outside[1] < 80, "fora do buraco continua o vídeo: {outside:?}");
+        player.set_hole(None);
+        pump(200);
+        let back = mon.capture_region((100 + 360 - mx) as u32, (100 + 190 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
+        assert!(back[0] > 180 && back[1] < 80, "sem buraco, o vídeo volta: {back:?}");
 
         // Geração de quadros: o gerado na metade entre vermelho e azul (sem movimento) é a
         // mistura, e o azul aparece no horário marcado.

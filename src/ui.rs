@@ -22,6 +22,8 @@ const PAD: f32 = 12.0;
 const GAP: f32 = 12.0;
 const HEADER: f32 = 44.0;
 const FOOTER: f32 = 40.0;
+/// Largura do menu de engrenagem (igual ao `GearMenu` do Slint).
+const MENU_W: f32 = 300.0;
 
 const PUBLIC_REFRESH: Duration = Duration::from_secs(20);
 const TOAST_TIME: Duration = Duration::from_secs(4);
@@ -37,6 +39,10 @@ struct Viewer {
     ping: Option<u32>,
     volume: u32,
     muted: bool,
+    /// Qualidade pedida ao host: "auto" ou a altura ("720").
+    quality: String,
+    /// Alturas que o host oferece além da principal (vazio = só uma).
+    renditions: Vec<u32>,
 }
 
 struct Ctl {
@@ -45,6 +51,11 @@ struct Ctl {
     s: settings::Settings,
     /// Placa NVIDIA com Optical Flow (geração de quadros possível).
     framegen_available: bool,
+    /// Stream com o menu de engrenagem aberto, e qual painel ("main", "fps", "quality").
+    menu: Option<String>,
+    menu_panel: String,
+    /// Código esperando a senha (janela de senha aberta).
+    password_for: Option<String>,
     view: String,
     net: String,
     live: bool,
@@ -207,6 +218,7 @@ fn render_general(c: &Ctl, ui: &AppWindow) {
 fn render_settings(c: &Ctl, ui: &AppWindow) {
     let a = ui.global::<App>();
     let st = &c.s;
+    a.set_s_password_set(!st.stream_password.is_empty());
     a.set_s_res(s(st.res.to_string()));
     a.set_s_fps(s(st.fps.to_string()));
     a.set_s_bitrate(s(st.bitrate.to_string()));
@@ -260,6 +272,7 @@ fn render_public(c: &Ctl, ui: &AppWindow) {
             cover: cover_index(&e.name),
             watching: c.viewers.iter().any(|v| v.code == e.code),
             blank: false,
+            locked: e.locked,
         }
     };
     a.set_has_featured(!others.is_empty());
@@ -399,9 +412,10 @@ fn relayout(c: &Ctl, ui: &AppWindow) {
     let (cols, rows) = grid_for(shown.len());
     let tile_w = (area_w - gap * (cols as f32 - 1.0)) / cols as f32;
     let tile_h = (area_h - gap * (rows as f32 - 1.0)) / rows as f32;
-    let players_visible = c.view == "watch" && c.picker.is_empty() && !c.updating;
+    let players_visible = c.view == "watch" && c.picker.is_empty() && !c.updating && c.password_for.is_none();
 
     let mut tiles = Vec::new();
+    let mut menu_tile = false;
     for (i, v) in shown.iter().enumerate() {
         let (col, row) = ((i % cols) as f32, (i / cols) as f32);
         let x = pad + col * (tile_w + gap);
@@ -411,6 +425,29 @@ fn relayout(c: &Ctl, ui: &AppWindow) {
         let foot = if controls && v.watching { FOOTER } else { 0.0 };
         let (vx, vy) = (x + border, top + y + head);
         let (vw, vh) = (tile_w - 2.0 * border, (tile_h - head - foot - border).max(1.0));
+        let stats = v.stats.as_ref();
+        let num = |k: &str| stats.and_then(|st| st[k].as_f64()).unwrap_or(0.0);
+
+        // Menu de engrenagem desta stream: acima do rodapé, no canto direito. A janela do
+        // vídeo ganha um buraco ali para o menu aparecer por cima.
+        let mut hole = None;
+        if c.menu.as_deref() == Some(v.id.as_str()) && v.watching {
+            menu_tile = true;
+            let m = gear_menu(c, ui, v);
+            let mh = m.height;
+            let mx = (x + tile_w - MENU_W - 8.0).max(4.0);
+            let my = (y + tile_h - foot - 6.0 - mh).max(4.0);
+            a.set_menu_x(mx);
+            a.set_menu_y(my);
+            a.set_menu_h(mh);
+            m.apply(&a);
+            hole = Some((
+                ((mx - vx) * scale).round() as i32,
+                ((top + my - vy) * scale).round() as i32,
+                (MENU_W * scale).round() as i32,
+                (mh * scale).round() as i32,
+            ));
+        }
         session::player_rect(
             v.id.clone(),
             (vx * scale).round() as i32,
@@ -418,13 +455,13 @@ fn relayout(c: &Ctl, ui: &AppWindow) {
             (vw * scale).round() as i32,
             (vh * scale).round() as i32,
             players_visible && v.watching,
+            hole,
         );
 
-        let stats = v.stats.as_ref();
-        let num = |k: &str| stats.and_then(|st| st[k].as_f64()).unwrap_or(0.0);
         let buffer = num("buffer_ms") as u32;
         tiles.push(Tile {
             id: s(&v.id),
+            gen_tag: s(gen_tag(num("fps"), num("shown_fps"))),
             name: s(if v.host_name.is_empty() { "Conectando…" } else { &v.host_name }),
             initials: s(initials(if v.host_name.is_empty() { "?" } else { &v.host_name })),
             watching: v.watching,
@@ -451,10 +488,111 @@ fn relayout(c: &Ctl, ui: &AppWindow) {
     }
     // Streams escondidas (outra está ampliada): player fora da tela.
     for v in c.viewers.iter().filter(|v| !shown.iter().any(|x| x.id == v.id)) {
-        session::player_rect(v.id.clone(), 0, 0, 1, 1, false);
+        session::player_rect(v.id.clone(), 0, 0, 1, 1, false, None);
     }
+    a.set_menu_tile(s(if menu_tile { c.menu.clone().unwrap_or_default() } else { String::new() }));
     a.set_tiles(model(tiles));
     a.set_has_focus(c.focus.is_some());
+}
+
+/// Multiplicador da geração de quadros que está acontecendo ("2x"), pelo fps recebido e
+/// o mostrado.
+fn gen_tag(fps: f64, shown: f64) -> String {
+    if fps > 1.0 && shown > fps * 1.4 { format!("{}x", (shown / fps).round() as u32) } else { String::new() }
+}
+
+/// Conteúdo do menu de engrenagem de uma stream.
+struct GearMenu {
+    height: f32,
+    panel: String,
+    fps: Vec<MenuOption>,
+    quality: Vec<MenuOption>,
+    fps_label: String,
+    quality_label: String,
+    gen_tag: String,
+    info: String,
+    fps_hint: String,
+}
+
+impl GearMenu {
+    fn apply(&self, a: &App) {
+        a.set_menu_panel(s(&self.panel));
+        a.set_menu_fps(model(self.fps.clone()));
+        a.set_menu_quality(model(self.quality.clone()));
+        a.set_menu_fps_label(s(&self.fps_label));
+        a.set_menu_quality_label(s(&self.quality_label));
+        a.set_menu_gen_tag(s(&self.gen_tag));
+        a.set_menu_info(s(&self.info));
+        a.set_menu_fps_hint(s(&self.fps_hint));
+    }
+}
+
+fn option(value: &str, label: String, tag: String, note: &str, selected: bool) -> MenuOption {
+    MenuOption { value: s(value), label: s(label), tag: s(tag), note: s(note), selected }
+}
+
+fn gear_menu(c: &Ctl, ui: &AppWindow, v: &Viewer) -> GearMenu {
+    let num = |k: &str| v.stats.as_ref().and_then(|st| st[k].as_f64()).unwrap_or(0.0);
+    let stream = num("fps").round() as u32;
+    let height = num("height") as u32;
+    let hz = monitor_hz(ui);
+    let chosen = c.s.view_fps;
+    // fps para assistir: acima do da stream, a placa gera quadros ("FG 2x"); abaixo, descarta.
+    let mut fps = vec![];
+    for (value, f) in [("0", 0u32), ("30", 30), ("60", 60), ("120", 120), ("144", 144)] {
+        if f > hz || (f > stream.max(30) && !c.framegen_available) {
+            continue;
+        }
+        let label = match (f, stream) {
+            (0, 0) => "Original".to_string(),
+            (0, st) => format!("Original ({st})"),
+            (f, _) => format!("{f} fps"),
+        };
+        let tag = if f > 0 && stream > 0 && f > stream { format!("FG {}x", ((f as f64 / stream as f64).round() as u32).max(2)) } else { String::new() };
+        let note = if f > 0 && stream > 0 && f < stream { "descarta quadros" } else { "" };
+        fps.push(option(value, label, tag, note, chosen == f));
+    }
+    let gen = fps.iter().find(|o| o.selected).map(|o| o.tag.to_string().replace("FG ", "")).unwrap_or_default();
+    // Qualidade: Auto ou uma das versões que o host oferece.
+    let mut quality = vec![option("auto", "Auto".into(), String::new(), &if height > 0 { format!("{height}p agora") } else { String::new() }, v.quality == "auto")];
+    for h in &v.renditions {
+        quality.push(option(&h.to_string(), format!("{h}p"), String::new(), if *h <= 480 { "economiza internet" } else { "" }, v.quality == h.to_string()));
+    }
+    if v.renditions.is_empty() && height > 0 {
+        quality.push(option(&height.to_string(), format!("{height}p"), String::new(), "a única que o host manda", v.quality == height.to_string()));
+    }
+    let rows = |n: usize| 12.0 + 40.0 + 9.0 + n as f32 * 42.0 + 9.0;
+    let panel = c.menu_panel.clone();
+    let menu_height = match panel.as_str() {
+        "fps" => rows(fps.len()) + 48.0,
+        "quality" => rows(quality.len()) + 36.0,
+        _ => 12.0 + 44.0 * 2.0 + 4.0 + 9.0 + 2.0 + 32.0,
+    };
+    GearMenu {
+        height: menu_height,
+        panel,
+        fps_label: if chosen == 0 { "Original".into() } else { chosen.to_string() },
+        quality_label: match (v.quality.as_str(), height) {
+            ("auto", 0) => "Auto".into(),
+            ("auto", h) => format!("Auto · {h}p"),
+            (q, _) => format!("{q}p"),
+        },
+        gen_tag: gen,
+        info: if height > 0 { format!("Stream: {height}p a {stream} fps") } else { "Conectando…".into() },
+        fps_hint: if c.framegen_available {
+            "FG = quadros gerados pela placa NVIDIA (2x = um gerado para cada quadro real). Soma ~16–26 ms de atraso.".into()
+        } else {
+            "Acima do fps da stream precisa de placa NVIDIA (GTX 16 ou RTX).".into()
+        },
+        fps,
+        quality,
+    }
+}
+
+fn close_menu(c: &mut Ctl, ui: &AppWindow) {
+    if c.menu.take().is_some() {
+        relayout(c, ui);
+    }
 }
 
 fn render_all(c: &mut Ctl, ui: &AppWindow) {
@@ -565,6 +703,7 @@ fn host_config(c: &Ctl) -> Option<session::HostConfig> {
         volume: c.s.volume,
         public: c.s.public,
         title: src.name.clone(),
+        password: c.s.stream_password.clone(),
     })
 }
 
@@ -596,6 +735,32 @@ fn set_setting(c: &mut Ctl, ui: &AppWindow, key: &str, value: &str) {
         "abitrate" => c.s.abitrate = num().unwrap_or(c.s.abitrate),
         "volume" => c.s.volume = num().unwrap_or(c.s.volume),
         "cursor" => c.s.cursor = on,
+        "password" => {
+            let new = value.trim().to_string();
+            if new == c.s.stream_password {
+                return;
+            }
+            c.s.stream_password = new;
+            settings::save(&c.s);
+            render_settings(c, ui);
+            push_config(c, ui);
+            let msg = if c.s.stream_password.is_empty() { "Senha removida." } else { "Senha definida." };
+            if c.live {
+                // A senha entra nas chaves do código: gera outro (quem já assiste continua).
+                let app = c.app.clone();
+                bg(move || session::host_new_code(&app), move |c, ui, r| match r {
+                    Ok(code) => {
+                        c.code = code;
+                        render_host_code(c, ui);
+                        toast(c, ui, "ok", format!("{msg} Código novo gerado; quem já está assistindo continua."));
+                    }
+                    Err(e) => toast(c, ui, "err", e),
+                });
+            } else {
+                toast(c, ui, "ok", msg);
+            }
+            return;
+        }
         "public" => c.s.public = on,
         "audio-app" => c.s.audio_app = value.to_string(),
         "audio-mode" => {
@@ -618,6 +783,16 @@ fn open_picker(c: &mut Ctl, ui: &AppWindow, mode: &str) {
     }
     c.picker = mode.to_string();
     c.picker_selected.clear();
+    if mode == "start" {
+        // Cada transmissão nova começa no padrão: aparece em "Ao vivo agora", sem senha.
+        c.s.public = true;
+        c.s.stream_password.clear();
+        settings::save(&c.s);
+        render_settings(c, ui);
+        let a = ui.global::<App>();
+        a.set_picker_pw_on(false);
+        a.set_picker_pw(s(""));
+    }
     render_general(c, ui);
     relayout(c, ui);
     load_sources(c, ui);
@@ -652,6 +827,17 @@ fn close_picker(c: &mut Ctl, ui: &AppWindow) {
 fn picker_confirm(c: &mut Ctl, ui: &AppWindow, id: &str) {
     let Some(src) = c.sources.as_ref().and_then(|l| l.iter().find(|x| x.id == id)).cloned() else { return };
     let mode = c.picker.clone();
+    if mode == "start" {
+        // A senha escolhida nesta tela vale para a transmissão que vai começar.
+        let a = ui.global::<App>();
+        let password = if a.get_picker_pw_on() { a.get_picker_pw().trim().to_string() } else { String::new() };
+        if a.get_picker_pw_on() && password.is_empty() {
+            return toast(c, ui, "err", "Digite a senha ou desligue “Pedir senha”.");
+        }
+        c.s.stream_password = password;
+        settings::save(&c.s);
+        render_settings(c, ui);
+    }
     close_picker(c, ui);
     let preview = c.thumbs.get(&src.id).cloned();
     if mode == "switch" {
@@ -726,9 +912,10 @@ fn join_with_code(c: &mut Ctl, ui: &AppWindow, raw: &str) {
     if code.is_empty() {
         return toast(c, ui, "err", "Cole o código da transmissão primeiro.");
     }
-    if let Err(e) = rendezvous::check_code(&code) {
-        return toast(c, ui, "err", e);
-    }
+    let locked = match rendezvous::check_code(&code) {
+        Ok(l) => l,
+        Err(e) => return toast(c, ui, "err", e),
+    };
     if c.live && c.code == code {
         return toast(c, ui, "err", "Esse é o código da sua própria transmissão.");
     }
@@ -736,9 +923,45 @@ fn join_with_code(c: &mut Ctl, ui: &AppWindow, raw: &str) {
         set_view(c, ui, "watch");
         return toast(c, ui, "", "Você já está assistindo essa transmissão.");
     }
+    if locked {
+        // Pede a senha antes (os vídeos nativos cobririam a janela: ficam escondidos).
+        c.password_for = Some(code);
+        let a = ui.global::<App>();
+        a.set_password_error(s(""));
+        a.set_password_prompt(true);
+        relayout(c, ui);
+        return;
+    }
+    start_watching(c, ui, code, None);
+}
+
+fn submit_password(c: &mut Ctl, ui: &AppWindow, password: &str) {
+    let Some(code) = c.password_for.clone() else { return };
+    if password.is_empty() {
+        ui.global::<App>().set_password_error(s("Digite a senha."));
+        return;
+    }
+    c.password_for = None;
+    ui.global::<App>().set_password_prompt(false);
+    start_watching(c, ui, code, Some(password.to_string()));
+}
+
+fn start_watching(c: &mut Ctl, ui: &AppWindow, code: String, password: Option<String>) {
     let id = random_id();
     let volume = c.s.view_volume.min(100);
-    c.viewers.push(Viewer { id: id.clone(), code: code.clone(), host_name: String::new(), step: 0, watching: false, stats: None, ping: None, volume, muted: false });
+    c.viewers.push(Viewer {
+        id: id.clone(),
+        code: code.clone(),
+        host_name: String::new(),
+        step: 0,
+        watching: false,
+        stats: None,
+        ping: None,
+        volume,
+        muted: false,
+        quality: "auto".into(),
+        renditions: vec![],
+    });
     c.focus = None;
     c.view = "watch".into();
     render_general(c, ui);
@@ -749,7 +972,7 @@ fn join_with_code(c: &mut Ctl, ui: &AppWindow, raw: &str) {
     let (app, name) = (c.app.clone(), my_name(c));
     let view_fps = view_fps(c, ui);
     transport::tokio_rt().spawn(async move {
-        let r = session::viewer_join(app, id.clone(), code, name, volume, view_fps).await;
+        let r = session::viewer_join(app, id.clone(), code, password, name, volume, view_fps).await;
         let _ = slint::invoke_from_event_loop(move || {
             with(|c, ui| match r {
                 Ok(host) => {
@@ -799,6 +1022,9 @@ fn monitor_hz(ui: &AppWindow) -> u32 {
 }
 
 fn end_watching(c: &mut Ctl, ui: &AppWindow, id: &str, message: Option<&str>, is_error: bool) {
+    if c.menu.as_deref() == Some(id) {
+        c.menu = None;
+    }
     let Some(pos) = c.viewers.iter().position(|v| v.id == id) else { return };
     let v = c.viewers.remove(pos);
     if c.focus.as_deref() == Some(id) {
@@ -977,6 +1203,13 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
                 relayout(c, ui);
             }
         }
+        "viewer-renditions" => {
+            let id = id_of(&v);
+            if let Some(x) = c.viewers.iter_mut().find(|x| x.id == id) {
+                x.renditions = v["value"].as_array().map(|a| a.iter().filter_map(|h| h.as_u64().map(|h| h as u32)).collect()).unwrap_or_default();
+                relayout(c, ui);
+            }
+        }
         "viewer-ping" => {
             let id = id_of(&v);
             if let Some(x) = c.viewers.iter_mut().find(|x| x.id == id) {
@@ -989,6 +1222,7 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
             let id = id_of(&v);
             match v["kind"].as_str().unwrap_or("") {
                 "dblclick" => toggle_stream_fullscreen(c, ui, &id),
+                "down" => close_menu(c, ui),
                 "move" if c.fullscreen => {
                     let was_hidden = !c.controls_until.is_some_and(|t| t > Instant::now());
                     c.controls_until = Some(Instant::now() + CONTROLS_TIME);
@@ -1031,7 +1265,9 @@ fn wire(ui: &AppWindow) {
     a.on_key_f11(|| later(|c, ui| set_fullscreen(c, ui, !c.fullscreen)));
     a.on_key_escape(|| {
         later(|c, ui| {
-            if !c.picker.is_empty() {
+            if c.menu.is_some() {
+                close_menu(c, ui);
+            } else if !c.picker.is_empty() {
                 close_picker(c, ui);
             } else {
                 set_fullscreen(c, ui, false);
@@ -1082,6 +1318,8 @@ fn wire(ui: &AppWindow) {
         })
     });
     a.on_picker_confirm(|id| later(move |c, ui| picker_confirm(c, ui, &id)));
+    a.on_picker_pw_toggled(|on| later(move |_, ui| ui.global::<App>().set_picker_pw_on(on)));
+    a.on_picker_pw_edited(|t| later(move |_, ui| ui.global::<App>().set_picker_pw(t)));
     a.on_stop_sharing(|| later(|c, ui| stop_sharing(c, ui, None)));
     a.on_new_code(|| {
         later(|c, _| {
@@ -1126,10 +1364,45 @@ fn wire(ui: &AppWindow) {
                 session::viewer_view_fps(&x.id, fps);
             }
             ui.global::<App>().set_view_fps(s(c.s.view_fps.to_string()));
+            c.menu_panel = "main".into();
+            relayout(c, ui);
             let hz = monitor_hz(ui);
             if c.s.view_fps > 0 && fps < c.s.view_fps {
                 toast(c, ui, "", format!("Seu monitor mostra até {hz} quadros por segundo: assistindo a {fps} fps."));
             }
+        })
+    });
+    a.on_submit_password(|p| later(move |c, ui| submit_password(c, ui, &p)));
+    a.on_cancel_password(|| {
+        later(|c, ui| {
+            c.password_for = None;
+            ui.global::<App>().set_password_prompt(false);
+            relayout(c, ui);
+        })
+    });
+    a.on_toggle_menu(|id| {
+        later(move |c, ui| {
+            c.menu = if c.menu.as_deref() == Some(id.as_str()) { None } else { Some(id.to_string()) };
+            c.menu_panel = "main".into();
+            relayout(c, ui);
+        })
+    });
+    a.on_close_menu(|| later(|c, ui| close_menu(c, ui)));
+    a.on_menu_go(|panel| {
+        later(move |c, ui| {
+            c.menu_panel = panel.to_string();
+            relayout(c, ui);
+        })
+    });
+    a.on_pick_quality(|q| {
+        later(move |c, ui| {
+            let Some(id) = c.menu.clone() else { return };
+            if let Some(v) = c.viewers.iter_mut().find(|v| v.id == id) {
+                v.quality = q.to_string();
+            }
+            session::viewer_quality(&id, &q);
+            c.menu_panel = "main".into();
+            relayout(c, ui);
         })
     });
     a.on_toggle_mute(|id| {
@@ -1220,6 +1493,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
             focus: None,
             fullscreen: false,
             framegen_available: false,
+            menu: None,
+            menu_panel: "main".into(),
+            password_for: None,
             controls_until: None,
             toasts: Vec::new(),
             toast_seq: 0,

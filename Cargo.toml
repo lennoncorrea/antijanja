@@ -25,6 +25,8 @@ minisign-verify = "0.3"
 async-trait = "0.1.92"
 base64 = "0.23.1"
 blake3 = "1.8.7"
+# Senha da transmissão: deriva as chaves (lento de propósito contra tentativa e erro)
+argon2 = "0.5"
 bytes = "1.12.1"
 chacha20poly1305 = "0.11.0"
 # Mesma versão que o mainline usa (assinatura das respostas do host e do mural)
@@ -50,6 +52,12 @@ xcap = "0.9.10"
 
 # LTO "thin" e algumas unidades de código: binário quase igual, build bem mais leve
 # (o build completo com lto=true travava o PC).
+# Argon2 sem otimização (build de desenvolvimento) leva segundos por senha.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+
 [profile.release]
 codegen-units = 4
 lto = "thin"

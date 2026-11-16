@@ -216,6 +216,48 @@ impl Converter {
     }
 }
 
+/// Redimensiona um quadro NV12 na memória (versões menores da transmissão, caminho da CPU).
+pub struct Scaler {
+    mft: IMFTransform,
+    provides: bool,
+    alloc: u32,
+}
+
+impl Scaler {
+    pub fn new(in_w: u32, in_h: u32, out_w: u32, out_h: u32, fps: u32) -> Res<Self> {
+        unsafe {
+            let mft: IMFTransform = windows::Win32::System::Com::CoCreateInstance(
+                &CLSID_VideoProcessorMFT,
+                None,
+                windows::Win32::System::Com::CLSCTX_INPROC_SERVER,
+            )
+            .map_err(e("VideoProcessorMFT"))?;
+            let input = video_type(&MFVideoFormat_NV12, in_w, in_h, fps)?;
+            mft.SetInputType(0, &input, 0).map_err(e("VP NV12 SetInputType"))?;
+            let output = video_type(&MFVideoFormat_NV12, out_w, out_h, fps)?;
+            mft.SetOutputType(0, &output, 0).map_err(e("VP NV12 SetOutputType"))?;
+            mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0).ok();
+            let (provides, mut alloc) = stream_info(&mft);
+            alloc = alloc.max(out_w * out_h * 3 / 2);
+            Ok(Self { mft, provides, alloc })
+        }
+    }
+
+    pub fn scale(&self, input: &IMFSample, time_hns: i64, dur_hns: i64) -> Res<IMFSample> {
+        unsafe { self.mft.ProcessInput(0, input, 0).map_err(e("VP NV12 ProcessInput"))? };
+        let mut last = None;
+        while let Some(s) = pull_output(&self.mft, self.provides, self.alloc)? {
+            last = Some(s);
+        }
+        let out = last.ok_or("VP NV12 sem saída")?;
+        unsafe {
+            out.SetSampleTime(time_hns).ok();
+            out.SetSampleDuration(dur_hns).ok();
+        }
+        Ok(out)
+    }
+}
+
 /* ====================================================================== */
 /*                               Encoder                                    */
 /* ====================================================================== */

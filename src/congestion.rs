@@ -103,6 +103,22 @@ pub fn combined_target<'a>(controllers: impl Iterator<Item = &'a RateController>
         .min()
 }
 
+/// Versões menores que o host pode mandar, além da principal (alturas).
+pub const EXTRA_HEIGHTS: [u32; 2] = [720, 480];
+
+/// Bitrate de uma versão menor: proporcional à área, com um pouco mais de bits por pixel
+/// (imagem menor comprime pior). 1080p a 12 Mb/s -> 720p ~6,5 e 480p ~3,6.
+pub fn extra_bitrate(main_bps: u32, main_height: u32, height: u32) -> u32 {
+    let ratio = (height as f64 / main_height.max(1) as f64).clamp(0.0, 1.0);
+    ((main_bps as f64 * ratio.powf(1.5)) as u32).max(MIN_BPS)
+}
+
+/// Versão que o "Auto" escolhe para quem tem `estimate` b/s: a melhor que cabe com
+/// folga. `options` = (chave, bitrate), da melhor para a pior.
+pub fn pick_rendition(options: &[(u32, u32)], estimate: u32) -> u32 {
+    options.iter().find(|(_, bps)| estimate as f64 >= *bps as f64 * 0.8).or(options.last()).map(|(k, _)| *k).unwrap_or(0)
+}
+
 /// Bits por pixel por quadro abaixo disso: cai para 30 fps. Acima de `FPS_RESTORE_BPP`
 /// (medido no fps escolhido por quem transmite): volta. A folga entre os dois evita
 /// ficar trocando.
@@ -218,6 +234,21 @@ mod tests {
         let target = combined_target([&a, &b, &stale].into_iter(), now).unwrap();
         assert_eq!(target, b.estimate());
         assert!(combined_target([&a].into_iter(), now + REPORT_STALE).is_none());
+    }
+
+    #[test]
+    fn renditions_scale_with_area_and_auto_picks_what_fits() {
+        assert_eq!(extra_bitrate(12_000_000, 1080, 1080), 12_000_000);
+        let b720 = extra_bitrate(12_000_000, 1080, 720);
+        let b480 = extra_bitrate(12_000_000, 1080, 480);
+        assert!((6_000_000..7_000_000).contains(&b720), "{b720}");
+        assert!((3_000_000..4_000_000).contains(&b480), "{b480}");
+        let opts = [(0, 12_000_000), (720, b720), (480, b480)];
+        assert_eq!(pick_rendition(&opts, 20_000_000), 0);
+        assert_eq!(pick_rendition(&opts, 10_000_000), 0, "80% do alvo já serve");
+        assert_eq!(pick_rendition(&opts, 7_000_000), 720);
+        assert_eq!(pick_rendition(&opts, 3_000_000), 480);
+        assert_eq!(pick_rendition(&opts, 500_000), 480, "nada cabe: a menor");
     }
 
     #[test]
