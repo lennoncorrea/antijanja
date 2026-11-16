@@ -66,6 +66,8 @@ struct PeerEntry {
     name: String,
     state: &'static str,
     peer: Arc<HostPeer>,
+    /// Tentativa (da oferta) que criou esta conexão.
+    sid: String,
 }
 
 enum Media {
@@ -81,7 +83,7 @@ struct HostSession {
     opus: Arc<Mutex<OpusEncoder>>,
     peers: Arc<Mutex<HashMap<u64, PeerEntry>>>,
     media_tx: tokio::sync::mpsc::Sender<Media>,
-    on_offer: Arc<dyn Fn(u8, String) + Send + Sync>,
+    on_offer: rendezvous::OfferFn,
     public: Option<rendezvous::PublicAnnouncer>,
     since: i64,
 }
@@ -109,6 +111,26 @@ static HOST: Mutex<Option<HostSession>> = Mutex::new(None);
 /// Ofertas já vistas, por `sid`: `None` enquanto a resposta é montada, depois (slot, resposta).
 type Offers = Arc<Mutex<HashMap<String, Option<(u8, String)>>>>;
 static PEER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Máximo de espectadores entrando ao mesmo tempo (resposta sendo montada ou ainda
+/// "conectando"). Cada um segura uma PeerConnection por até ~2 min; sem limite, quem
+/// tem o código poderia mandar ofertas falsas sem parar e esgotar memória e portas.
+/// Ofertas recusadas não são marcadas como vistas: o espectador republica a cada 25 s.
+const MAX_PENDING: usize = 6;
+
+/// Esquece as ofertas cujas conexões já acabaram e conta as que ainda estão entrando.
+fn prune_offers(map: &mut HashMap<String, Option<(u8, String)>>, peers: &Mutex<HashMap<u64, PeerEntry>>) -> usize {
+    let peers = peers.lock().unwrap();
+    let live: Vec<(&str, bool)> = peers.values().map(|p| (p.sid.as_str(), p.state == "connecting")).collect();
+    prune_offers_by(map, &live)
+}
+
+/// `live` = (sid, ainda conectando?) de cada conexão existente.
+fn prune_offers_by<T>(map: &mut HashMap<String, Option<T>>, live: &[(&str, bool)]) -> usize {
+    let is = |sid: &str, connecting_only: bool| live.iter().any(|&(s, c)| s == sid && (c || !connecting_only));
+    map.retain(|sid, v| v.is_none() || is(sid, false));
+    map.iter().filter(|(sid, v)| v.is_none() || is(sid, true)).count()
+}
 
 fn emit_peers(app: &AppHandle, peers: &Mutex<HashMap<u64, PeerEntry>>) {
     let mut list: Vec<PeerInfo> = peers
@@ -220,12 +242,12 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
     let audio = start_audio(&app, &config, opus.clone(), media_tx.clone());
 
     // Pedidos de conexão vindos da DHT.
-    let on_offer: Arc<dyn Fn(u8, String) + Send + Sync> = {
+    let on_offer: rendezvous::OfferFn = {
         let app = app.clone();
         let peers = peers.clone();
         let video = video.clone();
         let offers: Offers = Arc::new(Mutex::new(HashMap::new()));
-        Arc::new(move |slot: u8, payload: String| {
+        Arc::new(move |code: &str, slot: u8, payload: String| {
             let Ok(msg) = serde_json::from_str::<serde_json::Value>(&payload) else { return };
             let (Some(sdp), Some(sid)) = (msg["sdp"].as_str(), msg["sid"].as_str()) else { return };
             if msg["t"] != "offer" {
@@ -236,21 +258,23 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
                 // Oferta repetida: o espectador não recebeu a resposta (a DHT perdeu ou
                 // ainda não propagou). Publica a mesma resposta de novo.
                 Some(Some((reply_slot, answer))) => {
-                    let (reply_slot, answer, app) = (*reply_slot, answer.clone(), app.clone());
+                    let (reply_slot, answer, app, code) = (*reply_slot, answer.clone(), app.clone(), code.to_string());
                     drop(map);
-                    let Some(code) = HOST.lock().unwrap().as_ref().map(|h| h.code.clone()) else { return };
                     std::thread::spawn(move || {
                         let _ = rendezvous::host_reply(&app.rdv(), &code, reply_slot, &answer);
                     });
                 }
                 Some(None) => {} // ainda montando a resposta
                 None => {
+                    if prune_offers(&mut map, &peers) >= MAX_PENDING {
+                        return; // muita gente entrando agora; o espectador tenta de novo
+                    }
                     map.insert(sid.to_string(), None);
                     drop(map);
                     let name: String = msg["name"].as_str().unwrap_or("Espectador").chars().take(40).collect();
                     let (app, peers, video, offers) = (app.clone(), peers.clone(), video.clone(), offers.clone());
-                    let (sdp, sid) = (sdp.to_string(), sid.to_string());
-                    transport::spawn(async move { accept_viewer(app, peers, video, offers, slot, sid, sdp, name).await });
+                    let (sdp, sid, code) = (sdp.to_string(), sid.to_string(), code.to_string());
+                    transport::spawn(async move { accept_viewer(app, peers, video, offers, code, slot, sid, sdp, name).await });
                 }
             }
         })
@@ -279,6 +303,9 @@ async fn accept_viewer(
     peers: Arc<Mutex<HashMap<u64, PeerEntry>>>,
     video: VideoPipeline,
     offers: Offers,
+    // Código em que o pedido chegou: a resposta vai por ele, mesmo que o host
+    // tenha gerado um código novo nesse meio tempo.
+    code: String,
     slot: u8,
     sid: String,
     sdp: String,
@@ -348,10 +375,9 @@ async fn accept_viewer(
             return;
         }
     };
-    peers.lock().unwrap().insert(id, PeerEntry { name: name.clone(), state: "connecting", peer: peer.clone() });
+    peers.lock().unwrap().insert(id, PeerEntry { name: name.clone(), state: "connecting", peer: peer.clone(), sid: sid.clone() });
     emit_peers(&app, &peers);
 
-    let Some(code) = HOST.lock().unwrap().as_ref().map(|h| h.code.clone()) else { return };
     let host_name = HOST.lock().unwrap().as_ref().map(|h| h.config.name.clone()).unwrap_or_default();
     let payload = serde_json::json!({ "t": "answer", "sid": sid, "sdp": answer, "name": host_name }).to_string();
     offers.lock().unwrap().insert(sid.clone(), Some((slot, payload.clone())));
@@ -740,4 +766,22 @@ pub fn viewer_volume(id: String, volume: u32, muted: bool) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_offers_are_counted_and_pruned() {
+        let mut map: HashMap<String, Option<u8>> = HashMap::new();
+        map.insert("montando".into(), None); // resposta sendo montada
+        map.insert("conectando".into(), Some(1)); // respondida, ainda conectando
+        map.insert("assistindo".into(), Some(2)); // já conectou
+        map.insert("saiu".into(), Some(3)); // a conexão já acabou
+        let live = [("conectando", true), ("assistindo", false)];
+        assert_eq!(prune_offers_by(&mut map, &live), 2);
+        assert!(!map.contains_key("saiu"));
+        assert!(map.contains_key("assistindo") && map.contains_key("montando"));
+    }
 }
