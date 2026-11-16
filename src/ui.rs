@@ -1182,6 +1182,13 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
                 relayout(c, ui);
             }
         }
+        "viewer-renditions" => {
+            let id = id_of(&v);
+            if let Some(x) = c.viewers.iter_mut().find(|x| x.id == id) {
+                x.renditions = v["value"].as_array().map(|a| a.iter().filter_map(|h| h.as_u64().map(|h| h as u32)).collect()).unwrap_or_default();
+                relayout(c, ui);
+            }
+        }
         "viewer-ping" => {
             let id = id_of(&v);
             if let Some(x) = c.viewers.iter_mut().find(|x| x.id == id) {

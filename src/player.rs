@@ -660,7 +660,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, Duration)>();
         let src = crate::capture::list_sources().into_iter().find(|s| s.primary).unwrap();
         let pipe = VideoPipeline::start(src.id, VideoSettings { res: 1080, fps: 30, bitrate: 8000, cursor: true }, Callbacks {
-            on_packet: Arc::new(move |d, dur| { let _ = tx.send((d, dur)); }),
+            on_packet: Arc::new(move |_, d, dur| { let _ = tx.send((d, dur)); }),
             on_info: Arc::new(|_| {}), on_preview: Arc::new(|_| {}),
             on_error: Arc::new(|e| println!("ERRO {e}")), on_source_closed: Arc::new(|| {}),
         }).unwrap();

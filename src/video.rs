@@ -5,10 +5,13 @@
 //!   alguns microssegundos adiantados não são descartados, e com a tela parada o último
 //!   quadro é repetido (custa quase nada para o encoder e mantém o FPS estável).
 //! - Comandos ao vivo: trocar a fonte, resolução, FPS, bitrate, cursor e pedir keyframe.
+//! - Versões menores (720p, 480p) para espectadores com menos banda ou que pediram menos
+//!   qualidade: o NV12 da principal é redimensionado e vai para um encoder próprio. Só
+//!   existem enquanto alguém usa (ver `set_extras`).
 
 use crate::capture::{self, CaptureMsg, RawFrame};
-use crate::gpu::{GpuConverter, GpuDevice, GpuFrame};
-use crate::media::{adjust_bitrate, mf_init, rewrap, Converter, Encoder};
+use crate::gpu::{GpuConverter, GpuDevice, GpuFrame, GpuScaler};
+use crate::media::{adjust_bitrate, mf_init, rewrap, Converter, Encoder, Scaler};
 use image::RgbaImage;
 use serde::Serialize;
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
@@ -45,6 +48,17 @@ pub struct VideoInfo {
     pub net_kbps: u32,
     /// fps reduzido por falta de banda (0 = o escolhido).
     pub net_fps: u32,
+    /// Alturas das versões menores que dá para pedir (além da principal, `height`).
+    pub extras: Vec<u32>,
+    /// Bitrate alvo de cada versão menor (b/s), na ordem de `extras`.
+    pub extras_bps: Vec<u32>,
+}
+
+/// Uma versão menor pedida: altura e limite de bitrate pela rede de quem usa.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExtraReq {
+    pub height: u32,
+    pub cap_bps: Option<u32>,
 }
 
 pub enum Msg {
@@ -52,14 +66,18 @@ pub enum Msg {
     Settings(VideoSettings),
     /// Limite de bitrate pela rede (b/s; None = sem limite). Ver `congestion`.
     Network(Option<u32>),
+    /// Versões menores que alguém está usando.
+    Extras(Vec<ExtraReq>),
+    /// Keyframe numa versão menor (altura).
+    KeyframeExtra(u32),
     Source(String),
     Keyframe,
     Stop,
 }
 
 pub struct Callbacks {
-    /// (dados Annex B, duração do quadro)
-    pub on_packet: Arc<dyn Fn(Vec<u8>, Duration) + Send + Sync>,
+    /// (versão: 0 = principal, senão a altura; dados Annex B; duração do quadro)
+    pub on_packet: Arc<dyn Fn(u32, Vec<u8>, Duration) + Send + Sync>,
     pub on_info: Arc<dyn Fn(VideoInfo) + Send + Sync>,
     pub on_preview: Arc<dyn Fn(String) + Send + Sync>,
     pub on_error: Arc<dyn Fn(String) + Send + Sync>,
@@ -89,6 +107,11 @@ impl VideoPipeline {
     }
     pub fn set_settings(&self, s: VideoSettings) { self.send(Msg::Settings(s)) }
     pub fn set_network(&self, cap_bps: Option<u32>) { self.send(Msg::Network(cap_bps)) }
+    pub fn set_extras(&self, reqs: Vec<ExtraReq>) { self.send(Msg::Extras(reqs)) }
+    /// Keyframe na versão `key` (0 = principal, senão a altura da versão menor).
+    pub fn keyframe_for(&self, key: u32) {
+        if key == 0 { self.keyframe() } else { self.send(Msg::KeyframeExtra(key)) }
+    }
     pub fn set_source(&self, id: String) { self.send(Msg::Source(id)) }
     pub fn keyframe(&self) { self.send(Msg::Keyframe) }
     pub fn stop(&self) { self.send(Msg::Stop) }
@@ -143,6 +166,22 @@ enum Pending {
     Gpu(GpuFrame),
 }
 
+enum Scale {
+    Cpu(Scaler),
+    Gpu(GpuScaler),
+}
+
+/// Versão menor: redimensiona o NV12 da principal e codifica.
+struct Extra {
+    height: u32,
+    scale: Scale,
+    enc: Encoder,
+    /// Tamanho e fps da principal quando foi criada (mudou: recria).
+    from: ((u32, u32), u32),
+    bitrate: u32,
+    want_keyframe: bool,
+}
+
 /// Tempo mínimo entre trocas de fps por causa da rede (cada troca recria o encoder).
 const NET_FPS_MIN_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -154,6 +193,10 @@ struct State {
     net_bps: Option<u32>,
     net_fps: Option<u32>,
     net_fps_changed: Option<Instant>,
+    extras: Vec<Extra>,
+    extra_reqs: Vec<ExtraReq>,
+    /// Versões que falharam ao criar (não tenta de novo até a principal mudar).
+    extra_failed: Vec<u32>,
     gpu: Option<GpuDevice>,
     active: Option<Active>,
     want_keyframe: bool,
@@ -183,6 +226,9 @@ impl State {
         self.active = None;
         self.last_nv12 = None;
         // Encoder novo: aplica o limite da rede (pode ter chegado antes do 1º quadro).
+        // As versões menores dependem da principal: recria junto.
+        self.extras.clear();
+        self.extra_failed.clear();
         self.update_net_fps();
         self.settings = self.effective();
         let fps = self.settings.fps;
@@ -242,6 +288,99 @@ impl State {
         }
     }
 
+    /// Versões menores possíveis com a principal atual: (altura, bitrate alvo).
+    fn extra_options(&self) -> Vec<(u32, u32)> {
+        let Some(a) = self.active.as_ref() else { return vec![] };
+        let (w, h) = a.conv.output_size();
+        let main_bps = bitrate_for(&self.user, (w, h));
+        crate::congestion::EXTRA_HEIGHTS
+            .iter()
+            .filter(|&&eh| eh < h)
+            .map(|&eh| (eh, crate::congestion::extra_bitrate(main_bps, h, eh)))
+            .collect()
+    }
+
+    /// Cria/atualiza/remove as versões menores conforme os pedidos.
+    fn sync_extras(&mut self, cb: &Callbacks) {
+        let Some(a) = self.active.as_ref() else {
+            self.extras.clear();
+            return;
+        };
+        let (main_out, fps) = (a.conv.output_size(), a.fps);
+        let gpu_path = matches!(a.conv, Conv::Gpu(_));
+        let options = self.extra_options();
+        let wanted: Vec<(u32, u32)> = self
+            .extra_reqs
+            .iter()
+            .filter_map(|r| options.iter().find(|(h, _)| *h == r.height).map(|(h, bps)| (*h, r.cap_bps.map_or(*bps, |c| c.min(*bps)))))
+            .collect();
+        self.extras.retain(|x| x.from == (main_out, fps) && wanted.iter().any(|(h, _)| *h == x.height));
+        for (h, bps) in wanted {
+            if let Some(x) = self.extras.iter_mut().find(|x| x.height == h) {
+                if x.bitrate.abs_diff(bps) > x.bitrate / 33 {
+                    x.bitrate = bps;
+                    x.enc.set_bitrate(bps);
+                }
+                continue;
+            }
+            if self.extra_failed.contains(&h) {
+                continue;
+            }
+            let out = (even(main_out.0 * h / main_out.1), h);
+            let built = match (&self.gpu, gpu_path) {
+                (Some(g), true) => GpuScaler::new(g, main_out.0, main_out.1, out.0, out.1, fps)
+                    .and_then(|s| Encoder::new(out.0, out.1, fps, bps, true, Some(&g.manager)).map(|e| (Scale::Gpu(s), e))),
+                _ => Scaler::new(main_out.0, main_out.1, out.0, out.1, fps)
+                    .and_then(|s| Encoder::new(out.0, out.1, fps, bps, true, None).map(|e| (Scale::Cpu(s), e))),
+            };
+            match built {
+                Ok((scale, enc)) => self.extras.push(Extra { height: h, scale, enc, from: (main_out, fps), bitrate: bps, want_keyframe: true }),
+                Err(err) => {
+                    (cb.on_error)(format!("Não deu para criar a versão {h}p: {err}"));
+                    self.extra_failed.push(h);
+                }
+            }
+        }
+    }
+
+    /// Codifica as versões menores a partir do NV12 da principal.
+    fn encode_extras(&mut self, nv12: &IMFSample, t: i64, dur: i64, interval: Duration, cb: &Callbacks) {
+        if self.extra_reqs.is_empty() {
+            self.extras.clear();
+            return;
+        }
+        let main = self.active.as_ref().map(|a| (a.conv.output_size(), a.fps));
+        if self.extras.iter().any(|x| Some(x.from) != main) || self.extras.len() < self.extra_reqs.len() {
+            self.sync_extras(cb);
+        }
+        let mut broken = vec![];
+        for x in &mut self.extras {
+            let scaled = match (&mut x.scale, self.gpu.as_ref()) {
+                (Scale::Gpu(s), Some(g)) => s.scale(g, nv12, t, dur),
+                (Scale::Cpu(s), _) => s.scale(nv12, t, dur),
+                (Scale::Gpu(_), None) => Err("GPU indisponível".into()),
+            };
+            let Ok(scaled) = scaled else {
+                broken.push(x.height);
+                continue;
+            };
+            if x.want_keyframe {
+                x.enc.force_keyframe();
+                x.want_keyframe = false;
+            }
+            match x.enc.encode(&scaled) {
+                Ok(packets) => {
+                    for (i, pk) in packets.into_iter().enumerate() {
+                        (cb.on_packet)(x.height, pk.data, if i == 0 { interval } else { Duration::ZERO });
+                    }
+                }
+                Err(_) => broken.push(x.height),
+            }
+        }
+        // Falhou: recria no próximo quadro (e pede keyframe).
+        self.extras.retain(|x| !broken.contains(&x.height));
+    }
+
     fn timestamp(&mut self) -> (i64, i64) {
         let dur = (10_000_000 / self.settings.fps.max(1)) as i64;
         let t = self.frame_index as i64 * dur;
@@ -295,12 +434,13 @@ impl State {
         }
         match a.enc.encode(&nv12) {
             Ok(packets) => {
-                self.last_nv12 = Some(nv12);
+                self.last_nv12 = Some(nv12.clone());
                 let mut bytes = 0;
                 for (i, pk) in packets.into_iter().enumerate() {
                     bytes += pk.data.len();
-                    (cb.on_packet)(pk.data, if i == 0 { interval } else { Duration::ZERO });
+                    (cb.on_packet)(0, pk.data, if i == 0 { interval } else { Duration::ZERO });
                 }
+                self.encode_extras(&nv12, t, dur, interval, cb);
                 Some(bytes)
             }
             Err(err) => {
@@ -360,7 +500,7 @@ fn run(
             })
             .ok();
     }
-    let mut st = State { user: settings.clone(), net_bps: None, net_fps: None, net_fps_changed: None, settings, gpu, active: None, want_keyframe: true, last_nv12: None, frame_size: None, start: Instant::now(), convert_errors: 0, frame_index: 0 };
+    let mut st = State { user: settings.clone(), net_bps: None, net_fps: None, net_fps_changed: None, extras: vec![], extra_reqs: vec![], extra_failed: vec![], settings, gpu, active: None, want_keyframe: true, last_nv12: None, frame_size: None, start: Instant::now(), convert_errors: 0, frame_index: 0 };
     let mut pending: Option<Pending> = None;
     let mut next_due = Instant::now();
     // Relógio de vídeo: cada tick é 1/fps. A duração de cada quadro no RTP = ticks avançados,
@@ -481,6 +621,19 @@ fn run(
                 }
                 continue;
             }
+            Ok(Msg::Extras(reqs)) => {
+                if reqs != st.extra_reqs {
+                    st.extra_reqs = reqs;
+                    st.sync_extras(&cb);
+                }
+                continue;
+            }
+            Ok(Msg::KeyframeExtra(h)) => {
+                if let Some(x) = st.extras.iter_mut().find(|x| x.height == h) {
+                    x.want_keyframe = true;
+                }
+                continue;
+            }
             Ok(Msg::Keyframe) => {
                 st.want_keyframe = true;
                 next_due = Instant::now();
@@ -572,6 +725,8 @@ fn run(
                     net_fps: st.net_fps.filter(|&f| f < st.user.fps).unwrap_or(0),
                     captured_fps: fresh_count as f32 / el.as_secs_f32(),
                     encode_ms: if win_frames > 0 { win_time.as_secs_f32() * 1000.0 / win_frames as f32 } else { 0.0 },
+                    extras: st.extra_options().iter().map(|(h, _)| *h).collect(),
+                    extras_bps: st.extra_options().iter().map(|(_, b)| *b).collect(),
                 });
             }
             win_frames = 0;
@@ -625,7 +780,7 @@ mod tests {
             src.id,
             VideoSettings { res: 1080, fps: 60, bitrate: 12000, cursor: true },
             Callbacks {
-                on_packet: Arc::new(move |_, _| { p.fetch_add(1, Ordering::SeqCst); }),
+                on_packet: Arc::new(move |_, _, _| { p.fetch_add(1, Ordering::SeqCst); }),
                 on_info: Arc::new(move |i| {
                     println!("  {} hw={} zero-copy={} {}x{} {:.1} fps {} kb/s (alvo {}) encode {:.1} ms, capturados {:.0}/s", i.encoder, i.hardware, i.zero_copy, i.width, i.height, i.fps, i.kbps, i.target_kbps, i.encode_ms, i.captured_fps);
                     inf.lock().unwrap().push(i);
@@ -643,6 +798,77 @@ mod tests {
         assert!(last.fps >= 55.0, "FPS abaixo do alvo: {:.1}", last.fps);
     }
 
+    /// Versões menores com a tela real: 1080p + 720p + 480p ao mesmo tempo. Cada versão
+    /// tem que sair, decodificar no tamanho certo e atender keyframe pedido só para ela.
+    /// `cargo test extra_renditions -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn extra_renditions_from_the_real_screen() {
+        use std::collections::HashMap;
+        crate::media::mf_init().unwrap();
+        let src = capture::list_sources().into_iter().find(|s| s.primary || s.kind == "monitor").expect("sem tela");
+        let packets = Arc::new(std::sync::Mutex::new(HashMap::<u32, Vec<Vec<u8>>>::new()));
+        let infos = Arc::new(std::sync::Mutex::new(Vec::<VideoInfo>::new()));
+        let (p, inf) = (packets.clone(), infos.clone());
+        let pipe = VideoPipeline::start(
+            src.id,
+            VideoSettings { res: 1080, fps: 30, bitrate: 8000, cursor: true },
+            Callbacks {
+                on_packet: Arc::new(move |k, d, _| p.lock().unwrap().entry(k).or_default().push(d)),
+                on_info: Arc::new(move |i| inf.lock().unwrap().push(i)),
+                on_preview: Arc::new(|_| {}),
+                on_error: Arc::new(|e| println!("  ERRO {e}")),
+                on_source_closed: Arc::new(|| {}),
+            },
+        )
+        .expect("pipeline");
+        std::thread::sleep(Duration::from_millis(1500));
+        pipe.set_extras(vec![ExtraReq { height: 720, cap_bps: None }, ExtraReq { height: 480, cap_bps: Some(1_000_000) }]);
+        std::thread::sleep(Duration::from_secs(3));
+        // Keyframe só na 720p.
+        let keys = |k: u32| packets.lock().unwrap().get(&k).map(|v| v.iter().filter(|d| crate::media::has_nal(d, 5)).count()).unwrap_or(0);
+        let (k720, k480) = (keys(720), keys(480));
+        pipe.keyframe_for(720);
+        std::thread::sleep(Duration::from_millis(500));
+        let (k720b, k480b) = (keys(720), keys(480));
+        pipe.set_extras(vec![]);
+        std::thread::sleep(Duration::from_millis(500));
+        let after = packets.lock().unwrap().get(&480).map(|v| v.len()).unwrap_or(0);
+        std::thread::sleep(Duration::from_millis(500));
+        let after2 = packets.lock().unwrap().get(&480).map(|v| v.len()).unwrap_or(0);
+        pipe.stop();
+
+        let info = infos.lock().unwrap().last().cloned().expect("info");
+        println!("principal {}x{} ({}), versões possíveis {:?} a {:?} b/s", info.width, info.height, info.encoder, info.extras, info.extras_bps);
+        let packets = packets.lock().unwrap();
+        for (k, list) in packets.iter() {
+            let bytes: usize = list.iter().map(|d| d.len()).sum();
+            // Decodifica a versão inteira e confere o tamanho.
+            let mut dec = crate::media::Decoder::new().unwrap();
+            let mut size = None;
+            let mut decoded = 0;
+            for d in list {
+                for f in dec.decode(d, 0).unwrap_or_default() {
+                    size = Some((f.width, f.height));
+                    decoded += 1;
+                }
+            }
+            println!("versão {k}: {} pacotes, {} KB, {decoded} quadros decodificados, tamanho {:?}", list.len(), bytes / 1024, size);
+        }
+        let size_of = |k: u32| {
+            let mut dec = crate::media::Decoder::new().unwrap();
+            packets[&k].iter().flat_map(|d| dec.decode(d, 0).unwrap_or_default()).last().map(|f| (f.width, f.height))
+        };
+        assert_eq!(info.extras, vec![720, 480]);
+        assert_eq!(size_of(0).map(|s| s.1), Some(1080));
+        assert_eq!(size_of(720).map(|s| s.1), Some(720));
+        assert_eq!(size_of(480).map(|s| s.1), Some(480));
+        println!("keyframes 720p: {k720} -> {k720b}, 480p: {k480} -> {k480b}; 480p depois de desligar: {after} -> {after2}");
+        assert!(k720b > k720, "keyframe pedido para a 720p não saiu");
+        assert_eq!(k480b, k480, "keyframe da 720p não pode forçar a 480p");
+        assert_eq!(after, after2, "versão desligada continuou saindo");
+    }
+
     /// Diagnóstico do bitrate: tamanho de cada quadro (keyframe ou não) e kb/s por
     /// segundo com a tela real. Fase 1 normal; fase 2 simula um espectador com perda
     /// de pacotes pedindo keyframe a cada 300 ms (o mínimo que o host aceita).
@@ -657,7 +883,7 @@ mod tests {
             src.id,
             VideoSettings { res: 1080, fps: 60, bitrate: 12000, cursor: true },
             Callbacks {
-                on_packet: Arc::new(move |d, _| {
+                on_packet: Arc::new(move |_, d, _| {
                     let key = crate::media::has_nal(&d, 5);
                     f.lock().unwrap().push((Instant::now(), d.len(), key));
                 }),

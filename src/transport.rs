@@ -925,6 +925,90 @@ mod tests {
             times.len() as f64 / secs, mean, sd, p99, max, over);
     }
 
+    /// Troca de versão no meio: o espectador recebe a 1080p e passa para a 720p exatamente
+    /// num keyframe dela (como a sessão do host faz). O decoder tem que trocar de tamanho
+    /// sem nenhum erro e sem quadro corrompido.
+    /// `cargo test rendition_switch -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn rendition_switch_over_webrtc() {
+        use crate::video::{Callbacks, ExtraReq, VideoPipeline, VideoSettings};
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        crate::media::mf_init().unwrap();
+        BROKEN_FRAMES.store(0, SeqCst);
+        let (vtx, vrx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let sinks = ViewerSinks {
+            on_video: Arc::new(move |f, _| { let _ = vtx.send(f); }),
+            on_audio: Arc::new(|_| {}),
+            on_state: Arc::new(|_| {}),
+            on_message: Arc::new(|_| {}),
+        };
+        let (viewer, offer) = block_on(ViewerSession::offer(sinks, false)).unwrap();
+        let (ctx, crx) = std::sync::mpsc::channel();
+        let (peer, answer) = block_on(HostPeer::answer(offer, false,
+            Arc::new(move |e| if e == PeerEvent::Connected { let _ = ctx.send(()); }),
+            Arc::new(|_| {}))).unwrap();
+        block_on(viewer.accept_answer(answer)).unwrap();
+        crx.recv_timeout(Duration::from_secs(10)).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Versão atual do espectador e a pendente (0 = nenhuma), como no PeerEntry.
+        let current = Arc::new(AtomicU32::new(0));
+        let pending = Arc::new(AtomicU32::new(u32::MAX));
+        let (cur, pen, p2) = (current.clone(), pending.clone(), peer.clone());
+        let src = crate::capture::list_sources().into_iter().find(|s| s.primary).unwrap();
+        let pipe = VideoPipeline::start(src.id, VideoSettings { res: 1080, fps: 30, bitrate: 8000, cursor: true }, Callbacks {
+            on_packet: Arc::new(move |key, d, dur| {
+                if pen.load(SeqCst) == key && crate::media::has_nal(&d, 5) {
+                    cur.store(key, SeqCst);
+                    pen.store(u32::MAX, SeqCst);
+                }
+                if cur.load(SeqCst) == key {
+                    let p = p2.clone();
+                    let _ = block_on(p.send_video(Bytes::from(d), dur));
+                }
+            }),
+            on_info: Arc::new(|_| {}), on_preview: Arc::new(|_| {}),
+            on_error: Arc::new(|e| println!("ERRO {e}")), on_source_closed: Arc::new(|| {}),
+        }).unwrap();
+        pipe.keyframe();
+        std::thread::sleep(Duration::from_secs(2));
+        // Pede a 720p e troca no keyframe dela.
+        pipe.set_extras(vec![ExtraReq { height: 720, cap_bps: None }]);
+        pending.store(720, SeqCst);
+        pipe.keyframe_for(720);
+        std::thread::sleep(Duration::from_secs(2));
+        // E volta para a principal.
+        pending.store(0, SeqCst);
+        pipe.keyframe_for(0);
+        std::thread::sleep(Duration::from_secs(2));
+        pipe.stop();
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = block_on(peer.pc.close());
+        let _ = block_on(viewer.pc.close());
+
+        let mut dec = crate::media::Decoder::new().unwrap();
+        let (mut sizes, mut errors, mut frames) = (Vec::<(u32, u32)>::new(), 0, 0);
+        while let Ok(f) = vrx.recv_timeout(Duration::from_millis(500)) {
+            match dec.decode(&f, 0) {
+                Ok(out) => {
+                    for fr in out {
+                        frames += 1;
+                        if sizes.last() != Some(&(fr.width, fr.height)) {
+                            sizes.push((fr.width, fr.height));
+                        }
+                    }
+                }
+                Err(_) => errors += 1,
+            }
+        }
+        println!("{frames} quadros, tamanhos em ordem: {sizes:?}, erros no decoder: {errors}, quadros corrompidos na rede: {}", BROKEN_FRAMES.load(SeqCst));
+        assert_eq!(sizes.iter().map(|s| s.1).collect::<Vec<_>>(), vec![1080, 720, 1080], "devia ir 1080 -> 720 -> 1080");
+        assert_eq!(errors, 0);
+        assert_eq!(BROKEN_FRAMES.load(SeqCst), 0);
+        assert!(frames > 150);
+    }
+
     /// Captura real → encoder → WebRTC → receptor → decoder, medindo a regularidade.
     #[test]
     #[ignore]
@@ -987,7 +1071,7 @@ mod tests {
             let src = crate::capture::list_sources().into_iter().find(|s| s.primary).unwrap();
             let (p2, ht, q2, d2) = (peer.clone(), host_times.clone(), queued.clone(), dropped.clone());
             let pipe = VideoPipeline::start(src.id, VideoSettings { res: 1080, fps: 60, bitrate: 10000, cursor: true }, Callbacks {
-                on_packet: Arc::new(move |d, dur| {
+                on_packet: Arc::new(move |_, d, dur| {
                     ht.lock().unwrap().push(Instant::now());
                     let p = p2.clone();
                     let (q, dr) = (q2.clone(), d2.clone());

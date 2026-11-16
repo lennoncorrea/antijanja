@@ -7,7 +7,7 @@ use crate::media::{mf_init, Decoder};
 use crate::player::{Player, PlayerFeed};
 use crate::rendezvous::{self, RdvState};
 use crate::transport::{self, HostPeer, PeerEvent, ViewerSession, ViewerSinks};
-use crate::video::{Callbacks, VideoPipeline, VideoSettings};
+use crate::video::{Callbacks, ExtraReq, VideoPipeline, VideoSettings};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -78,34 +78,71 @@ struct PeerEntry {
     sid: String,
     /// Quanto a rede até este espectador aguenta (pelos relatórios dele).
     rate: RateController,
+    /// Qualidade pedida: None = automática; Some(altura).
+    quality: Option<u32>,
+    /// Versão que ele recebe agora (0 = principal, senão a altura da versão menor) e a
+    /// próxima, que só começa num keyframe dela (senão a imagem corromperia).
+    rendition: u32,
+    pending: Option<u32>,
+    joined: Instant,
+    /// Automático querendo subir de versão: qual e desde quando (sobe só depois de um tempo).
+    up_since: Option<(u32, Instant)>,
 }
 
-/// Keyframes forçados: no máximo um por intervalo, somando os pedidos de todos os
-/// espectadores (o encoder é um só). Antes cada espectador podia pedir a cada 300 ms.
+/// Keyframes forçados: no máximo um por intervalo em cada versão, somando os pedidos de
+/// todos os espectadores dela. Antes cada espectador podia pedir a cada 300 ms.
 const KEYFRAME_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// Espectador que já mandou relatórios e parou por esse tempo: a conexão dele está
 /// tão ruim que nem o relatório chega. Conta como rede sobrecarregada.
 const REPORT_SILENCE: Duration = Duration::from_millis(1500);
+/// Qualidade automática: espera a estimativa de banda firmar antes de trocar de versão,
+/// e só sobe depois de a folga durar esse tempo (descer é na hora).
+const AUTO_SETTLE: Duration = Duration::from_secs(8);
+const AUTO_UP_AFTER: Duration = Duration::from_secs(5);
 
 /// O que as partes do host compartilham: encoder, espectadores, keyframes e bitrate.
 struct HostShared {
     video: VideoPipeline,
     peers: Arc<Mutex<HashMap<u64, PeerEntry>>>,
-    keyframe_needed: Arc<AtomicUsize>,
+    /// Versões que precisam de keyframe (0 = principal, senão a altura).
+    keyframes: Arc<Mutex<std::collections::HashSet<u32>>>,
     /// Bitrate alvo escolhido por quem transmite (b/s), informado pelo pipeline.
     user_bps: Arc<AtomicU32>,
-    /// Limite de bitrate pela rede aplicado agora (None = sem limite).
+    /// Altura da versão principal e as menores possíveis (altura, bitrate alvo).
+    renditions: Arc<Mutex<(u32, Vec<(u32, u32)>)>>,
+    /// Limite de bitrate pela rede aplicado agora na principal (None = sem limite).
     applied: Mutex<Option<u32>>,
+    /// Versões menores pedidas ao pipeline agora.
+    extras: Mutex<Vec<ExtraReq>>,
     alive: AtomicBool,
 }
 
 impl HostShared {
-    fn request_keyframe(&self) {
-        self.keyframe_needed.fetch_add(1, Ordering::SeqCst);
+    fn request_keyframe(&self, key: u32) {
+        self.keyframes.lock().unwrap().insert(key);
+    }
+
+    /// Keyframe na versão que o espectador `id` recebe (ou vai receber).
+    fn request_keyframe_for(&self, id: u64) {
+        let key = self.peers.lock().unwrap().get(&id).map(|p| p.pending.unwrap_or(p.rendition)).unwrap_or(0);
+        self.request_keyframe(key);
     }
 
     fn user_bps(&self) -> u32 {
         self.user_bps.load(Ordering::Relaxed).max(congestion::MIN_BPS)
+    }
+
+    /// Versões disponíveis agora: (chave, bitrate alvo), da melhor para a pior.
+    fn options(&self) -> Vec<(u32, u32)> {
+        let (_, extras) = self.renditions.lock().unwrap().clone();
+        std::iter::once((0, self.user_bps())).chain(extras).collect()
+    }
+
+    /// Mensagem com as qualidades que quem assiste pode escolher.
+    fn renditions_msg(&self) -> String {
+        let (main, extras) = self.renditions.lock().unwrap().clone();
+        let heights: Vec<u32> = std::iter::once(main).chain(extras.iter().map(|(h, _)| *h)).filter(|h| *h > 0).collect();
+        serde_json::json!({ "t": "renditions", "h": heights }).to_string()
     }
 
     fn on_report(&self, id: u64, r: &Report) {
@@ -113,27 +150,124 @@ impl HostShared {
         if let Some(p) = self.peers.lock().unwrap().get_mut(&id) {
             p.rate.on_report(r, max, Instant::now());
         }
+        self.assign();
         self.apply();
     }
 
-    /// Recalcula o limite (pior conexão) e aplica no encoder e nos pacers.
+    fn set_quality(&self, id: u64, q: &str) {
+        if let Some(p) = self.peers.lock().unwrap().get_mut(&id) {
+            p.quality = q.parse().ok();
+            p.up_since = None;
+        }
+        self.assign();
+        self.apply();
+    }
+
+    /// Escolhe a versão de cada espectador (pedida ou automática). Uma troca só vale no
+    /// próximo keyframe da versão nova, que é pedido aqui.
+    fn assign(&self) {
+        let options = self.options();
+        let main_height = self.renditions.lock().unwrap().0;
+        let now = Instant::now();
+        let mut keyframes = vec![];
+        for p in self.peers.lock().unwrap().values_mut() {
+            if p.state == "connecting" {
+                continue;
+            }
+            let current = p.pending.unwrap_or(p.rendition);
+            let want = match p.quality {
+                // Fixa: a maior versão que não passa da pedida (a principal se pediu ela ou mais).
+                Some(h) if h >= main_height => 0,
+                Some(h) => options.iter().skip(1).find(|(eh, _)| *eh <= h).or(options.last()).map(|(k, _)| *k).unwrap_or(0),
+                None => {
+                    let settled = now.saturating_duration_since(p.joined) >= AUTO_SETTLE && p.rate.last_report().is_some();
+                    if !settled || options.len() < 2 {
+                        current
+                    } else {
+                        let pick = congestion::pick_rendition(&options, p.rate.estimate());
+                        let rank = |k: u32| options.iter().position(|(o, _)| *o == k).unwrap_or(0);
+                        if rank(pick) > rank(current) {
+                            p.up_since = None;
+                            pick // pior conexão: desce na hora
+                        } else if rank(pick) < rank(current) {
+                            match p.up_since {
+                                Some((k, t)) if k == pick && now.saturating_duration_since(t) >= AUTO_UP_AFTER => pick,
+                                Some((k, _)) if k == pick => current,
+                                _ => {
+                                    p.up_since = Some((pick, now));
+                                    current
+                                }
+                            }
+                        } else {
+                            p.up_since = None;
+                            current
+                        }
+                    }
+                }
+            };
+            // A versão sumiu (ex.: a principal ficou menor que ela): volta para a principal.
+            let want = if want == 0 || options.iter().any(|(k, _)| *k == want) { want } else { 0 };
+            if want != current {
+                p.up_since = None;
+                if want == p.rendition {
+                    p.pending = None;
+                } else {
+                    p.pending = Some(want);
+                    keyframes.push(want);
+                }
+            }
+        }
+        for k in keyframes {
+            self.request_keyframe(k);
+        }
+    }
+
+    /// Limites de bitrate pela rede: cada versão segue a pior conexão entre quem a usa.
+    /// Aplica no encoder de cada versão e nos pacers.
     fn apply(&self) {
         let now = Instant::now();
         let user = self.user_bps();
+        let options = self.options();
         let peers = self.peers.lock().unwrap();
-        let target = congestion::combined_target(peers.values().map(|p| &p.rate), now).filter(|&t| t < user);
+        let on = |k: u32| peers.values().filter(move |p| p.state != "connecting" && p.rendition == k).map(|p| &p.rate);
+        let main_cap = congestion::combined_target(on(0), now).filter(|&t| t < user);
+        let mut reqs: Vec<ExtraReq> = vec![];
+        for (h, bps) in options.iter().skip(1) {
+            let used = peers.values().any(|p| p.state != "connecting" && (p.rendition == *h || p.pending == Some(*h)));
+            if used {
+                reqs.push(ExtraReq { height: *h, cap_bps: congestion::combined_target(on(*h), now).filter(|t| t < bps) });
+            }
+        }
         for p in peers.values() {
-            p.peer.set_target_bitrate(target.unwrap_or(user));
+            let target = match p.rendition {
+                0 => main_cap.unwrap_or(user),
+                h => reqs.iter().find(|r| r.height == h).and_then(|r| r.cap_bps).or(options.iter().find(|(k, _)| *k == h).map(|(_, b)| *b)).unwrap_or(user),
+            };
+            p.peer.set_target_bitrate(target);
         }
         drop(peers);
         let mut applied = self.applied.lock().unwrap();
-        let changed = match (*applied, target) {
+        let changed = match (*applied, main_cap) {
             (Some(a), Some(t)) => a.abs_diff(t) > a / 33, // ignora mudanças de menos de 3%
             (a, t) => a != t,
         };
         if changed {
-            *applied = target;
-            self.video.set_network(target);
+            *applied = main_cap;
+            self.video.set_network(main_cap);
+        }
+        drop(applied);
+        let mut extras = self.extras.lock().unwrap();
+        let differs = extras.len() != reqs.len()
+            || extras.iter().zip(&reqs).any(|(a, b)| {
+                a.height != b.height
+                    || match (a.cap_bps, b.cap_bps) {
+                        (Some(x), Some(y)) => x.abs_diff(y) > x / 33,
+                        (x, y) => x != y,
+                    }
+            });
+        if differs {
+            *extras = reqs.clone();
+            self.video.set_extras(reqs);
         }
     }
 
@@ -146,12 +280,14 @@ impl HostShared {
                 p.rate.on_report(&Report { kbps: 0, loss: 1.0, qd: 1000.0 }, max, now);
             }
         }
+        self.assign();
         self.apply();
     }
 }
 
 enum Media {
-    Video(Bytes, Duration),
+    /// (versão: 0 = principal, senão a altura; dados; duração)
+    Video(u32, Bytes, Duration),
     Audio(Bytes),
 }
 
@@ -273,28 +409,42 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
     stop_host(&state);
     let (media_tx, mut media_rx) = tokio::sync::mpsc::channel::<Media>(240);
     let peers: Arc<Mutex<HashMap<u64, PeerEntry>>> = Arc::new(Mutex::new(HashMap::new()));
-    let keyframe_needed = Arc::new(AtomicUsize::new(0));
+    let keyframes: Arc<Mutex<std::collections::HashSet<u32>>> = Default::default();
     let user_bps = Arc::new(AtomicU32::new(0));
+    let renditions: Arc<Mutex<(u32, Vec<(u32, u32)>)>> = Default::default();
 
-    // Distribui os pacotes para todos os espectadores conectados.
+    // Distribui os pacotes para os espectadores, cada um na sua versão.
     {
         let peers = peers.clone();
-        let kf = keyframe_needed.clone();
+        let kf = keyframes.clone();
         transport::spawn(async move {
             while let Some(m) = media_rx.recv().await {
-                let targets: Vec<Arc<HostPeer>> = peers
-                    .lock()
-                    .unwrap()
-                    .values()
-                    .filter(|p| p.state != "connecting")
-                    .map(|p| p.peer.clone())
-                    .collect();
+                let targets: Vec<Arc<HostPeer>> = {
+                    let mut peers = peers.lock().unwrap();
+                    let (key, is_keyframe) = match &m {
+                        Media::Video(k, d, _) => (Some(*k), crate::media::has_nal(d, 5)),
+                        Media::Audio(_) => (None, false),
+                    };
+                    peers
+                        .values_mut()
+                        .filter(|p| p.state != "connecting")
+                        .filter_map(|p| {
+                            let Some(k) = key else { return Some(p.peer.clone()) };
+                            // Troca de versão: começa exatamente num keyframe da nova.
+                            if p.pending == Some(k) && is_keyframe {
+                                p.rendition = k;
+                                p.pending = None;
+                            }
+                            (p.rendition == k).then(|| p.peer.clone())
+                        })
+                        .collect()
+                };
                 for p in targets {
                     match &m {
-                        Media::Video(d, dur) => {
+                        Media::Video(k, d, dur) => {
                             // Fila do pacer cheia: quadro descartado, quem perdeu precisa de keyframe.
                             if let Ok(false) = p.send_video(d.clone(), *dur).await {
-                                kf.fetch_add(1, Ordering::SeqCst);
+                                kf.lock().unwrap().insert(*k);
                             }
                         }
                         Media::Audio(d) => {
@@ -310,19 +460,38 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
     let video = {
         let (a1, a2, a3, a4) = (app.clone(), app.clone(), app.clone(), app.clone());
         let tx = media_tx.clone();
-        let kf = keyframe_needed.clone();
+        let kf = keyframes.clone();
         let ub = user_bps.clone();
+        let (rd, pr) = (renditions.clone(), peers.clone());
         VideoPipeline::start(
             config.source.clone(),
             config.video(),
             Callbacks {
-                on_packet: Arc::new(move |data, dur| {
-                    if tx.try_send(Media::Video(Bytes::from(data), dur)).is_err() {
-                        kf.fetch_add(1, Ordering::SeqCst); // fila cheia: quadro perdido
+                on_packet: Arc::new(move |key, data, dur| {
+                    if tx.try_send(Media::Video(key, Bytes::from(data), dur)).is_err() {
+                        kf.lock().unwrap().insert(key); // fila cheia: quadro perdido
                     }
                 }),
                 on_info: Arc::new(move |i| {
                     ub.store(i.target_kbps * 1000, Ordering::Relaxed);
+                    // Qualidades disponíveis mudaram: avisa quem assiste (para o menu).
+                    let now = (i.height, i.extras.iter().copied().zip(i.extras_bps.iter().copied()).collect::<Vec<_>>());
+                    let changed = {
+                        let mut r = rd.lock().unwrap();
+                        let heights_changed = r.0 != now.0 || r.1.iter().map(|x| x.0).ne(now.1.iter().map(|x| x.0));
+                        *r = now.clone();
+                        heights_changed
+                    };
+                    if changed {
+                        let heights: Vec<u32> = std::iter::once(now.0).chain(now.1.iter().map(|x| x.0)).collect();
+                        let msg = serde_json::json!({ "t": "renditions", "h": heights }).to_string();
+                        let targets: Vec<Arc<HostPeer>> = pr.lock().unwrap().values().map(|p| p.peer.clone()).collect();
+                        transport::spawn(async move {
+                            for p in targets {
+                                p.send_message(&msg).await;
+                            }
+                        });
+                    }
                     let _ = a1.emit("host-info", i);
                 }),
                 on_preview: Arc::new(move |j| { let _ = a2.emit("host-preview", j); }),
@@ -335,9 +504,11 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
     let shared = Arc::new(HostShared {
         video: video.clone(),
         peers: peers.clone(),
-        keyframe_needed: keyframe_needed.clone(),
+        keyframes: keyframes.clone(),
         user_bps,
+        renditions,
         applied: Mutex::new(None),
+        extras: Mutex::new(vec![]),
         alive: AtomicBool::new(true),
     });
 
@@ -389,15 +560,24 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
     let public = start_public(&state, &config, &code, since, 0);
     *HOST.lock().unwrap() = Some(HostSession { code: code.clone(), config, shared: shared.clone(), video, audio, opus, peers, media_tx, on_offer, public, since });
 
-    // Keyframes pedidos (no máximo 1 por segundo) e bitrate de quem parou de mandar relatório.
+    // Keyframes pedidos (no máximo 1 por segundo em cada versão) e bitrate de quem parou
+    // de mandar relatório.
     transport::spawn(async move {
-        let mut last_kf = Instant::now() - KEYFRAME_MIN_INTERVAL;
+        let mut last_kf: HashMap<u32, Instant> = HashMap::new();
         let mut last_tick = Instant::now();
         while shared.alive.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            if last_kf.elapsed() >= KEYFRAME_MIN_INTERVAL && shared.keyframe_needed.swap(0, Ordering::SeqCst) > 0 {
-                last_kf = Instant::now();
-                shared.video.keyframe();
+            let due: Vec<u32> = {
+                let mut wanted = shared.keyframes.lock().unwrap();
+                let due: Vec<u32> = wanted.iter().copied().filter(|k| last_kf.get(k).is_none_or(|t| t.elapsed() >= KEYFRAME_MIN_INTERVAL)).collect();
+                for k in &due {
+                    wanted.remove(k);
+                }
+                due
+            };
+            for k in due {
+                last_kf.insert(k, Instant::now());
+                shared.video.keyframe_for(k);
             }
             if last_tick.elapsed() >= congestion::REPORT_INTERVAL {
                 last_tick = Instant::now();
@@ -435,8 +615,12 @@ async fn accept_viewer(
                                 let _ = app.emit("host-viewer-joined", name.clone());
                             }
                             p.state = "connected";
+                            // As qualidades que dá para escolher (menu de quem assiste).
+                            let (peer, msg) = (p.peer.clone(), shared.renditions_msg());
+                            transport::spawn(async move { peer.send_message(&msg).await });
                         }
-                        shared.request_keyframe();
+                        // (a lista está travada aqui: não chamar o que trava de novo)
+                        shared.request_keyframe(map.get(&id).map(|p| p.rendition).unwrap_or(0));
                     }
                     PeerEvent::Disconnected => {
                         if let Some(p) = map.get_mut(&id) {
@@ -461,7 +645,9 @@ async fn accept_viewer(
         Arc::new(move |m: String| {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&m) else { return };
             if v["t"] == "kf" {
-                shared.request_keyframe();
+                shared.request_keyframe_for(id);
+            } else if v["t"] == "quality" {
+                shared.set_quality(id, v["q"].as_str().unwrap_or("auto"));
             } else if v["t"] == "rr" {
                 if let Ok(r) = serde_json::from_value::<Report>(v) {
                     shared.on_report(id, &r);
@@ -487,7 +673,21 @@ async fn accept_viewer(
     };
     let rate = RateController::new(shared.user_bps());
     peer.set_target_bitrate(shared.applied.lock().unwrap().unwrap_or(shared.user_bps()));
-    peers.lock().unwrap().insert(id, PeerEntry { name: name.clone(), state: "connecting", peer: peer.clone(), sid: sid.clone(), rate });
+    peers.lock().unwrap().insert(
+        id,
+        PeerEntry {
+            name: name.clone(),
+            state: "connecting",
+            peer: peer.clone(),
+            sid: sid.clone(),
+            rate,
+            quality: None,
+            rendition: 0,
+            pending: None,
+            joined: Instant::now(),
+            up_since: None,
+        },
+    );
     emit_peers(&app, &peers);
 
     let host_name = HOST.lock().unwrap().as_ref().map(|h| h.config.name.clone()).unwrap_or_default();
@@ -792,6 +992,10 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
             }),
             on_message: Arc::new(move |m| {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&m) {
+                    // Qualidades que o host oferece (menu de engrenagem).
+                    if v["t"] == "renditions" {
+                        emit_viewer(&a2, "viewer-renditions", &id2, v["h"].clone());
+                    }
                     if v["t"] == "bye" {
                         let reason = v["reason"].as_str().unwrap_or("O host encerrou a transmissão.").to_string();
                         emit_viewer(&a2, "viewer-ended", &id2, reason.into());
