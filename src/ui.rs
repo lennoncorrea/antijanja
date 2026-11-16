@@ -8,7 +8,7 @@ use crate::app::AppHandle;
 use crate::{audio, capture, rendezvous, session, settings, transport, updater};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::Value;
-use slint::{ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
+use slint::{ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -80,6 +80,9 @@ struct Ctl {
     toasts: Vec<(i32, String, String, Instant)>,
     toast_seq: i32,
     updating: bool,
+    /// Gravar as configurações / mandar a configuração ao host já está marcado.
+    save_pending: bool,
+    push_pending: bool,
 }
 
 thread_local! {
@@ -121,6 +124,48 @@ fn s(text: impl AsRef<str>) -> SharedString {
 
 fn model<T: Clone + 'static>(v: Vec<T>) -> ModelRc<T> {
     ModelRc::new(VecModel::from(v))
+}
+
+/// Atualiza a lista mostrada no lugar, mexendo só nas linhas que mudaram. Trocar o
+/// modelo inteiro (como era feito, a cada segundo nas streams) faz o Slint recriar todos
+/// os itens: um clique no meio, o volume sendo arrastado e o hover se perdiam.
+fn sync<T: Clone + PartialEq + 'static>(current: ModelRc<T>, new: Vec<T>, set: impl FnOnce(ModelRc<T>)) {
+    let Some(vm) = current.as_any().downcast_ref::<VecModel<T>>() else { return set(model(new)) };
+    let n = new.len();
+    for (i, item) in new.into_iter().enumerate() {
+        if i >= vm.row_count() {
+            vm.push(item);
+        } else if vm.row_data(i).as_ref() != Some(&item) {
+            vm.set_row_data(i, item);
+        }
+    }
+    while vm.row_count() > n {
+        vm.remove(vm.row_count() - 1);
+    }
+}
+
+/// `sync` para listas de linhas que têm a própria lista de itens dentro (cada linha
+/// mantém o modelo dela; só os itens que mudaram são trocados).
+fn sync_rows<R: Clone + PartialEq + 'static, T: Clone + PartialEq + 'static>(
+    current: ModelRc<R>,
+    new: Vec<Vec<T>>,
+    items: impl Fn(&R) -> ModelRc<T>,
+    make: impl Fn(ModelRc<T>) -> R,
+    set: impl FnOnce(ModelRc<R>),
+) {
+    let Some(vm) = current.as_any().downcast_ref::<VecModel<R>>() else {
+        return set(model(new.into_iter().map(|v| make(model(v))).collect()));
+    };
+    let n = new.len();
+    for (i, row) in new.into_iter().enumerate() {
+        match vm.row_data(i) {
+            Some(old) => sync(items(&old), row, |m| vm.set_row_data(i, make(m))),
+            None => vm.push(make(model(row))),
+        }
+    }
+    while vm.row_count() > n {
+        vm.remove(vm.row_count() - 1);
+    }
 }
 
 fn initials(name: &str) -> String {
@@ -239,8 +284,8 @@ fn render_settings(c: &Ctl, ui: &AppWindow) {
     if !st.audio_app.is_empty() && !c.apps.iter().any(|app| app.exe == st.audio_app) {
         options.push(SelectOption { value: s(&st.audio_app), label: s(format!("{} (fechado)", app_name(c, &st.audio_app))) });
     }
-    a.set_app_options(model(options));
-    a.set_apps(model(c.apps.iter().map(|x| AudioApp { exe: s(&x.exe), name: s(&x.name), active: x.active }).collect()));
+    sync(a.get_app_options(), options, |m| a.set_app_options(m));
+    sync(a.get_apps(), c.apps.iter().map(|x| AudioApp { exe: s(&x.exe), name: s(&x.name), active: x.active }).collect(), |m| a.set_apps(m));
 }
 
 fn render_public(c: &Ctl, ui: &AppWindow) {
@@ -281,7 +326,7 @@ fn render_public(c: &Ctl, ui: &AppWindow) {
     if let Some(first) = others.first() {
         a.set_featured(to_stream(first));
     }
-    let rows: Vec<StreamRow> = others
+    let rows: Vec<Vec<Stream>> = others
         .iter()
         .skip(1)
         .copied()
@@ -290,10 +335,10 @@ fn render_public(c: &Ctl, ui: &AppWindow) {
         .map(|chunk| {
             let mut items: Vec<Stream> = chunk.iter().map(|p| to_stream(p)).collect();
             items.resize_with(3, || Stream { blank: true, ..Default::default() });
-            StreamRow { items: model(items) }
+            items
         })
         .collect();
-    a.set_rows(model(rows));
+    sync_rows(a.get_rows(), rows, |r| r.items.clone(), |items| StreamRow { items }, |m| a.set_rows(m));
 }
 
 fn render_watching_list(c: &Ctl, ui: &AppWindow) {
@@ -317,7 +362,8 @@ fn render_watching_list(c: &Ctl, ui: &AppWindow) {
             }
         })
         .collect();
-    ui.global::<App>().set_watching_list(model(items));
+    let a = ui.global::<App>();
+    sync(a.get_watching_list(), items, |m| a.set_watching_list(m));
 }
 
 fn render_picker(c: &mut Ctl, ui: &AppWindow) {
@@ -332,7 +378,7 @@ fn render_picker(c: &mut Ctl, ui: &AppWindow) {
     let shown: Vec<&capture::Source> = list.iter().filter(|x| x.kind == c.picker_tab).collect();
     let cols = if c.picker_tab == "monitor" && shown.len() <= 2 { 2 } else { 3 };
     let current = if c.picker == "switch" { c.source.as_ref().map(|x| x.id.clone()) } else { None };
-    let rows: Vec<SourceRow> = shown
+    let rows: Vec<Vec<Source>> = shown
         .chunks(cols)
         .map(|chunk| {
             let mut items: Vec<Source> = chunk
@@ -353,10 +399,10 @@ fn render_picker(c: &mut Ctl, ui: &AppWindow) {
                 })
                 .collect();
             items.resize_with(cols, || Source { blank: true, ..Default::default() });
-            SourceRow { items: model(items) }
+            items
         })
         .collect();
-    a.set_source_rows(model(rows));
+    sync_rows(a.get_source_rows(), rows, |r| r.items.clone(), |items| SourceRow { items }, |m| a.set_source_rows(m));
 }
 
 fn render_host_code(c: &Ctl, ui: &AppWindow) {
@@ -371,7 +417,8 @@ fn render_host_code(c: &Ctl, ui: &AppWindow) {
 
 fn render_toasts(c: &Ctl, ui: &AppWindow) {
     let items: Vec<Toast> = c.toasts.iter().map(|(id, text, kind, _)| Toast { id: *id, text: s(text), kind: s(kind) }).collect();
-    ui.global::<App>().set_toasts(model(items));
+    let a = ui.global::<App>();
+    sync(a.get_toasts(), items, |m| a.set_toasts(m));
 }
 
 fn toast(c: &mut Ctl, ui: &AppWindow, kind: &str, text: impl Into<String>) {
@@ -494,7 +541,7 @@ fn relayout(c: &Ctl, ui: &AppWindow) {
         session::player_rect(v.id.clone(), 0, 0, 1, 1, false, None);
     }
     a.set_menu_tile(s(if menu_tile { c.menu.clone().unwrap_or_default() } else { String::new() }));
-    a.set_tiles(model(tiles));
+    sync(a.get_tiles(), tiles, |m| a.set_tiles(m));
     a.set_has_focus(c.focus.is_some());
 }
 
@@ -520,8 +567,8 @@ struct GearMenu {
 impl GearMenu {
     fn apply(&self, a: &App) {
         a.set_menu_panel(s(&self.panel));
-        a.set_menu_fps(model(self.fps.clone()));
-        a.set_menu_quality(model(self.quality.clone()));
+        sync(a.get_menu_fps(), self.fps.clone(), |m| a.set_menu_fps(m));
+        sync(a.get_menu_quality(), self.quality.clone(), |m| a.set_menu_quality(m));
         a.set_menu_fps_label(s(&self.fps_label));
         a.set_menu_quality_label(s(&self.quality_label));
         a.set_menu_gen_tag(s(&self.gen_tag));
@@ -551,8 +598,11 @@ fn gear_menu(c: &Ctl, ui: &AppWindow, v: &Viewer) -> GearMenu {
             (0, st) => format!("Original ({st})"),
             (f, _) => format!("{f} fps"),
         };
-        let tag = if f > 0 && stream > 0 && f > stream { format!("FG {}x", ((f as f64 / stream as f64).round() as u32).max(2)) } else { String::new() };
-        let note = if f > 0 && stream > 0 && f < stream { "descarta quadros" } else { "" };
+        // As mesmas contas do framegen::Pacer: gera com 2x ou mais, descarta abaixo de
+        // ~87% do fps da stream; perto dele mostra os quadros como vêm (60 numa de 57).
+        let mult = if f > 0 && stream > 0 { (f as f64 / stream as f64).round() as u32 } else { 0 };
+        let tag = if mult >= 2 { format!("FG {}x", mult.min(8)) } else { String::new() };
+        let note = if f > 0 && stream > 0 && (f as f64) * 1.15 < stream as f64 { "descarta quadros" } else { "" };
         fps.push(option(value, label, tag, note, chosen == f));
     }
     let gen = fps.iter().find(|o| o.selected).map(|o| o.tag.to_string().replace("FG ", "")).unwrap_or_default();
@@ -715,6 +765,36 @@ fn my_name(c: &Ctl) -> String {
     if n.is_empty() { "Anônimo".into() } else { n.chars().take(40).collect() }
 }
 
+/// Grava as configurações daqui a pouco, uma vez só. Arrastar um controle (volume,
+/// bitrate) chamava a gravação no disco a cada pixel.
+fn save_soon(c: &mut Ctl) {
+    if c.save_pending {
+        return;
+    }
+    c.save_pending = true;
+    slint::Timer::single_shot(Duration::from_millis(400), || {
+        with(|c, _| {
+            c.save_pending = false;
+            settings::save(&c.s);
+        });
+    });
+}
+
+/// Manda a configuração ao host daqui a pouco, com o valor mais novo. Antes cada pixel
+/// arrastado num controle abria uma thread que reconfigurava a transmissão.
+fn push_soon(c: &mut Ctl) {
+    if !c.live || c.push_pending {
+        return;
+    }
+    c.push_pending = true;
+    slint::Timer::single_shot(Duration::from_millis(150), || {
+        with(|c, ui| {
+            c.push_pending = false;
+            push_config(c, ui);
+        });
+    });
+}
+
 fn push_config(c: &mut Ctl, _ui: &AppWindow) {
     if !c.live {
         return;
@@ -774,9 +854,9 @@ fn set_setting(c: &mut Ctl, ui: &AppWindow, key: &str, value: &str) {
         }
         _ => return,
     }
-    settings::save(&c.s);
+    save_soon(c);
     render_settings(c, ui);
-    push_config(c, ui);
+    push_soon(c);
 }
 
 fn open_picker(c: &mut Ctl, ui: &AppWindow, mode: &str) {
@@ -1003,6 +1083,22 @@ fn view_fps(c: &Ctl, ui: &AppWindow) -> u32 {
 
 /// Taxa de atualização (Hz) do monitor onde está a janela principal.
 fn monitor_hz(ui: &AppWindow) -> u32 {
+    // Consultar o Windows custa alguns ms e o menu pede isso a cada atualização da tela:
+    // guarda por 2 s (o suficiente para notar a janela indo para outro monitor).
+    thread_local! {
+        static CACHE: std::cell::Cell<Option<(u32, Instant)>> = const { std::cell::Cell::new(None) };
+    }
+    if let Some((hz, at)) = CACHE.get() {
+        if at.elapsed() < Duration::from_secs(2) {
+            return hz;
+        }
+    }
+    let hz = query_monitor_hz(ui);
+    CACHE.set(Some((hz, Instant::now())));
+    hz
+}
+
+fn query_monitor_hz(ui: &AppWindow) -> u32 {
     use windows::Win32::Graphics::Gdi::*;
     let fallback = 60;
     let Some(hwnd) = hwnd_of(ui) else { return fallback };
@@ -1054,7 +1150,7 @@ fn set_viewer_volume(c: &mut Ctl, ui: &AppWindow, id: &str, volume: u32, muted: 
         session::viewer_volume(id.to_string(), volume, muted);
     }
     c.s.view_volume = volume;
-    settings::save(&c.s);
+    save_soon(c);
     relayout(c, ui);
 }
 
@@ -1095,7 +1191,7 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
                     }
                 })
                 .collect();
-            a.set_peers(model(peers));
+            sync(a.get_peers(), peers, |m| a.set_peers(m));
             render_general(c, ui);
         }
         "host-info" => {
@@ -1507,6 +1603,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
             toasts: Vec::new(),
             toast_seq: 0,
             updating: false,
+            save_pending: false,
+            push_pending: false,
         });
     });
 
@@ -1527,6 +1625,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // Ao fechar: encerra a transmissão e as conexões antes de sair.
     ui.window().on_close_requested(|| {
         with(|c, _| {
+            if c.save_pending {
+                settings::save(&c.s);
+            }
             session::host_stop(&c.app);
             for v in &c.viewers {
                 let (app, id) = (c.app.clone(), v.id.clone());
@@ -1654,4 +1755,38 @@ fn autotest() {
             _ => {}
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    #[test]
+    fn sync_updates_in_place() {
+        let m = model(vec![1, 2, 3]);
+        let replaced = Rc::new(Cell::new(false));
+        let r = replaced.clone();
+        sync(m.clone(), vec![1, 5, 3, 4], move |_| r.set(true));
+        assert!(!replaced.get(), "não deve trocar o modelo inteiro");
+        assert_eq!(m.iter().collect::<Vec<_>>(), vec![1, 5, 3, 4]);
+        sync(m.clone(), vec![1, 5], |_| panic!("trocou tudo"));
+        assert_eq!(m.iter().collect::<Vec<_>>(), vec![1, 5]);
+        // Modelo que não é VecModel (o vazio inicial do Slint): troca.
+        let replaced = Rc::new(Cell::new(false));
+        let r = replaced.clone();
+        sync(ModelRc::<i32>::default(), vec![7], move |_| r.set(true));
+        assert!(replaced.get());
+    }
+
+    #[test]
+    fn sync_rows_keeps_each_row_model() {
+        let rows = model(vec![StreamRow { items: model(vec![Stream { name: s("a"), ..Default::default() }]) }]);
+        let inner_before = rows.row_data(0).unwrap().items;
+        sync_rows(rows.clone(), vec![vec![Stream { name: s("b"), ..Default::default() }]], |r| r.items.clone(), |items| StreamRow { items }, |_| panic!("trocou tudo"));
+        let inner_after = rows.row_data(0).unwrap().items;
+        assert!(inner_before == inner_after, "a linha devia manter o mesmo modelo de itens");
+        assert_eq!(inner_after.row_data(0).unwrap().name, "b");
+    }
 }

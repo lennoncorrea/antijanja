@@ -50,6 +50,8 @@ pub struct Player {
     /// Retângulo recortado da janela (menu por cima do vídeo), para não refazer à toa.
     /// (Junto com o tamanho da janela: a região é recalculada se ela mudar.)
     hole: std::cell::Cell<Option<((i32, i32, i32, i32, i32), (i32, i32))>>,
+    /// Posição atual (para não reposicionar a janela à toa a cada atualização da tela).
+    rect: std::cell::Cell<Option<(i32, i32, i32, i32, bool)>>,
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -142,7 +144,7 @@ impl Player {
             .spawn(move || render_thread(raw, rx, ready_tx))
             .map_err(|e| e.to_string())?;
         ready_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| "o player não iniciou".to_string())??;
-        Ok(Player { hwnd: raw, tx, hole: std::cell::Cell::new(None) })
+        Ok(Player { hwnd: raw, tx, hole: std::cell::Cell::new(None), rect: std::cell::Cell::new(None) })
     }
 
     /// Recorta um retângulo da janela do vídeo (relativo a ela, pixels físicos): o que a
@@ -179,6 +181,10 @@ impl Player {
 
     /// Posiciona a área de vídeo (pixels físicos, relativos à janela). Thread principal.
     pub fn set_rect(&self, x: i32, y: i32, w: i32, h: i32, visible: bool) {
+        if self.rect.get() == Some((x, y, w, h, visible)) {
+            return;
+        }
+        self.rect.set(Some((x, y, w, h, visible)));
         unsafe {
             let hwnd = HWND(self.hwnd as *mut _);
             let _ = SetWindowPos(
