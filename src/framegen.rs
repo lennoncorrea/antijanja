@@ -140,6 +140,54 @@ impl FrameGen {
     }
 }
 
+/// Entrega cada quadro decodificado ao player no fps escolhido por quem assiste
+/// (roda na thread de decodificação de cada stream).
+pub struct Presenter {
+    fg: FrameGen,
+    pacer: Pacer,
+    fg_active: bool,
+    prev_ts: Option<u32>,
+}
+
+impl Presenter {
+    pub fn new() -> Self {
+        Self { fg: FrameGen::new(), pacer: Pacer::new(), fg_active: false, prev_ts: None }
+    }
+
+    /// `at`: quando o quadro deve aparecer. Espera até lá e entrega. Devolve quantos
+    /// quadros vão para a tela (0 = descartado; n = n-1 gerados + o real).
+    pub fn present(&mut self, f: Nv12Frame, ts: u32, at: std::time::Instant, view_fps: u32, feed: &crate::player::PlayerFeed) -> u32 {
+        let gap_ms = self.prev_ts.map(|p| ts.wrapping_sub(p) as f64 / 90.0);
+        self.prev_ts = Some(ts);
+        let pacing = self.pacer.decide(at, gap_ms, view_fps);
+        let wants = matches!(pacing, Pacing::Generate(_));
+        if self.fg_active && !wants {
+            self.fg.clear();
+        }
+        self.fg_active = wants;
+        // Todo quadro mostrado passa pelo gerador enquanto ele está ativo (o "anterior"
+        // dele tem que ser o que está na tela).
+        let interp = if wants { self.fg.process(&f, ts) } else { None };
+        match (pacing, interp) {
+            (Pacing::Skip, _) => 0,
+            (Pacing::Generate(n), Some(m)) => {
+                crate::playout::sleep_until(at);
+                // n-1 quadros gerados ao longo do intervalo, depois o real.
+                let base = at.max(std::time::Instant::now());
+                let step = m.gap / n;
+                let steps = (1..n).map(|j| (base + step * (j - 1), j as f32 / n as f32)).collect();
+                feed.push_interp(f, m, steps, base + step * (n - 1));
+                n
+            }
+            _ => {
+                crate::playout::sleep_until(at);
+                feed.push(f);
+                1
+            }
+        }
+    }
+}
+
 /* ======================================================================== GPU */
 
 const SHADER: &str = r#"

@@ -689,9 +689,8 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, name: String,
                 let (mut frames, mut win) = (0u32, Instant::now());
                 let mut stats = ViewerStats { id, ..Default::default() };
                 let mut kbps_avg = 0.0f64;
-                let mut fg = crate::framegen::FrameGen::new();
-                let mut pacer = crate::framegen::Pacer::new();
-                let (mut fg_active, mut shown, mut prev_ts) = (false, 0u32, None::<u32>);
+                let mut presenter = crate::framegen::Presenter::new();
+                let mut shown = 0u32;
                 while let Ok((data, ts)) = drx.recv() {
                     if wait_idr.load(Ordering::SeqCst) && !crate::media::has_nal(&data, 5) {
                         continue; // restos de antes da perda, ainda na fila
@@ -706,37 +705,10 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, name: String,
                             stats.width = f.width;
                             stats.height = f.height;
                             frames += 1;
-                            // Horário certo (absorve a variação da rede e do host).
+                            // Horário certo (absorve a variação da rede e do host), no fps
+                            // escolhido para assistir (descarta, mostra ou gera quadros).
                             let at = playout.schedule(ts);
-                            let gap_ms = prev_ts.map(|p| ts.wrapping_sub(p) as f64 / 90.0);
-                            prev_ts = Some(ts);
-                            // fps escolhido para assistir: descarta, mostra ou gera quadros.
-                            let pacing = pacer.decide(at, gap_ms, view_fps.load(Ordering::Relaxed));
-                            let wants = matches!(pacing, crate::framegen::Pacing::Generate(_));
-                            if fg_active && !wants {
-                                fg.clear();
-                            }
-                            fg_active = wants;
-                            // Todo quadro mostrado passa pelo gerador enquanto ele está ativo
-                            // (o "anterior" dele tem que ser o que está na tela).
-                            let interp = if wants { fg.process(&f, ts) } else { None };
-                            match (pacing, interp) {
-                                (crate::framegen::Pacing::Skip, _) => {}
-                                (crate::framegen::Pacing::Generate(n), Some(m)) => {
-                                    crate::playout::sleep_until(at);
-                                    // n-1 quadros gerados ao longo do intervalo, depois o real.
-                                    let base = at.max(Instant::now());
-                                    let step = m.gap / n;
-                                    let steps = (1..n).map(|j| (base + step * (j - 1), j as f32 / n as f32)).collect();
-                                    feed.push_interp(f, m, steps, base + step * (n - 1));
-                                    shown += n;
-                                }
-                                _ => {
-                                    crate::playout::sleep_until(at);
-                                    feed.push(f);
-                                    shown += 1;
-                                }
-                            }
+                            shown += presenter.present(f, ts, at, view_fps.load(Ordering::Relaxed), &feed);
                         }
                     }
                     stats.buffer_ms = playout.delay_ms().round() as u32;

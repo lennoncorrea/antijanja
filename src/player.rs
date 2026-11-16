@@ -29,6 +29,10 @@ fn tag_of(hwnd: HWND) -> String {
 }
 static LAST_MOVE: AtomicIsize = AtomicIsize::new(0);
 
+/// Testes: (horário do present, gerado?, quanto esperou pelo get_current_texture).
+#[cfg(test)]
+pub static TRACE: std::sync::Mutex<Vec<(Instant, bool, Duration)>> = std::sync::Mutex::new(Vec::new());
+
 enum Msg {
     Frame(Nv12Frame),
     /// Geração de quadros: entre o quadro atual e `next`, mostra o quadro gerado na fração
@@ -425,6 +429,8 @@ impl Gpu {
 
     /// Desenha o quadro atual, ou (`t`) o gerado na fração `t` entre o atual e o outro.
     fn render(&mut self, t: Option<f32>) {
+        #[cfg(test)]
+        let waited = Instant::now();
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             _ => {
@@ -472,8 +478,12 @@ impl Gpu {
                 }
             }
         }
+        #[cfg(test)]
+        let waited = waited.elapsed();
         self.queue.submit([enc.finish()]);
         self.queue.present(frame);
+        #[cfg(test)]
+        TRACE.lock().unwrap().push((Instant::now(), t.is_some(), waited));
     }
 }
 
@@ -491,67 +501,87 @@ fn render_thread(hwnd: isize, rx: Receiver<Msg>, ready: SyncSender<Res<()>>) {
     // Próximos desenhos com horário marcado: Some(t) = quadro gerado na fração t entre o
     // atual e o preparado; None = mostrar o preparado (quadro real).
     let mut schedule: std::collections::VecDeque<(Instant, Option<f32>)> = Default::default();
+    // Quadros que chegaram enquanto a agenda do par anterior ainda não terminou. Na rede
+    // os quadros chegam em grupos; descartar o real que esperava a vez (como antes)
+    // dava um engasgo a cada grupo.
+    let mut queue: std::collections::VecDeque<Msg> = Default::default();
     loop {
-        let first = match schedule.front().copied() {
-            Some((at, step)) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
-                Ok(m) => m,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    schedule.pop_front();
-                    if step.is_none() {
-                        gpu.advance();
-                    }
-                    gpu.render(step);
-                    continue;
-                }
+        let wait = match (schedule.front(), queue.is_empty()) {
+            (Some((at, _)), _) => Some(at.saturating_duration_since(Instant::now())),
+            (None, false) => Some(Duration::ZERO),
+            (None, true) => None,
+        };
+        let msg = match wait {
+            Some(w) => match rx.recv_timeout(w) {
+                Ok(m) => Some(m),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             },
             None => match rx.recv() {
-                Ok(m) => m,
+                Ok(m) => Some(m),
                 Err(_) => break,
             },
         };
-        // Junta as mensagens pendentes: só o quadro mais novo importa.
-        let mut pending = vec![first];
-        while let Ok(m) = rx.try_recv() {
-            pending.push(m);
-        }
         let mut redraw = false;
-        let mut latest: Option<Msg> = None;
-        let mut frames = 0;
-        for m in pending {
+        for m in msg.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             match m {
                 Msg::Stop => return,
                 Msg::Resize(w, h) => {
                     gpu.resize(w, h);
                     redraw = true;
                 }
-                m => {
-                    frames += 1;
-                    latest = Some(m);
-                }
+                m => queue.push_back(m),
             }
         }
-        if latest.is_some() {
-            // Chegou quadro novo antes de terminar os gerados: o real que esperava a vez
-            // passa a ser o atual (é o "A" do próximo par).
+        // Muito atrasado: pula para o quadro mais novo (gerar entre quadros que não são
+        // vizinhos daria errado, então ele entra como quadro normal).
+        if queue.len() > 3 {
             if schedule.iter().any(|(_, step)| step.is_none()) {
                 gpu.advance();
             }
             schedule.clear();
+            let newest = queue.pop_back().unwrap();
+            queue.clear();
+            queue.push_back(match newest {
+                Msg::Interp { next, .. } => Msg::Frame(next),
+                m => m,
+            });
         }
-        match latest {
-            Some(Msg::Frame(f)) => gpu.show(&f),
-            // Atrasado (mais de um quadro na fila): gerar entre quadros que não são
-            // vizinhos daria errado; mostra o mais novo direto.
-            Some(Msg::Interp { next, .. }) if frames > 1 => gpu.show(&next),
-            Some(Msg::Interp { next, mid, steps, next_at }) => {
-                if gpu.prepare_interp(&next, &mid) {
-                    schedule.extend(steps.into_iter().map(|(at, t)| (at, Some(t))));
-                    schedule.push_back((next_at, None));
+        // O que já está na hora.
+        let now = Instant::now();
+        if let Some(&(at, step)) = schedule.front() {
+            if at <= now {
+                schedule.pop_front();
+                if step.is_none() {
+                    gpu.advance();
                 }
+                gpu.render(step);
+                continue;
             }
-            _ if redraw => gpu.render(None),
-            _ => {}
+        }
+        // Agenda vazia: próximo quadro da fila.
+        if schedule.is_empty() {
+            match queue.pop_front() {
+                Some(Msg::Frame(f)) => {
+                    gpu.show(&f);
+                    continue;
+                }
+                Some(Msg::Interp { next, mid, steps, next_at }) => {
+                    if gpu.prepare_interp(&next, &mid) {
+                        // Chegou atrasado (esperou o par anterior): desloca a agenda inteira,
+                        // mantendo o espaçamento entre os quadros.
+                        let first = steps.first().map(|s| s.0).unwrap_or(next_at);
+                        let shift = now.saturating_duration_since(first);
+                        schedule.extend(steps.into_iter().map(|(at, t)| (at + shift, Some(t))));
+                        schedule.push_back((next_at + shift, None));
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if redraw {
+            gpu.render(None);
         }
     }
 }
@@ -571,6 +601,103 @@ mod tests {
                 }
             }
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Caminho completo de quem assiste com fps escolhido: captura a 30 fps -> encoder ->
+    /// decoder -> gerador de quadros -> player numa janela. Mede o intervalo entre os
+    /// quadros que vão para a tela (engasgo = intervalo bem maior que o esperado).
+    /// `cargo test framegen_smoothness -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn framegen_smoothness_end_to_end() {
+        use crate::video::{Callbacks, VideoPipeline, VideoSettings};
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::Arc;
+        crate::media::mf_init().unwrap();
+        let parent = unsafe {
+            CreateWindowExW(WS_EX_TOPMOST, w!("STATIC"), w!("teste fluidez"), WS_POPUP | WS_VISIBLE, 50, 50, 960, 540, None, None, None, None).unwrap()
+        };
+        pump(100);
+        let player = Player::create_in(parent.0 as isize).expect("player");
+        player.set_rect(0, 0, 960, 540, true);
+        let feed = player.feed();
+        let view_fps = Arc::new(AtomicU32::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        // Simula a rede: um quadro em três chega 14 ms adiantado (chegadas em grupos).
+        let jitter = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, Duration)>();
+        let src = crate::capture::list_sources().into_iter().find(|s| s.primary).unwrap();
+        let pipe = VideoPipeline::start(src.id, VideoSettings { res: 1080, fps: 30, bitrate: 8000, cursor: true }, Callbacks {
+            on_packet: Arc::new(move |d, dur| { let _ = tx.send((d, dur)); }),
+            on_info: Arc::new(|_| {}), on_preview: Arc::new(|_| {}),
+            on_error: Arc::new(|e| println!("ERRO {e}")), on_source_closed: Arc::new(|| {}),
+        }).unwrap();
+        let (vf, st, jt) = (view_fps.clone(), stop.clone(), jitter.clone());
+        let late = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+        let lt = late.clone();
+        let decode = std::thread::spawn(move || {
+            crate::media::mf_init().unwrap();
+            unsafe { windows::Win32::Media::timeBeginPeriod(1); }
+            let mut dec = crate::media::Decoder::new().unwrap();
+            let mut playout = crate::playout::Playout::new();
+            let mut presenter = crate::framegen::Presenter::new();
+            let mut ts = 0u32;
+            let mut count = 0u64;
+            while !st.load(Ordering::SeqCst) {
+                let Ok((data, dur)) = rx.recv_timeout(Duration::from_millis(500)) else { continue };
+                ts = ts.wrapping_add((dur.as_secs_f64() * 90000.0).round() as u32);
+                for f in dec.decode(&data, 0).unwrap_or_default() {
+                    count += 1;
+                    let mut at = playout.schedule(ts);
+                    if jt.load(Ordering::Relaxed) && count % 3 == 1 {
+                        at -= Duration::from_millis(14);
+                    }
+                    presenter.present(f, ts, at, vf.load(Ordering::Relaxed), &feed);
+                    // Quanto passou do horário ao entregar (o gerador roda antes da espera).
+                    lt.lock().unwrap().push(Instant::now().saturating_duration_since(at).as_secs_f64() * 1000.0);
+                }
+            }
+        });
+        pump(1500);
+        let mut results = vec![];
+        for (target, irregular) in [(0u32, false), (60, false), (120, false), (60, true), (120, true)] {
+            view_fps.store(target, Ordering::Relaxed);
+            jitter.store(irregular, Ordering::Relaxed);
+            pump(1000); // estabiliza
+            TRACE.lock().unwrap().clear();
+            late.lock().unwrap().clear();
+            pump(5000);
+            let trace = TRACE.lock().unwrap().clone();
+            let iv: Vec<f64> = trace.windows(2).map(|w| (w[1].0 - w[0].0).as_secs_f64() * 1000.0).collect();
+            let expect = 1000.0 / if target == 0 { 30.0 } else { target as f64 };
+            let mean = iv.iter().sum::<f64>() / iv.len().max(1) as f64;
+            let sd = (iv.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / iv.len().max(1) as f64).sqrt();
+            let hitches = iv.iter().filter(|&&x| x > expect * 1.8).count();
+            let max = iv.iter().cloned().fold(0.0, f64::max);
+            let generated = trace.iter().filter(|t| t.1).count();
+            let wait_max = trace.iter().map(|t| t.2.as_secs_f64() * 1000.0).fold(0.0, f64::max);
+            let wait_avg = trace.iter().map(|t| t.2.as_secs_f64() * 1000.0).sum::<f64>() / trace.len().max(1) as f64;
+            let lt = late.lock().unwrap();
+            let late_max = lt.iter().cloned().fold(0.0, f64::max);
+            results.push((target, irregular, hitches, trace.len() as f64 / 5.0));
+            println!(
+                "{}alvo {:>3}: {:.1} quadros/s na tela ({} gerados) | intervalo médio {:.2} ms (esperado {:.2}), desvio {:.2}, máx {:.1}, {} engasgos | espera da tela média {:.2} ms, máx {:.1} | decodificação atrasada até {:.1} ms",
+                if irregular { "[chegadas irregulares] " } else { "" },
+                if target == 0 { "orig".to_string() } else { target.to_string() },
+                trace.len() as f64 / 5.0, generated, mean, expect, sd, max, hitches, wait_avg, wait_max, late_max
+            );
+        }
+        stop.store(true, Ordering::SeqCst);
+        pipe.stop();
+        decode.join().unwrap();
+        player.destroy();
+        unsafe { let _ = DestroyWindow(parent); }
+        for (target, irregular, hitches, fps) in results {
+            if target > 0 {
+                assert!(hitches <= 5, "alvo {target} (irregular: {irregular}): {hitches} engasgos");
+                assert!(fps > target as f64 * 0.9, "alvo {target} (irregular: {irregular}): só {fps:.1} quadros/s");
+            }
         }
     }
 
