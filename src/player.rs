@@ -4,6 +4,7 @@
 //! A janela-filha fica por cima da área de vídeo da interface; a interface (WebView) informa
 //! o retângulo dessa área. Eventos de mouse/teclado na janela-filha viram eventos Tauri.
 
+use crate::agenda::{Action, Agenda, Entry};
 use crate::framegen::{Interpolator, Midpoint, PlaneViews};
 use crate::media::Nv12Frame;
 use std::num::NonZeroIsize;
@@ -529,20 +530,9 @@ fn render_thread(hwnd: isize, rx: Receiver<Msg>, ready: SyncSender<Res<()>>) {
             return;
         }
     };
-    // Próximos desenhos com horário marcado: Some(t) = quadro gerado na fração t entre o
-    // atual e o preparado; None = mostrar o preparado (quadro real).
-    let mut schedule: std::collections::VecDeque<(Instant, Option<f32>)> = Default::default();
-    // Quadros que chegaram enquanto a agenda do par anterior ainda não terminou. Na rede
-    // os quadros chegam em grupos; descartar o real que esperava a vez (como antes)
-    // dava um engasgo a cada grupo.
-    let mut queue: std::collections::VecDeque<Msg> = Default::default();
+    let mut agenda: Agenda<Nv12Frame, Midpoint> = Agenda::new();
     loop {
-        let wait = match (schedule.front(), queue.is_empty()) {
-            (Some((at, _)), _) => Some(at.saturating_duration_since(Instant::now())),
-            (None, false) => Some(Duration::ZERO),
-            (None, true) => None,
-        };
-        let msg = match wait {
+        let msg = match agenda.wait(Instant::now()) {
             Some(w) => match rx.recv_timeout(w) {
                 Ok(m) => Some(m),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
@@ -561,58 +551,28 @@ fn render_thread(hwnd: isize, rx: Receiver<Msg>, ready: SyncSender<Res<()>>) {
                     gpu.resize(w, h);
                     redraw = true;
                 }
-                m => queue.push_back(m),
+                Msg::Frame(f) => agenda.push(Entry::Frame(f)),
+                Msg::Interp { next, mid, steps, next_at } => agenda.push(Entry::Pair { next, mid, steps, next_at }),
             }
         }
-        // Muito atrasado: pula para o quadro mais novo (gerar entre quadros que não são
-        // vizinhos daria errado, então ele entra como quadro normal).
-        if queue.len() > 3 {
-            if schedule.iter().any(|(_, step)| step.is_none()) {
-                gpu.advance();
-            }
-            schedule.clear();
-            let newest = queue.pop_back().unwrap();
-            queue.clear();
-            queue.push_back(match newest {
-                Msg::Interp { next, .. } => Msg::Frame(next),
-                m => m,
-            });
-        }
-        // O que já está na hora.
-        let now = Instant::now();
-        if let Some(&(at, step)) = schedule.front() {
-            if at <= now {
-                schedule.pop_front();
+        match agenda.next(Instant::now()) {
+            Action::Draw(step) => {
                 if step.is_none() {
                     gpu.advance();
                 }
                 gpu.render(step);
-                continue;
             }
-        }
-        // Agenda vazia: próximo quadro da fila.
-        if schedule.is_empty() {
-            match queue.pop_front() {
-                Some(Msg::Frame(f)) => {
-                    gpu.show(&f);
-                    continue;
-                }
-                Some(Msg::Interp { next, mid, steps, next_at }) => {
-                    if gpu.prepare_interp(&next, &mid) {
-                        // Chegou atrasado (esperou o par anterior): desloca a agenda inteira,
-                        // mantendo o espaçamento entre os quadros.
-                        let first = steps.first().map(|s| s.0).unwrap_or(next_at);
-                        let shift = now.saturating_duration_since(first);
-                        schedule.extend(steps.into_iter().map(|(at, t)| (at + shift, Some(t))));
-                        schedule.push_back((next_at + shift, None));
-                    }
-                    continue;
-                }
-                _ => {}
+            Action::Show(f) => gpu.show(&f),
+            Action::Prepare(next, mid) => {
+                let ok = gpu.prepare_interp(&next, &mid);
+                agenda.prepared(ok, Instant::now());
             }
-        }
-        if redraw {
-            gpu.render(None);
+            Action::Advance => gpu.advance(),
+            Action::Idle => {
+                if redraw {
+                    gpu.render(None);
+                }
+            }
         }
     }
 }
