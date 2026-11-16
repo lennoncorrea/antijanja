@@ -17,14 +17,16 @@ use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::transport::RTCIceServer;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp::codec::h264::H264Packet;
-use rtc::rtp::packetizer::Depacketizer;
+use rtc::rtp::packetizer::{Depacketizer, Packetizer};
 use rtc::rtp_transceiver::rtp_sender::{
     RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
 };
 use rtc::rtp_transceiver::{PayloadType, RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
+use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
@@ -47,6 +49,14 @@ pub static KEYFRAME_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic
 pub static TEST_REORDER_PERMILLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const OPUS_PT: u8 = 111;
 const ICE_TIMEOUT: Duration = Duration::from_secs(4);
+const RTP_MTU: usize = 1200;
+/// Ritmo do pacer em relação ao bitrate alvo: folga para keyframes (o libwebrtc usa 2,5x).
+const PACING_FACTOR: f64 = 2.5;
+const MIN_PACING_BPS: u64 = 2_000_000;
+/// Rajada máxima que o pacer solta de uma vez depois de ficar parado.
+const PACER_BURST: Duration = Duration::from_millis(5);
+/// Quadros esperando no pacer (~0,75 s a 60 fps). Cheio: a rede não está dando conta.
+const PACER_QUEUE: usize = 45;
 
 pub fn runtime() -> Arc<dyn Runtime> {
     static RT: OnceLock<Arc<dyn Runtime>> = OnceLock::new();
@@ -189,26 +199,49 @@ async fn wait_gathering(rx: &mut webrtc::runtime::Receiver<()>) {
     let _ = futures::future::select(recv, timeout).await;
 }
 
-fn new_track(kind: RtpCodecKind, codec: RTCRtpCodec) -> Res<(Arc<TrackLocalStaticSample>, u32)> {
+fn media_track(kind: RtpCodecKind, codec: RTCRtpCodec) -> Res<(MediaStreamTrack, u32)> {
     let mut b = [0u8; 4];
     getrandom::fill(&mut b).map_err(err)?;
     let ssrc = u32::from_le_bytes(b);
-    let track = TrackLocalStaticSample::new(
-        Instant::now(),
-        MediaStreamTrack::new(
-            "antijanja".into(),
-            format!("aj-{kind}"),
-            format!("aj-{kind}"),
-            kind,
-            vec![RTCRtpEncodingParameters {
-                rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() },
-                codec,
-                ..Default::default()
-            }],
-        ),
-    )
-    .map_err(err)?;
-    Ok((Arc::new(track), ssrc))
+    let track = MediaStreamTrack::new(
+        "antijanja".into(),
+        format!("aj-{kind}"),
+        format!("aj-{kind}"),
+        kind,
+        vec![RTCRtpEncodingParameters {
+            rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() },
+            codec,
+            ..Default::default()
+        }],
+    );
+    Ok((track, ssrc))
+}
+
+fn new_track(kind: RtpCodecKind, codec: RTCRtpCodec) -> Res<(Arc<TrackLocalStaticSample>, u32)> {
+    let (track, ssrc) = media_track(kind, codec)?;
+    Ok((Arc::new(TrackLocalStaticSample::new(Instant::now(), track).map_err(err)?), ssrc))
+}
+
+/// Solta os pacotes de vídeo no ritmo `rate` (b/s), em vez de todos de uma vez: um
+/// keyframe inteiro em rajada enche a fila de roteadores e vira perda.
+async fn pace(video: Arc<TrackLocalStaticRTP>, mut rx: tokio::sync::mpsc::Receiver<Vec<rtc::rtp::Packet>>, rate: Arc<AtomicU64>) {
+    let mut next = tokio::time::Instant::now();
+    while let Some(frame) = rx.recv().await {
+        for pkt in frame {
+            let now = tokio::time::Instant::now();
+            if next + PACER_BURST < now {
+                next = now - PACER_BURST;
+            }
+            if next > now {
+                tokio::time::sleep_until(next).await;
+            }
+            let bits = ((pkt.payload.len() + 40) * 8) as f64; // + cabeçalhos IP/UDP/RTP
+            next += Duration::from_secs_f64(bits / rate.load(Ordering::Relaxed).max(1) as f64);
+            // Erro (ex.: faixa ainda não ligada à conexão): perde só este pacote. O pacer
+            // termina quando o HostPeer some (o canal fecha).
+            let _ = video.write_rtp(pkt).await;
+        }
+    }
 }
 
 /* ========================================================================== */
@@ -218,9 +251,11 @@ fn new_track(kind: RtpCodecKind, codec: RTCRtpCodec) -> Res<(Arc<TrackLocalStati
 /// Um espectador conectado ao host.
 pub struct HostPeer {
     pub pc: Arc<dyn PeerConnection>,
-    video: Arc<TrackLocalStaticSample>,
+    /// Quebra cada quadro H.264 em pacotes RTP (o envio fica com o pacer).
+    packetizer: Mutex<Box<dyn Packetizer>>,
+    pacer: tokio::sync::mpsc::Sender<Vec<rtc::rtp::Packet>>,
+    pacing_bps: Arc<AtomicU64>,
     audio: Arc<TrackLocalStaticSample>,
-    vssrc: u32,
     assrc: u32,
     pts: Mutex<Option<(PayloadType, PayloadType)>>,
     senders: Vec<Arc<dyn webrtc::rtp_transceiver::RtpSender>>,
@@ -254,7 +289,8 @@ impl HostPeer {
         let handler = Arc::new(Handler { gathered: gtx, on_state, on_track: None, on_dc: Some(on_dc) });
         let pc = build_pc(handler, stun).await?;
 
-        let (video, vssrc) = new_track(RtpCodecKind::Video, video_codec())?;
+        let (video_track, vssrc) = media_track(RtpCodecKind::Video, video_codec())?;
+        let video = Arc::new(TrackLocalStaticRTP::new(video_track));
         let (audio, assrc) = new_track(RtpCodecKind::Audio, audio_codec())?;
         let vs = pc.add_track(video.clone() as Arc<dyn TrackLocal>).await.map_err(err)?;
         let a_s = pc.add_track(audio.clone() as Arc<dyn TrackLocal>).await.map_err(err)?;
@@ -265,8 +301,24 @@ impl HostPeer {
         wait_gathering(&mut grx).await;
         let sdp = pc.local_description().await.ok_or("sem descrição local")?.sdp;
 
+        let packetizer: Box<dyn Packetizer> = Box::new(rtc::rtp::packetizer::new_packetizer(
+            Instant::now(),
+            RTP_MTU,
+            0, // o payload type negociado vai em cada pacote
+            vssrc,
+            video_codec().payloader().map_err(err)?,
+            Box::new(rtc::rtp::sequence::new_random_sequencer()),
+            90000,
+        ));
+        let (pacer, pacer_rx) = tokio::sync::mpsc::channel(PACER_QUEUE);
+        // Até saber o alvo (logo que o espectador entra), solta com folga.
+        let pacing_bps = Arc::new(AtomicU64::new(40_000_000));
+        spawn(pace(video.clone(), pacer_rx, pacing_bps.clone()));
         let peer = Arc::new(HostPeer {
-            pc, video, audio, vssrc, assrc,
+            pc, audio, assrc,
+            packetizer: Mutex::new(packetizer),
+            pacer,
+            pacing_bps,
             pts: Mutex::new(None),
             senders: vec![vs, a_s],
             dc: Mutex::new(None),
@@ -299,13 +351,30 @@ impl HostPeer {
         Some(pts)
     }
 
-    pub async fn send_video(&self, data: Bytes, duration: Duration) -> Res<()> {
+    /// Entrega um quadro ao pacer. `Ok(false)`: a fila do pacer está cheia e o quadro foi
+    /// descartado (o espectador vai precisar de um keyframe).
+    pub async fn send_video(&self, data: Bytes, duration: Duration) -> Res<bool> {
         let (vpt, _) = self.payload_types().await.ok_or("sem codec negociado")?;
-        self.video
-            .sample_writer(self.vssrc, vpt)
-            .write_sample(&Sample { data, duration, ..Sample::new(Instant::now()) })
-            .await
-            .map_err(err)
+        let samples = (duration.as_secs_f64() * 90000.0).round() as u32;
+        let mut packetizer = self.packetizer.lock().unwrap();
+        if self.pacer.capacity() == 0 {
+            // Descarta antes de numerar os pacotes (senão o espectador veria um buraco
+            // e pediria retransmissão de algo que nunca saiu), mas avança o relógio RTP.
+            packetizer.skip_samples(samples);
+            return Ok(false);
+        }
+        let mut packets = packetizer.packetize(Instant::now(), &data, samples).map_err(err)?;
+        drop(packetizer);
+        for p in &mut packets {
+            p.header.payload_type = vpt;
+        }
+        Ok(self.pacer.try_send(packets).is_ok())
+    }
+
+    /// Bitrate alvo atual do vídeo (b/s): o pacer solta os pacotes com folga sobre ele.
+    pub fn set_target_bitrate(&self, bps: u32) {
+        let pacing = ((bps as f64 * PACING_FACTOR) as u64).max(MIN_PACING_BPS);
+        self.pacing_bps.store(pacing, Ordering::Relaxed);
     }
 
     pub async fn send_audio(&self, data: Bytes, duration: Duration) -> Res<()> {
@@ -437,6 +506,7 @@ async fn receive_track(track: Arc<dyn TrackRemote>, sinks: ViewerSinks, dc: Arc<
 
     let mut jb = JitterBuffer::new();
     let mut asm = FrameAssembler::new();
+    let mut meter = NetMeter::new(Instant::now());
     let mut last_request = Instant::now() - Duration::from_secs(10);
 
     // Simulação de rede (só em testes): segura um pacote e solta depois do próximo.
@@ -466,6 +536,7 @@ async fn receive_track(track: Arc<dyn TrackRemote>, sinks: ViewerSinks, dc: Arc<
             Some(_) => continue,
         };
 
+        meter.on_packet(Instant::now(), p.payload.len(), p.header.timestamp);
         let permille = TEST_REORDER_PERMILLE.load(std::sync::atomic::Ordering::Relaxed);
         let mut batch = Vec::with_capacity(2);
         if permille > 0 {
@@ -489,10 +560,95 @@ async fn receive_track(track: Arc<dyn TrackRemote>, sinks: ViewerSinks, dc: Arc<
                 asm.push(&ready, &sinks);
             }
         }
-        if asm.needs_keyframe() && last_request.elapsed() > Duration::from_millis(300) {
+        if asm.needs_keyframe() && last_request.elapsed() > KEYFRAME_REQUEST_INTERVAL {
             last_request = Instant::now();
             request_keyframe(&track).await;
         }
+        // Relatório para o bitrate adaptativo do host.
+        if let Some(r) = meter.report(Instant::now(), jb.received, jb.last_ext) {
+            if let (Some(dc), Ok(json)) = (dc.get(), serde_json::to_value(r)) {
+                let mut msg = json;
+                msg["t"] = "rr".into();
+                let _ = dc.send_text(&msg.to_string()).await;
+            }
+        }
+    }
+}
+
+/// Intervalo mínimo entre pedidos de keyframe do espectador. Cada keyframe é ~10x um
+/// quadro normal: pedir a cada 300 ms (como antes) triplicava o bitrate justamente quando a
+/// rede já estava perdendo pacotes, e piorava a perda.
+const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Medidas do espectador para o bitrate adaptativo do host (ver `congestion`).
+struct NetMeter {
+    start: Instant,
+    window_start: Instant,
+    bytes: usize,
+    /// (pacotes recebidos, maior número de sequência) no começo da janela.
+    at_start: Option<(u64, u64)>,
+    last_ts: Option<u32>,
+    ext_ts: i64,
+    /// Trânsito (chegada − horário RTP, ms) do 1º pacote de cada quadro nesta janela.
+    transits: Vec<f64>,
+    /// Trânsitos dos últimos 10 s (o mínimo é a referência de "sem fila").
+    history: std::collections::VecDeque<(f64, f64)>,
+}
+
+impl NetMeter {
+    fn new(now: Instant) -> Self {
+        Self { start: now, window_start: now, bytes: 0, at_start: None, last_ts: None, ext_ts: 0, transits: vec![], history: Default::default() }
+    }
+
+    fn on_packet(&mut self, now: Instant, payload: usize, rtp_ts: u32) {
+        self.bytes += payload;
+        if self.last_ts == Some(rtp_ts) {
+            return;
+        }
+        // Primeiro pacote de um quadro: o atraso dele não inclui o envio espaçado do
+        // próprio quadro (pacer), só a fila que já havia antes.
+        if let Some(last) = self.last_ts {
+            self.ext_ts += rtp_ts.wrapping_sub(last) as i32 as i64;
+        }
+        self.last_ts = Some(rtp_ts);
+        let local = now.duration_since(self.start).as_secs_f64() * 1000.0;
+        let transit = local - self.ext_ts as f64 / 90.0;
+        self.transits.push(transit);
+        self.history.push_back((local, transit));
+        while self.history.front().is_some_and(|&(t, _)| local - t > 10_000.0) {
+            self.history.pop_front();
+        }
+    }
+
+    /// A cada `congestion::REPORT_INTERVAL`: taxa, perda e fila da janela que acabou.
+    fn report(&mut self, now: Instant, received: u64, highest: Option<u64>) -> Option<crate::congestion::Report> {
+        let highest = highest?;
+        let Some((rx0, hi0)) = self.at_start else {
+            self.at_start = Some((received, highest));
+            self.window_start = now;
+            self.bytes = 0;
+            self.transits.clear();
+            return None;
+        };
+        let el = now.duration_since(self.window_start);
+        if el < crate::congestion::REPORT_INTERVAL {
+            return None;
+        }
+        let expected = highest.saturating_sub(hi0);
+        let got = received.saturating_sub(rx0);
+        let loss = if expected > 0 { (1.0 - got as f64 / expected as f64).clamp(0.0, 1.0) as f32 } else { 0.0 };
+        let min = self.history.iter().map(|&(_, t)| t).fold(f64::INFINITY, f64::min);
+        let qd = if self.transits.is_empty() || !min.is_finite() {
+            0.0
+        } else {
+            (self.transits.iter().sum::<f64>() / self.transits.len() as f64 - min).max(0.0) as f32
+        };
+        let kbps = (self.bytes as f64 * 8.0 / el.as_secs_f64() / 1000.0) as u32;
+        self.at_start = Some((received, highest));
+        self.window_start = now;
+        self.bytes = 0;
+        self.transits.clear();
+        Some(crate::congestion::Report { kbps, loss, qd })
     }
 }
 
@@ -502,6 +658,8 @@ struct JitterBuffer {
     next: Option<u64>,
     last_ext: Option<u64>,
     gap_since: Option<Instant>,
+    /// Pacotes únicos recebidos (para a perda do relatório).
+    received: u64,
 }
 
 /// Quanto esperar por um pacote que faltou (a retransmissão leva ~1 RTT + intervalo do NACK).
@@ -510,7 +668,7 @@ const MAX_BUFFERED: usize = 2000;
 
 impl JitterBuffer {
     fn new() -> Self {
-        Self { buf: Default::default(), next: None, last_ext: None, gap_since: None }
+        Self { buf: Default::default(), next: None, last_ext: None, gap_since: None, received: 0 }
     }
 
     /// Número de sequência estendido (sem a virada de 16 bits).
@@ -536,7 +694,9 @@ impl JitterBuffer {
         if ext < next {
             return Vec::new(); // atrasado demais ou duplicado
         }
-        self.buf.insert(ext, p);
+        if self.buf.insert(ext, p).is_none() {
+            self.received += 1;
+        }
         let out = self.drain();
         if self.buf.len() > MAX_BUFFERED {
             let mut more = self.give_up();
@@ -640,6 +800,33 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn net_meter_measures_rate_loss_and_queue() {
+        let t0 = Instant::now();
+        let mut m = NetMeter::new(t0);
+        let (mut received, mut highest) = (0u64, 1000u64);
+        // 30 fps, 4 pacotes de 1000 bytes por quadro, sem fila.
+        let frame = |m: &mut NetMeter, i: u32, delay_ms: u64, lose: bool, received: &mut u64, highest: &mut u64| {
+            let at = t0 + Duration::from_micros(i as u64 * 33_333 + delay_ms * 1000);
+            for k in 0..4 {
+                *highest += 1;
+                if lose && k == 3 { continue; }
+                *received += 1;
+                m.on_packet(at, 1000, 7777 + i * 3000);
+            }
+        };
+        assert!(m.report(t0, received, Some(highest)).is_none(), "primeira chamada só marca o início");
+        for i in 0..15 { frame(&mut m, i, 0, false, &mut received, &mut highest); }
+        let r = m.report(t0 + Duration::from_millis(500), received, Some(highest)).unwrap();
+        assert!(r.loss < 0.01 && r.qd < 2.0, "{r:?}");
+        assert!((900..1000).contains(&r.kbps), "15 quadros x 4 KB em 0,5 s = 960 kb/s: {r:?}");
+        // Fila crescendo (cada quadro 10 ms mais atrasado) e 1 de 4 pacotes perdidos.
+        for i in 15..30 { frame(&mut m, i, (i as u64 - 14) * 10, true, &mut received, &mut highest); }
+        let r = m.report(t0 + Duration::from_millis(1000), received, Some(highest)).unwrap();
+        assert!((r.loss - 0.25).abs() < 0.02, "{r:?}");
+        assert!(r.qd > 50.0, "{r:?}");
+    }
+
     /// Host e espectador na mesma máquina: vídeo codificado de verdade atravessa o WebRTC
     /// e é decodificado do outro lado.
     #[test]
@@ -660,12 +847,17 @@ mod tests {
         };
         let (viewer, offer) = block_on(ViewerSession::offer(sinks, false)).expect("oferta");
         let kf = keyframe_requests.clone();
+        let reports = Arc::new(Mutex::new(Vec::<crate::congestion::Report>::new()));
+        let rr = reports.clone();
         let (connected_tx, connected_rx) = std::sync::mpsc::channel();
         let (peer, answer) = block_on(HostPeer::answer(
             offer,
             false,
             Arc::new(move |e| { println!("host: {e:?}"); if e == PeerEvent::Connected { let _ = connected_tx.send(()); } }),
-            Arc::new(move |m| { if m.contains("kf") { kf.fetch_add(1, Ordering::SeqCst); } }),
+            Arc::new(move |m| {
+                if m.contains("\"kf\"") { kf.fetch_add(1, Ordering::SeqCst); }
+                if let Ok(r) = serde_json::from_str::<crate::congestion::Report>(&m) { rr.lock().unwrap().push(r); }
+            }),
         ))
         .expect("resposta");
         block_on(viewer.accept_answer(answer)).expect("aceitar resposta");
@@ -713,6 +905,10 @@ mod tests {
             start.elapsed(), received.load(Ordering::SeqCst), decoded.load(Ordering::SeqCst), keyframe_requests.load(Ordering::SeqCst)
         );
         assert!(decoded.load(Ordering::SeqCst) >= 150);
+        let reports = reports.lock().unwrap();
+        println!("relatórios do espectador: {}; últimos: {:?}", reports.len(), &reports[reports.len().saturating_sub(3)..]);
+        assert!(reports.len() >= 4, "o espectador devia mandar um relatório a cada 500 ms");
+        assert!(reports.iter().all(|r| r.loss < 0.05), "perda na mesma máquina? {reports:?}");
     }
 
     fn stats(label: &str, times: &[Instant]) {
@@ -741,8 +937,10 @@ mod tests {
             BROKEN_FRAMES.store(0, SeqCst);
             KEYFRAME_REQUESTS.store(0, SeqCst);
             let (vtx, vrx) = std::sync::mpsc::channel::<(Vec<u8>, u32)>();
+            let (frames_in, queued, dropped) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let fi = frames_in.clone();
             let sinks = ViewerSinks {
-                on_video: Arc::new(move |f, ts| { let _ = vtx.send((f, ts)); }),
+                on_video: Arc::new(move |f, ts| { fi.fetch_add(1, SeqCst); let _ = vtx.send((f, ts)); }),
                 on_audio: Arc::new(|_| {}),
                 on_state: Arc::new(|_| {}),
                 on_message: Arc::new(|_| {}),
@@ -763,8 +961,17 @@ mod tests {
                 let mut dec = crate::media::Decoder::new().unwrap();
                 let mut playout = crate::playout::Playout::new();
                 let mut times = Vec::new();
-                while let Ok((f, ts)) = vrx.recv_timeout(Duration::from_secs(2)) {
-                    if let Ok(out) = dec.decode(&f, 0) {
+                let (mut ok, mut errs) = (0usize, 0usize);
+                // O 1º quadro decodificável (keyframe) pode levar alguns segundos para chegar.
+                let mut wait = Duration::from_secs(10);
+                while let Ok((f, ts)) = vrx.recv_timeout(wait) {
+                    wait = Duration::from_secs(2);
+                    let res = dec.decode(&f, 0);
+                    match &res {
+                        Ok(o) => ok += o.len(),
+                        Err(e) => { if errs == 0 { println!("  erro no decoder: {e}"); } errs += 1; }
+                    }
+                    if let Ok(out) = res {
                         for _ in out {
                             if smooth {
                                 crate::playout::sleep_until(playout.schedule(ts));
@@ -773,16 +980,23 @@ mod tests {
                         }
                     }
                 }
+                println!("  decoder: {ok} quadros, {errs} erros");
                 times
             });
 
             let src = crate::capture::list_sources().into_iter().find(|s| s.primary).unwrap();
-            let (p2, ht) = (peer.clone(), host_times.clone());
+            let (p2, ht, q2, d2) = (peer.clone(), host_times.clone(), queued.clone(), dropped.clone());
             let pipe = VideoPipeline::start(src.id, VideoSettings { res: 1080, fps: 60, bitrate: 10000, cursor: true }, Callbacks {
                 on_packet: Arc::new(move |d, dur| {
                     ht.lock().unwrap().push(Instant::now());
                     let p = p2.clone();
-                    spawn(async move { let _ = p.send_video(Bytes::from(d), dur).await; });
+                    let (q, dr) = (q2.clone(), d2.clone());
+                    spawn(async move {
+                        match p.send_video(Bytes::from(d), dur).await {
+                            Ok(true) => q.fetch_add(1, SeqCst),
+                            _ => dr.fetch_add(1, SeqCst),
+                        };
+                    });
                 }),
                 on_info: Arc::new(|_| {}), on_preview: Arc::new(|_| {}),
                 on_error: Arc::new(|e| println!("ERRO {e}")), on_source_closed: Arc::new(|| {}),
@@ -801,6 +1015,7 @@ mod tests {
             stats("  host (saída do encoder)", &ht[ht.len().min(60)..]);
             stats("  espectador (decodificados)", &times[times.len().min(60)..]);
             println!("  quadros descartados: {}, pedidos de keyframe: {}", BROKEN_FRAMES.load(SeqCst), KEYFRAME_REQUESTS.load(SeqCst));
+            println!("  host: {} quadros no pacer, {} recusados; espectador: {} quadros completos", queued.load(SeqCst), dropped.load(SeqCst), frames_in.load(SeqCst));
         }
         TEST_REORDER_PERMILLE.store(0, SeqCst);
     }

@@ -836,6 +836,14 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
             a.set_stat_res(s(format!("{}×{}", f("width") as u32, f("height") as u32)));
             a.set_stat_fps(s((f("fps").round() as u32).to_string()));
             a.set_stat_rate(s(format!("{} de {}", format_rate(f("kbps")), format_rate(f("target_kbps")))));
+            // Bitrate adaptativo: a rede de alguém que assiste não aguenta o escolhido.
+            let (net_kbps, net_fps) = (f("net_kbps"), f("net_fps") as u32);
+            a.set_stat_net(s(match (net_kbps > 0.0, net_fps > 0) {
+                (false, false) => String::new(),
+                (true, false) => format!("Rede: até {}", format_rate(net_kbps)),
+                (false, true) => format!("Rede: {net_fps} fps"),
+                (true, true) => format!("Rede: até {}, {net_fps} fps", format_rate(net_kbps)),
+            }));
             a.set_encoder_line(s(format!(
                 "H.264 com {}{}",
                 v["encoder"].as_str().unwrap_or("?"),

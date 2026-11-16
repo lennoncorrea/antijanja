@@ -291,7 +291,9 @@ impl Encoder {
                 set_codec_value(c, &CODECAPI_AVEncCommonRateControlMode, VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32));
                 set_codec_value(c, &CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bitrate));
                 set_codec_value(c, &CODECAPI_AVEncCommonBufferSize, VARIANT::from(bitrate)); // 1 s de buffer
-                set_codec_value(c, &CODECAPI_AVEncMPVGOPSize, VARIANT::from(fps * 4)); // keyframe a cada ~4 s
+                // Keyframe periódico a cada ~10 s só por segurança: quem entra ou perde pacotes
+                // pede um. Cada keyframe é ~10x um quadro normal (pico de bitrate).
+                set_codec_value(c, &CODECAPI_AVEncMPVGOPSize, VARIANT::from(fps * 10));
                 set_codec_value(c, &CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32));
                 // Deixa o encoder comprimir até o limite do H.264 quando a cena é muito pesada.
                 set_codec_value(c, &CODECAPI_AVEncVideoMaxQP, VARIANT::from(51u32));
