@@ -45,10 +45,23 @@ cargo run                        # roda o app (modo desenvolvimento)
 cargo test                       # testes unitários
 cargo test -- --ignored --nocapture  # testes contra a DHT real (precisa de internet)
 
-.\scripts\release.ps1            # build + instalador assinado + latest.json
-.\scripts\release.ps1 -Publish   # e publica a release no GitHub (atualiza quem já tem o app)
+.\scripts\release.ps1            # build + instalador assinado + latest.json (sem publicar)
 ```
 
 Os builds rodam com poucas tarefas e prioridade baixa (`CARGO_BUILD_JOBS=4`) para não travar o PC.
+
+### Releases
+
+Cada PR da `dev` mergeado na `main` vira uma release automaticamente
+(`.github/workflows/release.yml`): a action compila, assina, publica no GitHub e os apps
+instalados se atualizam ao abrir. Ela precisa do secret `TAURI_SIGNING_PRIVATE_KEY`
+(conteúdo de `~/.tauri/antijanja.key`).
+
+As versões são `0.x.y` enquanto o app não for considerado estável. A action usa a versão do
+`Cargo.toml` se ela ainda não foi lançada; senão soma 1 ao último número da última release
+(`0.3.2` → `0.3.3`). Para pular para `0.4.0`, mude o `Cargo.toml` no PR.
+
+Os apps antigos (2.x e 3.x) só atualizam para uma versão "maior" que a deles, então o
+`latest.json` leva `version: 3.999.0` (lido só por eles) e a versão real em `app_version`.
 
 Fontes: [Inter](https://rsms.me/inter/) e [JetBrains Mono](https://www.jetbrains.com/lp/mono/), ambas OFL (`assets/fonts`).

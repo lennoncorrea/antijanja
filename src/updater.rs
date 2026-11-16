@@ -27,6 +27,19 @@ fn newer(remote: &str, local: &str) -> bool {
     parse_version(remote) > parse_version(local)
 }
 
+/// Versão real da release. Desde a 0.3.2 as versões são 0.x: ela vem em `app_version`.
+/// O campo `version` fica fixo e alto (3.999.0) só para os apps antigos (2.x e 3.x),
+/// que só leem ele e só atualizam para uma versão "maior" que a deles.
+fn release_version(json: &serde_json::Value) -> Option<String> {
+    json["app_version"].as_str().or(json["version"].as_str()).map(str::to_string)
+}
+
+/// A versão também vira nome de arquivo: só dígitos, pontos e um `v` opcional.
+fn safe_version(v: &str) -> bool {
+    let v = v.strip_prefix('v').unwrap_or(v);
+    !v.is_empty() && v.len() <= 32 && v.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(15)))
@@ -39,7 +52,10 @@ pub fn check() -> Result<Option<Update>, String> {
     let mut resp = agent().get(ENDPOINT).call().map_err(|e| e.to_string())?;
     let text = resp.body_mut().read_to_string().map_err(|e| e.to_string())?;
     let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let version = json["version"].as_str().ok_or("latest.json sem versão")?.to_string();
+    let version = release_version(&json).ok_or("latest.json sem versão")?;
+    if !safe_version(&version) {
+        return Err("latest.json com versão inválida".into());
+    }
     if !newer(&version, env!("CARGO_PKG_VERSION")) {
         return Ok(None);
     }
@@ -96,6 +112,23 @@ mod tests {
         assert!(newer("2.10.0", "2.9.9"));
         assert!(!newer("2.5.0", "2.5.0"));
         assert!(!newer("v2.4.9", "2.5.0"));
+        assert!(newer("0.3.3", "0.3.2"));
+    }
+
+    #[test]
+    fn reads_real_version_and_keeps_old_apps_updating() {
+        let json = serde_json::json!({ "version": "3.999.0", "app_version": "0.3.2" });
+        assert_eq!(release_version(&json).as_deref(), Some("0.3.2"));
+        assert!(newer(json["version"].as_str().unwrap(), "3.1.0"), "apps 3.x precisam ver uma versão maior");
+        assert_eq!(release_version(&serde_json::json!({ "version": "3.1.0" })).as_deref(), Some("3.1.0"));
+    }
+
+    #[test]
+    fn rejects_unsafe_versions() {
+        assert!(safe_version("0.3.2") && safe_version("v3.1.0"));
+        assert!(!safe_version("9.9.9/../../x"));
+        assert!(!safe_version("1.0.0-beta"));
+        assert!(!safe_version(""));
     }
 
     /// Confere o instalador gerado por `scripts/release.ps1` contra a chave embutida:
@@ -105,7 +138,7 @@ mod tests {
     fn verifies_release_signature() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/bundle");
         let latest: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("latest.json")).unwrap()).unwrap();
-        let version = latest["version"].as_str().unwrap();
+        let version = release_version(&latest).unwrap();
         let sig = latest["platforms"]["windows-x86_64"]["signature"].as_str().unwrap();
         let data = std::fs::read(dir.join(format!("AntiJanja_{version}_x64-setup.exe"))).unwrap();
         verify(&data, sig).expect("assinatura deve bater com a chave embutida");
