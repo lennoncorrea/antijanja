@@ -44,8 +44,12 @@ if ($LASTEXITCODE -ne 0) { throw "makensis falhou" }
 
 # Assinatura minisign (mesmo formato de antes; a CLI do Tauri só é usada para assinar).
 $Password = if ($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) { $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD } else { "" }
+# Versão EXATA da CLI: este comando recebe a chave privada, então nunca deixamos o npx
+# baixar sozinho uma versão nova (um pacote comprometido no npm roubaria a chave).
+# Para atualizar: escolha uma versão com algumas semanas de publicada e troque aqui.
+$TauriCli = "@tauri-apps/cli@2.12.4"
 # "--password=" junto: o PowerShell 5.1 descarta argumentos vazios (a chave não tem senha).
-npx --yes "@tauri-apps/cli@2" signer sign -f $Key "--password=$Password" $Setup
+npx --yes $TauriCli signer sign -f $Key "--password=$Password" $Setup
 if ($LASTEXITCODE -ne 0) { throw "falha ao assinar" }
 $Signature = (Get-Content "$Setup.sig" -Raw).Trim()
 

@@ -66,6 +66,8 @@ struct PeerEntry {
     name: String,
     state: &'static str,
     peer: Arc<HostPeer>,
+    /// Tentativa (da oferta) que criou esta conexão.
+    sid: String,
 }
 
 enum Media {
@@ -109,6 +111,26 @@ static HOST: Mutex<Option<HostSession>> = Mutex::new(None);
 /// Ofertas já vistas, por `sid`: `None` enquanto a resposta é montada, depois (slot, resposta).
 type Offers = Arc<Mutex<HashMap<String, Option<(u8, String)>>>>;
 static PEER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Máximo de espectadores entrando ao mesmo tempo (resposta sendo montada ou ainda
+/// "conectando"). Cada um segura uma PeerConnection por até ~2 min; sem limite, quem
+/// tem o código poderia mandar ofertas falsas sem parar e esgotar memória e portas.
+/// Ofertas recusadas não são marcadas como vistas: o espectador republica a cada 25 s.
+const MAX_PENDING: usize = 6;
+
+/// Esquece as ofertas cujas conexões já acabaram e conta as que ainda estão entrando.
+fn prune_offers(map: &mut HashMap<String, Option<(u8, String)>>, peers: &Mutex<HashMap<u64, PeerEntry>>) -> usize {
+    let peers = peers.lock().unwrap();
+    let live: Vec<(&str, bool)> = peers.values().map(|p| (p.sid.as_str(), p.state == "connecting")).collect();
+    prune_offers_by(map, &live)
+}
+
+/// `live` = (sid, ainda conectando?) de cada conexão existente.
+fn prune_offers_by<T>(map: &mut HashMap<String, Option<T>>, live: &[(&str, bool)]) -> usize {
+    let is = |sid: &str, connecting_only: bool| live.iter().any(|&(s, c)| s == sid && (c || !connecting_only));
+    map.retain(|sid, v| v.is_none() || is(sid, false));
+    map.iter().filter(|(sid, v)| v.is_none() || is(sid, true)).count()
+}
 
 fn emit_peers(app: &AppHandle, peers: &Mutex<HashMap<u64, PeerEntry>>) {
     let mut list: Vec<PeerInfo> = peers
@@ -245,6 +267,9 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
                 }
                 Some(None) => {} // ainda montando a resposta
                 None => {
+                    if prune_offers(&mut map, &peers) >= MAX_PENDING {
+                        return; // muita gente entrando agora; o espectador tenta de novo
+                    }
                     map.insert(sid.to_string(), None);
                     drop(map);
                     let name: String = msg["name"].as_str().unwrap_or("Espectador").chars().take(40).collect();
@@ -348,7 +373,7 @@ async fn accept_viewer(
             return;
         }
     };
-    peers.lock().unwrap().insert(id, PeerEntry { name: name.clone(), state: "connecting", peer: peer.clone() });
+    peers.lock().unwrap().insert(id, PeerEntry { name: name.clone(), state: "connecting", peer: peer.clone(), sid: sid.clone() });
     emit_peers(&app, &peers);
 
     let Some(code) = HOST.lock().unwrap().as_ref().map(|h| h.code.clone()) else { return };
@@ -740,4 +765,22 @@ pub fn viewer_volume(id: String, volume: u32, muted: bool) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_offers_are_counted_and_pruned() {
+        let mut map: HashMap<String, Option<u8>> = HashMap::new();
+        map.insert("montando".into(), None); // resposta sendo montada
+        map.insert("conectando".into(), Some(1)); // respondida, ainda conectando
+        map.insert("assistindo".into(), Some(2)); // já conectou
+        map.insert("saiu".into(), Some(3)); // a conexão já acabou
+        let live = [("conectando", true), ("assistindo", false)];
+        assert_eq!(prune_offers_by(&mut map, &live), 2);
+        assert!(!map.contains_key("saiu"));
+        assert!(map.contains_key("assistindo") && map.contains_key("montando"));
+    }
 }

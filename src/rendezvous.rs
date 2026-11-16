@@ -40,6 +40,15 @@ const CHUNK: usize = 900;
 const MAX_CHUNKS: usize = 8;
 const MAX_PLAIN: u64 = 64 * 1024;
 const NONCE_LEN: usize = 12;
+/// `seq` (ms desde 1970) mais adiantado que isso em relação ao nosso relógio é tratado
+/// como lixo: quem tem o código poderia publicar `seq = i64::MAX` e travar um slot
+/// (os nós da DHT recusam qualquer `seq` menor e o host pararia de olhar o slot).
+const MAX_FUTURE_MS: i64 = 10 * 60 * 1000;
+
+/// Esse `seq` é plausível (não está muito no futuro)?
+fn sane_seq(seq: i64) -> bool {
+    seq <= now_ms().saturating_add(MAX_FUTURE_MS)
+}
 
 #[derive(Default)]
 pub struct RdvState {
@@ -166,7 +175,7 @@ fn publish(dht: &Dht, keys: &Keys, role: Role, slot: u8, payload: &str, min_seq:
     if chunks.len() > MAX_CHUNKS {
         return Err("Mensagem de conexão grande demais.".into());
     }
-    let seq = now_ms().max(min_seq + 1);
+    let seq = now_ms().max(min_seq.saturating_add(1));
     let signer = keys.signer(role);
 
     // Todos os pedaços em paralelo. Se alguém ler o cabeçalho antes dos demais
@@ -198,7 +207,7 @@ fn fetch(dht: &Dht, keys: &Keys, role: Role, slot: u8, newer_than: i64) -> Optio
     let pk = keys.signer(role).verifying_key().to_bytes();
     let head = dht
         .get_mutable(&pk, Some(&salt(role, slot, 0)), Some(newer_than))
-        .filter(|item| item.seq() > newer_than)
+        .filter(|item| item.seq() > newer_than && sane_seq(item.seq()))
         .max_by_key(|item| item.seq())?;
     let seq = head.seq();
     let (&total, first) = head.value().split_first()?;
@@ -315,6 +324,26 @@ pub fn host_reply(state: &RdvState, code: &str, slot: u8, payload: &str) -> Resu
     Ok(())
 }
 
+/// Escolhe um slot (começando por um sorteado) que não esteja travado por um `seq`
+/// absurdo, nem do lado do espectador nem da resposta do host. Devolve (slot, seq atual).
+fn pick_slot(dht: &Dht, keys: &Keys) -> Result<(u8, i64), String> {
+    let mut r = [0u8; 1];
+    getrandom::fill(&mut r).map_err(|e| e.to_string())?;
+    for i in 0..SLOTS {
+        let slot = r[0].wrapping_add(i) % SLOTS;
+        // O slot pode ter sido usado por outro espectador (com outro relógio).
+        let (viewer, host) = thread::scope(|s| {
+            let host = s.spawn(|| current_seq(dht, keys, Role::Host, slot, MAX_CHUNKS));
+            let viewer = current_seq(dht, keys, Role::Viewer, slot, MAX_CHUNKS);
+            (viewer, host.join().unwrap_or(0))
+        });
+        if sane_seq(viewer) && sane_seq(host) {
+            return Ok((slot, viewer));
+        }
+    }
+    Err("Não foi possível pedir para entrar: a rede está bloqueada para este código. Peça um código novo ao host.".into())
+}
+
 /// Espectador: publica a oferta e espera a resposta do host (até `timeout_secs`).
 /// `sid` identifica esta tentativa; respostas com outro `sid` são ignoradas.
 pub fn join(
@@ -331,15 +360,10 @@ pub fn join(
     let keys = Keys::from_code(code)?;
     let dht = get_dht(state)?;
 
-    let mut r = [0u8; 1];
-    getrandom::fill(&mut r).map_err(|e| e.to_string())?;
-    let slot = r[0] % SLOTS;
-
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs.clamp(10, 600));
+    let (slot, mut my_seq) = pick_slot(&dht, &keys)?;
     let mut last_seq = 0i64;
     let mut published_at: Option<Instant> = None;
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs.clamp(10, 600));
-    // O slot pode ter sido usado por outro espectador (com outro relógio).
-    let mut my_seq = current_seq(&dht, &keys, Role::Viewer, slot, MAX_CHUNKS);
 
     while Instant::now() < deadline {
         if stop.load(Ordering::SeqCst) {
@@ -646,6 +670,40 @@ mod tests {
             assert!(Instant::now() < deadline, "espectador não achou a resposta");
         }
         println!("handshake completo em {:?}", start.elapsed());
+    }
+
+    /// Envenena 7 dos 8 slots (seq absurdo, como faria um atacante com o código) e
+    /// confere que o espectador escolhe o que sobrou. Usa um código novo, de ninguém.
+    #[test]
+    #[ignore]
+    fn live_skips_poisoned_slots() {
+        let dht = Dht::client().unwrap();
+        assert!(dht.bootstrapped());
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).unwrap();
+        let keys = Keys::from_seed(&seed);
+        let handles: Vec<_> = (0..SLOTS)
+            .filter(|&s| s != 5)
+            .map(|slot| {
+                // Metade pelo lado do espectador, metade pelo da resposta do host.
+                let role = if slot % 2 == 0 { Role::Viewer } else { Role::Host };
+                let (dht, key) = (dht.clone(), keys.signer(role).clone());
+                thread::spawn(move || dht.put_mutable(MutableItem::new(key, b"lixo", i64::MAX - 1, Some(&salt(role, slot, 0))), None))
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+        let (slot, _) = pick_slot(&dht, &keys).expect("devia achar o slot livre");
+        assert_eq!(slot, 5);
+    }
+
+    #[test]
+    fn rejects_absurd_seq() {
+        assert!(sane_seq(now_ms()));
+        assert!(sane_seq(now_ms() + 60_000)); // relógio um pouco adiantado
+        assert!(!sane_seq(now_ms() + MAX_FUTURE_MS + 60_000));
+        assert!(!sane_seq(i64::MAX));
     }
 
     #[test]
