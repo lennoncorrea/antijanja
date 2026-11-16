@@ -45,6 +45,47 @@ struct Viewer {
     quality: String,
     /// Alturas que o host oferece além da principal (vazio = só uma).
     renditions: Vec<u32>,
+    /// fps da stream para o menu: o medido oscila (57, 60, 61...) e mudava os textos do
+    /// menu a cada segundo. Arredondado para uma taxa comum e só troca depois de 2
+    /// medições seguidas concordarem.
+    nominal_fps: u32,
+    fps_candidate: (u32, u8),
+}
+
+/// Taxa comum mais perto do fps medido (dentro de 10%), senão o múltiplo de 5 mais perto.
+fn snap_fps(measured: f64) -> u32 {
+    const COMMON: [u32; 13] = [24, 25, 30, 48, 50, 60, 75, 90, 100, 120, 144, 165, 240];
+    if measured < 1.0 {
+        return 0;
+    }
+    COMMON
+        .iter()
+        .copied()
+        .min_by(|a, b| (*a as f64 - measured).abs().total_cmp(&(*b as f64 - measured).abs()))
+        .filter(|c| (*c as f64 - measured).abs() <= *c as f64 * 0.1)
+        .unwrap_or(((measured / 5.0).round() * 5.0).max(1.0) as u32)
+}
+
+impl Viewer {
+    fn update_nominal_fps(&mut self, measured: f64) {
+        let snapped = snap_fps(measured);
+        if self.nominal_fps == 0 {
+            self.nominal_fps = snapped;
+        }
+        if snapped == self.nominal_fps {
+            self.fps_candidate = (0, 0);
+            return;
+        }
+        if self.fps_candidate.0 == snapped {
+            self.fps_candidate.1 += 1;
+        } else {
+            self.fps_candidate = (snapped, 1);
+        }
+        if self.fps_candidate.1 >= 2 {
+            self.nominal_fps = snapped;
+            self.fps_candidate = (0, 0);
+        }
+    }
 }
 
 struct Ctl {
@@ -83,6 +124,8 @@ struct Ctl {
     /// Gravar as configurações / mandar a configuração ao host já está marcado.
     save_pending: bool,
     push_pending: bool,
+    /// Altura de cada painel do menu de engrenagem, medida pelo Slint.
+    menu_heights: HashMap<String, f32>,
 }
 
 thread_local! {
@@ -442,6 +485,26 @@ fn grid_for(n: usize) -> (usize, usize) {
 
 /// Recalcula a grade da tela "Assistindo" e reposiciona os players nativos.
 fn relayout(c: &Ctl, ui: &AppWindow) {
+    let t0 = Instant::now();
+    relayout_inner(c, ui);
+    if trace() {
+        eprintln!("[ui {:.0}] relayout {:.2} ms", tms(), t0.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
+/// Milissegundos desde o início (para alinhar as linhas do diagnóstico).
+fn tms() -> f64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+}
+
+/// Diagnóstico de tempos da interface (AJ_TRACE).
+fn trace() -> bool {
+    thread_local! { static ON: bool = std::env::var_os("AJ_TRACE").is_some(); }
+    ON.with(|x| *x)
+}
+
+fn relayout_inner(c: &Ctl, ui: &AppWindow) {
     let a = ui.global::<App>();
     let scale = ui.window().scale_factor();
     let size = ui.window().size();
@@ -483,12 +546,13 @@ fn relayout(c: &Ctl, ui: &AppWindow) {
         if c.menu.as_deref() == Some(v.id.as_str()) && v.watching {
             menu_tile = true;
             let m = gear_menu(c, ui, v);
-            let mh = m.height;
+            // Altura medida pelo próprio menu (a estimativa só vale até ele avisar).
+            let mh = c.menu_heights.get(&m.panel).copied().unwrap_or(m.height);
             let mx = (x + tile_w - MENU_W - 8.0).max(4.0);
-            let my = (y + tile_h - foot - 6.0 - mh).max(4.0);
+            let bottom = (y + tile_h - foot - 6.0).max(4.0 + mh);
+            let my = bottom - mh;
             a.set_menu_x(mx);
-            a.set_menu_y(my);
-            a.set_menu_h(mh);
+            a.set_menu_bottom(bottom);
             m.apply(&a);
             hole = Some((
                 ((mx - vx) * scale).round() as i32,
@@ -583,7 +647,7 @@ fn option(value: &str, label: String, tag: String, note: &str, selected: bool) -
 
 fn gear_menu(c: &Ctl, ui: &AppWindow, v: &Viewer) -> GearMenu {
     let num = |k: &str| v.stats.as_ref().and_then(|st| st[k].as_f64()).unwrap_or(0.0);
-    let stream = num("fps").round() as u32;
+    let stream = v.nominal_fps;
     let height = num("height") as u32;
     let hz = monitor_hz(ui);
     let chosen = c.s.view_fps;
@@ -640,6 +704,12 @@ fn gear_menu(c: &Ctl, ui: &AppWindow, v: &Viewer) -> GearMenu {
         fps,
         quality,
     }
+}
+
+fn toggle_menu(c: &mut Ctl, ui: &AppWindow, id: &str) {
+    c.menu = if c.menu.as_deref() == Some(id) { None } else { Some(id.to_string()) };
+    c.menu_panel = "main".into();
+    relayout(c, ui);
 }
 
 fn close_menu(c: &mut Ctl, ui: &AppWindow) {
@@ -1044,6 +1114,8 @@ fn start_watching(c: &mut Ctl, ui: &AppWindow, code: String, password: Option<St
         muted: false,
         quality: "auto".into(),
         renditions: vec![],
+        nominal_fps: 0,
+        fps_candidate: (0, 0),
     });
     c.focus = None;
     c.view = "watch".into();
@@ -1302,6 +1374,7 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
                 eprintln!("[stats] {v}");
             }
             if let Some(x) = c.viewers.iter_mut().find(|x| x.id == id) {
+                x.update_nominal_fps(v["fps"].as_f64().unwrap_or(0.0));
                 x.stats = Some(v);
                 relayout(c, ui);
             }
@@ -1484,13 +1557,21 @@ fn wire(ui: &AppWindow) {
         })
     });
     a.on_toggle_menu(|id| {
-        later(move |c, ui| {
-            c.menu = if c.menu.as_deref() == Some(id.as_str()) { None } else { Some(id.to_string()) };
-            c.menu_panel = "main".into();
-            relayout(c, ui);
-        })
+        if trace() {
+            eprintln!("[ui {:.0}] clique na engrenagem", tms());
+        }
+        later(move |c, ui| toggle_menu(c, ui, &id))
     });
     a.on_close_menu(|| later(|c, ui| close_menu(c, ui)));
+    a.on_menu_resized(|h| {
+        later(move |c, ui| {
+            let h = h as f32;
+            if h > 0.0 && c.menu_heights.get(&c.menu_panel).is_none_or(|old| (old - h).abs() > 0.5) {
+                c.menu_heights.insert(c.menu_panel.clone(), h);
+                relayout(c, ui);
+            }
+        })
+    });
     a.on_menu_go(|panel| {
         later(move |c, ui| {
             c.menu_panel = panel.to_string();
@@ -1605,6 +1686,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
             updating: false,
             save_pending: false,
             push_pending: false,
+            menu_heights: HashMap::new(),
         });
     });
 
@@ -1642,6 +1724,19 @@ pub fn run() -> Result<(), slint::PlatformError> {
     });
 
     ui.show()?;
+    if trace() {
+        // Quanto cada quadro da interface leva para desenhar.
+        let start = std::cell::Cell::new(None::<Instant>);
+        let _ = ui.window().set_rendering_notifier(move |state, _| match state {
+            slint::RenderingState::BeforeRendering => start.set(Some(Instant::now())),
+            slint::RenderingState::AfterRendering => {
+                if let Some(t) = start.take() {
+                    eprintln!("[ui {:.0}] quadro desenhado em {:.1} ms", tms(), t.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            _ => {}
+        });
+    }
 
     // A janela nativa só existe depois que o loop começa: pega o HWND e pinta a barra.
     let hwnd_timer = slint::Timer::default();
@@ -1716,6 +1811,7 @@ fn autotest() {
     let started = Instant::now();
     let mut done = false;
     let mut menu_opened = false;
+    let mut last_toggle = 0u64;
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(500), move || {
         with(|c, ui| match mode.as_str() {
             "host" => {
@@ -1738,6 +1834,17 @@ fn autotest() {
                     c.s.view_fps = std::env::var("AJ_VIEW_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
                     eprintln!("[autotest] assistindo a {} fps (monitor {} Hz)", view_fps(c, ui), monitor_hz(ui));
                     start_watching(c, ui, code.trim().to_string(), None);
+                }
+                // Abre e fecha o menu a cada 2 s, pelo mesmo caminho do clique (medir com AJ_TRACE).
+                if std::env::var_os("AJ_MENU_TOGGLE").is_some() && started.elapsed() >= Duration::from_secs(40) {
+                    let tick = (started.elapsed().as_millis() / 2000) as u64;
+                    if tick != last_toggle {
+                        last_toggle = tick;
+                        if let Some(id) = c.viewers.iter().find(|v| v.watching).map(|v| v.id.clone()) {
+                            eprintln!("[ui {:.0}] (autoteste) alterna o menu", tms());
+                            toggle_menu(c, ui, &id);
+                        }
+                    }
                 }
                 let menu_after = std::env::var("AJ_MENU_AFTER").ok().and_then(|v| v.parse::<u64>().ok());
                 if let (Some(after), false) = (menu_after, menu_opened) {
@@ -1778,6 +1885,30 @@ mod tests {
         let r = replaced.clone();
         sync(ModelRc::<i32>::default(), vec![7], move |_| r.set(true));
         assert!(replaced.get());
+    }
+
+    #[test]
+    fn stream_fps_in_the_menu_is_stable() {
+        assert_eq!(snap_fps(57.4), 60);
+        assert_eq!(snap_fps(61.0), 60);
+        assert_eq!(snap_fps(29.2), 30);
+        assert_eq!(snap_fps(118.0), 120);
+        assert_eq!(snap_fps(40.0), 40);
+        assert_eq!(snap_fps(0.0), 0);
+        let mut v = Viewer {
+            id: String::new(), code: String::new(), host_name: String::new(), step: 0, watching: true,
+            stats: None, ping: None, volume: 100, muted: false, quality: "auto".into(), renditions: vec![],
+            nominal_fps: 0, fps_candidate: (0, 0),
+        };
+        for m in [58.0, 61.0, 57.0, 60.0, 62.0] {
+            v.update_nominal_fps(m);
+            assert_eq!(v.nominal_fps, 60);
+        }
+        // Uma medição fora não muda; duas seguidas mudam (o host baixou para 30).
+        v.update_nominal_fps(31.0);
+        assert_eq!(v.nominal_fps, 60);
+        v.update_nominal_fps(30.0);
+        assert_eq!(v.nominal_fps, 30);
     }
 
     #[test]

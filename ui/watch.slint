@@ -193,18 +193,20 @@ component MenuDivider inherits Rectangle {
 }
 
 // Menu de engrenagem: qualidade e fps da stream.
+// Altura: a do conteúdo. Muda (troca de painel, texto que quebra) avisando o Rust, que
+// ajusta o buraco no vídeo. Sem sombra: em volta do menu fica o vídeo (janela nativa),
+// então ela nunca aparecia, mas custava para desenhar.
 component GearMenu inherits Rectangle {
     width: 300px;
-    height: App.menu-h;
+    height: lay.preferred-height;
     background: Theme.card;
     border-radius: 12px;
     border-width: 1px;
     border-color: Theme.input;
-    drop-shadow-blur: 24px;
-    drop-shadow-offset-y: 6px;
-    drop-shadow-color: #00000080;
+    init => { App.menu-resized(self.height); }
+    changed height => { App.menu-resized(self.height); }
     TouchArea { }
-    VerticalLayout {
+    lay := VerticalLayout {
         padding: 6px;
         spacing: 2px;
         alignment: start;
@@ -438,11 +440,18 @@ component TileView inherits Rectangle {
                         vertical-alignment: center;
                     }
                 }
+                // Abre ao apertar (não ao soltar), como os menus de player de vídeo: o
+                // clique leva ~100 ms entre apertar e soltar.
                 gear-ta := TouchArea {
                     mouse-cursor: pointer;
-                    clicked => { App.toggle-menu(root.t.id); }
+                    pointer-event(e) => {
+                        if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                            App.toggle-menu(root.t.id);
+                        }
+                    }
                 }
                 accessible-role: button;
+                accessible-action-default => { App.toggle-menu(root.t.id); }
                 accessible-label: "Configurações da stream (qualidade e fps)";
             }
         }
@@ -480,7 +489,7 @@ export component WatchView inherits Rectangle {
             }
             if App.menu-tile != "" : GearMenu {
                 x: App.menu-x;
-                y: App.menu-y;
+                y: App.menu-bottom - self.height;
             }
         }
     }
