@@ -783,6 +783,16 @@ fn open_picker(c: &mut Ctl, ui: &AppWindow, mode: &str) {
     }
     c.picker = mode.to_string();
     c.picker_selected.clear();
+    if mode == "start" {
+        // Cada transmissão nova começa no padrão: aparece em "Ao vivo agora", sem senha.
+        c.s.public = true;
+        c.s.stream_password.clear();
+        settings::save(&c.s);
+        render_settings(c, ui);
+        let a = ui.global::<App>();
+        a.set_picker_pw_on(false);
+        a.set_picker_pw(s(""));
+    }
     render_general(c, ui);
     relayout(c, ui);
     load_sources(c, ui);
@@ -817,6 +827,17 @@ fn close_picker(c: &mut Ctl, ui: &AppWindow) {
 fn picker_confirm(c: &mut Ctl, ui: &AppWindow, id: &str) {
     let Some(src) = c.sources.as_ref().and_then(|l| l.iter().find(|x| x.id == id)).cloned() else { return };
     let mode = c.picker.clone();
+    if mode == "start" {
+        // A senha escolhida nesta tela vale para a transmissão que vai começar.
+        let a = ui.global::<App>();
+        let password = if a.get_picker_pw_on() { a.get_picker_pw().trim().to_string() } else { String::new() };
+        if a.get_picker_pw_on() && password.is_empty() {
+            return toast(c, ui, "err", "Digite a senha ou desligue “Pedir senha”.");
+        }
+        c.s.stream_password = password;
+        settings::save(&c.s);
+        render_settings(c, ui);
+    }
     close_picker(c, ui);
     let preview = c.thumbs.get(&src.id).cloned();
     if mode == "switch" {
@@ -1297,6 +1318,8 @@ fn wire(ui: &AppWindow) {
         })
     });
     a.on_picker_confirm(|id| later(move |c, ui| picker_confirm(c, ui, &id)));
+    a.on_picker_pw_toggled(|on| later(move |_, ui| ui.global::<App>().set_picker_pw_on(on)));
+    a.on_picker_pw_edited(|t| later(move |_, ui| ui.global::<App>().set_picker_pw(t)));
     a.on_stop_sharing(|| later(|c, ui| stop_sharing(c, ui, None)));
     a.on_new_code(|| {
         later(|c, _| {

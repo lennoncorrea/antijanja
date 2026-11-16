@@ -152,6 +152,11 @@ export global App {
     in property <[SelectOption]> app-options;
     callback set-setting(string, string);
     in property <bool> s-password-set;
+    // Senha escolhida na tela "O que você quer transmitir?" (vale ao começar).
+    in property <bool> picker-pw-on;
+    in property <string> picker-pw;
+    callback picker-pw-toggled(bool);
+    callback picker-pw-edited(string);
     // Janela de senha para assistir uma transmissão com senha.
     in property <bool> password-prompt;
     in property <string> password-error;

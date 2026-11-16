@@ -3,7 +3,7 @@ import { ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { App, Source } from "state.slint";
 import { AudioSource } from "audio.slint";
-import { Badge, Btn, Divider, Icon, Segmented, Spinner, Toggle } from "widgets.slint";
+import { Badge, Btn, Divider, Icon, Segmented, Spinner, TextField, Toggle } from "widgets.slint";
 
 component SourceCard inherits Rectangle {
     in property <Source> s;
@@ -69,7 +69,7 @@ export component SourcePicker inherits Rectangle {
     }
     dialog := Rectangle {
         width: Math.min(parent.width - 48px, 900px);
-        height: Math.min(parent.height - 48px, App.picker == "start" ? 760px : 620px);
+        height: Math.min(parent.height - 48px, App.picker == "start" ? (App.picker-pw-on ? 880px : 830px) : 620px);
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         border-radius: 14px;
@@ -213,6 +213,54 @@ export component SourcePicker inherits Rectangle {
                                 checked: App.s-public;
                                 toggled(v) => { App.set-setting("public", v ? "1" : "0"); }
                             }
+                        }
+                    }
+                }
+                // Senha: quem assiste precisa do código e dela (na lista aparece um cadeado).
+                Rectangle {
+                    border-radius: 10px;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    VerticalLayout {
+                        padding: 12px;
+                        padding-left: 16px;
+                        spacing: 10px;
+                        HorizontalLayout {
+                            spacing: 16px;
+                            VerticalLayout {
+                                spacing: 2px;
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    alignment: start;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Icon { source: @image-url("icons/lock.svg"); tint: App.picker-pw-on ? Theme.live-text : Theme.muted-fg; width: 13px; height: 13px; }
+                                    }
+                                    Text { text: "Pedir senha"; font-size: 13px; font-weight: 500; color: Theme.fg; }
+                                }
+                                Text {
+                                    text: App.picker-pw-on
+                                        ? "Só entra quem tiver o código e a senha. Na lista “Ao vivo agora” aparece um cadeado."
+                                        : "Desligado, qualquer pessoa com o código entra.";
+                                    font-size: 12px;
+                                    color: Theme.muted-fg;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Toggle {
+                                    checked: App.picker-pw-on;
+                                    toggled(v) => { App.picker-pw-toggled(v); }
+                                }
+                            }
+                        }
+                        if App.picker-pw-on : TextField {
+                            secret: true;
+                            placeholder: "Senha da transmissão";
+                            text: App.picker-pw;
+                            edited(t) => { App.picker-pw-edited(t); }
+                            init => { self.focus-input(); }
                         }
                     }
                 }
