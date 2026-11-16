@@ -11,6 +11,7 @@
 //! - interface: Slint (`ui`, arquivos em `ui/`), sem navegador embutido
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agenda;
 mod app;
 mod audio;
 mod capture;

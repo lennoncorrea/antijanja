@@ -4,6 +4,7 @@
 //! A janela-filha fica por cima da área de vídeo da interface; a interface (WebView) informa
 //! o retângulo dessa área. Eventos de mouse/teclado na janela-filha viram eventos Tauri.
 
+use crate::agenda::{Action, Agenda, Entry};
 use crate::framegen::{Interpolator, Midpoint, PlaneViews};
 use crate::media::Nv12Frame;
 use std::num::NonZeroIsize;
@@ -47,7 +48,10 @@ pub struct Player {
     hwnd: isize,
     tx: SyncSender<Msg>,
     /// Retângulo recortado da janela (menu por cima do vídeo), para não refazer à toa.
-    hole: std::cell::Cell<Option<(i32, i32, i32, i32)>>,
+    /// (Junto com o tamanho da janela: a região é recalculada se ela mudar.)
+    hole: std::cell::Cell<Option<((i32, i32, i32, i32, i32), (i32, i32))>>,
+    /// Posição atual (para não reposicionar a janela à toa a cada atualização da tela).
+    rect: std::cell::Cell<Option<(i32, i32, i32, i32, bool)>>,
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -140,28 +144,32 @@ impl Player {
             .spawn(move || render_thread(raw, rx, ready_tx))
             .map_err(|e| e.to_string())?;
         ready_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| "o player não iniciou".to_string())??;
-        Ok(Player { hwnd: raw, tx, hole: std::cell::Cell::new(None) })
+        Ok(Player { hwnd: raw, tx, hole: std::cell::Cell::new(None), rect: std::cell::Cell::new(None) })
     }
 
     /// Recorta um retângulo da janela do vídeo (relativo a ela, pixels físicos): o que a
     /// interface desenha ali (um menu) aparece por cima do vídeo. None = sem recorte.
-    pub fn set_hole(&self, hole: Option<(i32, i32, i32, i32)>) {
-        if self.hole.get() == hole {
-            return;
-        }
-        self.hole.set(hole);
-        use windows::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, HRGN, RGN_DIFF};
+    /// `hole`: (x, y, largura, altura, raio dos cantos), em pixels físicos.
+    pub fn set_hole(&self, hole: Option<(i32, i32, i32, i32, i32)>) {
+        use windows::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, SetWindowRgn, HRGN, RGN_DIFF};
         unsafe {
             let hwnd = HWND(self.hwnd as *mut _);
+            let mut r = windows::Win32::Foundation::RECT::default();
+            let _ = GetClientRect(hwnd, &mut r);
+            let key = hole.map(|h| (h, (r.right, r.bottom)));
+            if self.hole.get() == key {
+                return;
+            }
+            self.hole.set(key);
             match hole {
                 None => {
                     SetWindowRgn(hwnd, None, true);
                 }
-                Some((x, y, w, h)) => {
-                    let mut r = windows::Win32::Foundation::RECT::default();
-                    let _ = GetClientRect(hwnd, &mut r);
+                Some((x, y, w, h, radius)) => {
                     let full = CreateRectRgn(0, 0, r.right.max(1), r.bottom.max(1));
-                    let cut = CreateRectRgn(x, y, x + w, y + h);
+                    // Cantos arredondados como os do menu (um buraco reto deixava aparecer
+                    // o fundo nos quatro cantos, fora da borda do menu).
+                    let cut = CreateRoundRectRgn(x, y, x + w + 1, y + h + 1, radius * 2, radius * 2);
                     CombineRgn(Some(full), Some(full), Some(cut), RGN_DIFF);
                     let _ = DeleteObject(cut.into());
                     // A janela passa a ser dona da região (não apagar `full`).
@@ -173,6 +181,10 @@ impl Player {
 
     /// Posiciona a área de vídeo (pixels físicos, relativos à janela). Thread principal.
     pub fn set_rect(&self, x: i32, y: i32, w: i32, h: i32, visible: bool) {
+        if self.rect.get() == Some((x, y, w, h, visible)) {
+            return;
+        }
+        self.rect.set(Some((x, y, w, h, visible)));
         unsafe {
             let hwnd = HWND(self.hwnd as *mut _);
             let _ = SetWindowPos(
@@ -529,20 +541,19 @@ fn render_thread(hwnd: isize, rx: Receiver<Msg>, ready: SyncSender<Res<()>>) {
             return;
         }
     };
-    // Próximos desenhos com horário marcado: Some(t) = quadro gerado na fração t entre o
-    // atual e o preparado; None = mostrar o preparado (quadro real).
-    let mut schedule: std::collections::VecDeque<(Instant, Option<f32>)> = Default::default();
-    // Quadros que chegaram enquanto a agenda do par anterior ainda não terminou. Na rede
-    // os quadros chegam em grupos; descartar o real que esperava a vez (como antes)
-    // dava um engasgo a cada grupo.
-    let mut queue: std::collections::VecDeque<Msg> = Default::default();
+    let mut agenda: Agenda<Nv12Frame, Midpoint> = Agenda::new();
+    let trace = std::env::var_os("AJ_TRACE").is_some();
+    let (mut t_win, mut n_real, mut n_gen, mut lag_max, mut render_max) = (Instant::now(), 0u32, 0u32, 0f64, 0f64);
     loop {
-        let wait = match (schedule.front(), queue.is_empty()) {
-            (Some((at, _)), _) => Some(at.saturating_duration_since(Instant::now())),
-            (None, false) => Some(Duration::ZERO),
-            (None, true) => None,
-        };
-        let msg = match wait {
+        if trace && t_win.elapsed() >= Duration::from_secs(1) {
+            eprintln!(
+                "[tela] reais {n_real}/s, gerados {n_gen}/s, gerados pulados {}, atraso máx do desenho {lag_max:.1} ms, desenho máx {render_max:.1} ms",
+                agenda.skipped
+            );
+            agenda.skipped = 0;
+            (t_win, n_real, n_gen, lag_max, render_max) = (Instant::now(), 0, 0, 0.0, 0.0);
+        }
+        let msg = match agenda.wait(Instant::now()) {
             Some(w) => match rx.recv_timeout(w) {
                 Ok(m) => Some(m),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
@@ -561,58 +572,39 @@ fn render_thread(hwnd: isize, rx: Receiver<Msg>, ready: SyncSender<Res<()>>) {
                     gpu.resize(w, h);
                     redraw = true;
                 }
-                m => queue.push_back(m),
+                Msg::Frame(f) => agenda.push(Entry::Frame(f)),
+                Msg::Interp { next, mid, steps, next_at } => agenda.push(Entry::Pair { next, mid, steps, next_at }),
             }
         }
-        // Muito atrasado: pula para o quadro mais novo (gerar entre quadros que não são
-        // vizinhos daria errado, então ele entra como quadro normal).
-        if queue.len() > 3 {
-            if schedule.iter().any(|(_, step)| step.is_none()) {
-                gpu.advance();
-            }
-            schedule.clear();
-            let newest = queue.pop_back().unwrap();
-            queue.clear();
-            queue.push_back(match newest {
-                Msg::Interp { next, .. } => Msg::Frame(next),
-                m => m,
-            });
-        }
-        // O que já está na hora.
-        let now = Instant::now();
-        if let Some(&(at, step)) = schedule.front() {
-            if at <= now {
-                schedule.pop_front();
+        match agenda.next(Instant::now()) {
+            Action::Draw(step) => {
                 if step.is_none() {
                     gpu.advance();
                 }
+                let t0 = Instant::now();
+                if let Some(due) = agenda.last_due {
+                    lag_max = lag_max.max(t0.saturating_duration_since(due).as_secs_f64() * 1000.0);
+                }
                 gpu.render(step);
-                continue;
+                render_max = render_max.max(t0.elapsed().as_secs_f64() * 1000.0);
+                if step.is_some() { n_gen += 1 } else { n_real += 1 }
             }
-        }
-        // Agenda vazia: próximo quadro da fila.
-        if schedule.is_empty() {
-            match queue.pop_front() {
-                Some(Msg::Frame(f)) => {
-                    gpu.show(&f);
-                    continue;
-                }
-                Some(Msg::Interp { next, mid, steps, next_at }) => {
-                    if gpu.prepare_interp(&next, &mid) {
-                        // Chegou atrasado (esperou o par anterior): desloca a agenda inteira,
-                        // mantendo o espaçamento entre os quadros.
-                        let first = steps.first().map(|s| s.0).unwrap_or(next_at);
-                        let shift = now.saturating_duration_since(first);
-                        schedule.extend(steps.into_iter().map(|(at, t)| (at + shift, Some(t))));
-                        schedule.push_back((next_at + shift, None));
-                    }
-                    continue;
-                }
-                _ => {}
+            Action::Show(f) => {
+                let t0 = Instant::now();
+                gpu.show(&f);
+                render_max = render_max.max(t0.elapsed().as_secs_f64() * 1000.0);
+                n_real += 1;
             }
-        }
-        if redraw {
-            gpu.render(None);
+            Action::Prepare(next, mid) => {
+                let ok = gpu.prepare_interp(&next, &mid);
+                agenda.prepared(ok, Instant::now());
+            }
+            Action::Advance => gpu.advance(),
+            Action::Idle => {
+                if redraw {
+                    gpu.render(None);
+                }
+            }
         }
     }
 }
@@ -762,7 +754,7 @@ mod tests {
         assert!(p.0[0] > 180 && p.0[1] < 80 && p.0[2] < 80, "esperava vermelho, veio {:?}", p.0);
 
         // Buraco para um menu: dentro dele aparece a janela de trás (não o vídeo vermelho).
-        player.set_hole(Some((300, 150, 120, 80)));
+        player.set_hole(Some((300, 150, 120, 80, 12)));
         pump(200);
         let inside = mon.capture_region((100 + 360 - mx) as u32, (100 + 190 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
         let outside = mon.capture_region((100 + 200 - mx) as u32, (100 + 190 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
