@@ -19,6 +19,7 @@ mod framegen;
 mod congestion;
 mod gpu;
 mod media;
+mod mesh;
 mod nvof;
 mod pieces;
 mod player;
