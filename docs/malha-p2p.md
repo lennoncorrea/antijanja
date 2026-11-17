@@ -211,6 +211,25 @@ Plano original da etapa:
 - Folga por espectador conforme o histórico; mais folga em keyframes; ajuste automático
   pela perda medida (como o controle de bitrate).
 
+## Áudio na malha e sincronia — feito
+
+- O host carimba áudio e vídeo no mesmo relógio de mídia (90 kHz desde o começo da
+  transmissão): o áudio com o horário de captura que o Windows informa em cada pacote
+  (menos o atraso do Opus, 6,5 ms); o vídeo com o instante em que o quadro capturado chega
+  ao pipeline.
+- Cada pacote de áudio vai inteiro em duas faixas diferentes (dois vizinhos), assinado, e
+  passa na frente do vídeo no pacer.
+- Quem assiste toca os dois numa agenda única (`avsync::SyncClock`): o atraso é o do mais
+  lento, desliza (nunca pula) e começa depois de 500 ms de medição. O áudio é o relógio
+  mestre: o tocador informa o que está saindo no alto-falante (contando o buffer e a
+  latência da placa) e o vídeo é agendado por isso.
+- Áudio sem cortes: pacote perdido é refeito pela correção de erro do seguinte (Opus FEC)
+  ou preenchido pelo Opus (PLC), inclusive quando nada chegou depois (até 60 ms); a deriva
+  da placa de som é corrigida variando a velocidade até 2% com interpolação.
+- Testes: `av_sync_through_the_mesh` (flash e bipe no mesmo instante de captura, 4
+  espectadores, um repassador cai no meio): no máximo 0,5 ms entre eles, nenhum corte;
+  `synced_playback_on_the_real_device`: o som que sai de fato da placa sem buraco.
+
 ## Fora do escopo por enquanto
 
 - IP exposto entre espectadores (decidido: ignorar por enquanto).
