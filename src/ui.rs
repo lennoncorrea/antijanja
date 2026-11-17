@@ -5,7 +5,7 @@
 //! próprias e posiciona os players nativos sobre os tiles da tela "Assistindo".
 
 use crate::app::AppHandle;
-use crate::{audio, capture, rendezvous, session, settings, transport, updater};
+use crate::{audio, capture, overlay, rendezvous, session, settings, transport, updater};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::Value;
 use slint::{ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
@@ -20,16 +20,28 @@ const TOPBAR: f32 = 44.0;
 const ADDBAR: f32 = 60.0;
 const PAD: f32 = 12.0;
 const GAP: f32 = 12.0;
+/// Cabeçalho do tile enquanto conecta.
 const HEADER: f32 = 44.0;
-const FOOTER: f32 = 40.0;
+/// Faixas dos controles por cima do vídeo (iguais às do overlay.slint).
+const TOP_BAND: f32 = 76.0;
+const BOTTOM_BAND: f32 = 84.0;
+/// Raio dos cantos do vídeo dentro do tile (o tile tem 12 e borda de 1).
+const VIDEO_RADIUS: f32 = 11.0;
 /// Largura do menu de engrenagem (igual ao `GearMenu` do Slint).
 const MENU_W: f32 = 300.0;
 /// Raio dos cantos do menu de engrenagem (igual ao `border-radius` do GearMenu).
 const MENU_RADIUS: f32 = 12.0;
+/// Distância da base do menu até o fim do vídeo (o menu fica acima da linha de botões).
+const MENU_GAP: f32 = 52.0;
 
 const PUBLIC_REFRESH: Duration = Duration::from_secs(20);
 const TOAST_TIME: Duration = Duration::from_secs(4);
+/// Controles por cima do vídeo: somem depois desse tempo com o mouse parado, ou deste
+/// outro depois de o mouse sair do vídeo.
 const CONTROLS_TIME: Duration = Duration::from_millis(2500);
+const CONTROLS_LEAVE: Duration = Duration::from_millis(700);
+/// Tempo do esmaecer dos controles: a janela deles só perde a região depois disso.
+const CONTROLS_FADE: Duration = Duration::from_millis(250);
 
 struct Viewer {
     id: String,
@@ -117,7 +129,13 @@ struct Ctl {
     viewers: Vec<Viewer>,
     focus: Option<String>,
     fullscreen: bool,
-    controls_until: Option<Instant>,
+    /// Stream com os controles à mostra, e até quando (o mouse mexeu sobre ela).
+    hover: Option<(String, Instant)>,
+    /// Último estado dos controles desenhado (ver `controls_state`).
+    last_controls: (Option<String>, Option<String>),
+    /// Janela dos controles por cima do vídeo (criada quando a principal já existe).
+    overlay: Option<VideoOverlay>,
+    overlay_attached: bool,
     toasts: Vec<(i32, String, String, Instant)>,
     toast_seq: i32,
     updating: bool,
@@ -279,8 +297,12 @@ fn app_name(c: &Ctl, exe: &str) -> String {
 /* ============================================================ janela nativa */
 
 fn hwnd_of(ui: &AppWindow) -> Option<isize> {
+    window_hwnd(ui.window())
+}
+
+fn window_hwnd(window: &slint::Window) -> Option<isize> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    let handle = ui.window().window_handle();
+    let handle = window.window_handle();
     let wh = handle.window_handle().ok()?;
     match wh.as_raw() {
         RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
@@ -326,6 +348,7 @@ fn render_settings(c: &Ctl, ui: &AppWindow) {
     set_if_changed!(a, get_s_fps, set_s_fps, s(st.fps.to_string()));
     set_if_changed!(a, get_s_bitrate, set_s_bitrate, s(st.bitrate.to_string()));
     set_if_changed!(a, get_s_cursor, set_s_cursor, st.cursor);
+    set_if_changed!(a, get_s_mesh, set_s_mesh, st.mesh);
     set_if_changed!(a, get_s_audio_mode, set_s_audio_mode, s(if st.audio_mode.is_empty() { "system" } else { &st.audio_mode }));
     set_if_changed!(a, get_s_audio_app, set_s_audio_app, s(&st.audio_app));
     set_if_changed!(a, get_s_abitrate, set_s_abitrate, s(st.abitrate.to_string()));
@@ -528,7 +551,6 @@ fn relayout_inner(c: &Ctl, ui: &AppWindow) {
     let gap = if fs { 0.0 } else { GAP };
     let area_w = (w - 2.0 * pad).max(1.0);
     let area_h = (h - top - pad).max(1.0);
-    let controls = !fs || c.controls_until.is_some_and(|t| t > Instant::now());
 
     let shown: Vec<&Viewer> = match &c.focus {
         Some(f) => c.viewers.iter().filter(|v| &v.id == f).collect(),
@@ -539,6 +561,10 @@ fn relayout_inner(c: &Ctl, ui: &AppWindow) {
     let tile_h = (area_h - gap * (rows as f32 - 1.0)) / rows as f32;
     let players_visible = c.view == "watch" && c.picker.is_empty() && !c.updating && c.password_for.is_none();
 
+    let (controls_on, controls_alive) = controls_state(c, Instant::now());
+    let ov = c.overlay.as_ref().map(|o| o.global::<Ov>());
+    let px = |v: f32| (v * scale).round() as i32;
+    let mut region: Vec<overlay::Rect> = Vec::new();
     let mut tiles = Vec::new();
     let mut menu_tile = false;
     for (i, v) in shown.iter().enumerate() {
@@ -546,43 +572,49 @@ fn relayout_inner(c: &Ctl, ui: &AppWindow) {
         let x = pad + col * (tile_w + gap);
         let y = row * (tile_h + gap);
         let border = if fs { 0.0 } else { 1.0 };
-        let head = if controls { HEADER } else { 0.0 };
-        let foot = if controls && v.watching { FOOTER } else { 0.0 };
+        // Assistindo, o vídeo ocupa o tile inteiro (os controles ficam por cima, em outra
+        // janela). Conectando, há o cabeçalho.
+        let head = if v.watching { border } else { HEADER };
         let (vx, vy) = (x + border, top + y + head);
-        let (vw, vh) = (tile_w - 2.0 * border, (tile_h - head - foot - border).max(1.0));
+        let (vw, vh) = (tile_w - 2.0 * border, (tile_h - head - border).max(1.0));
         let stats = v.stats.as_ref();
         let num = |k: &str| stats.and_then(|st| st[k].as_f64()).unwrap_or(0.0);
+        let menu_here = c.menu.as_deref() == Some(v.id.as_str()) && v.watching;
+        let chrome = v.watching && (menu_here || controls_on.as_deref() == Some(v.id.as_str()));
 
-        // Menu de engrenagem desta stream: acima do rodapé, no canto direito. A janela do
-        // vídeo ganha um buraco ali para o menu aparecer por cima.
-        let mut hole = None;
-        if c.menu.as_deref() == Some(v.id.as_str()) && v.watching {
+        // Faixas dos controles: a janela deles só existe ali (e continua um pouco depois de
+        // sumirem, enquanto esmaecem).
+        if v.watching && (menu_here || controls_alive.as_deref() == Some(v.id.as_str())) {
+            let top_h = TOP_BAND.min(vh);
+            let bottom_h = BOTTOM_BAND.min(vh);
+            region.push((px(vx), px(vy), px(vw), px(top_h), 0));
+            region.push((px(vx), px(vy + vh - bottom_h), px(vw), px(bottom_h), 0));
+        }
+
+        // Menu de engrenagem desta stream: acima da linha de botões, no canto direito.
+        if menu_here {
             menu_tile = true;
             let m = gear_menu(c, ui, v);
             // Altura medida pelo próprio menu (a estimativa só vale até ele avisar).
             let mh = c.menu_heights.get(&m.panel).copied().unwrap_or(m.height);
             let mx = (x + tile_w - MENU_W - 8.0).max(4.0);
-            let bottom = (y + tile_h - foot - 6.0).max(4.0 + mh);
-            let my = bottom - mh;
-            set_if_changed!(a, get_menu_x, set_menu_x, mx);
-            set_if_changed!(a, get_menu_bottom, set_menu_bottom, bottom);
-            m.apply(&a);
-            hole = Some((
-                ((mx - vx) * scale).round() as i32,
-                ((top + my - vy) * scale).round() as i32,
-                (MENU_W * scale).round() as i32,
-                (mh * scale).round() as i32,
-                (MENU_RADIUS * scale).round() as i32,
-            ));
+            let bottom = (vy + vh - MENU_GAP).max(top + 4.0 + mh);
+            if let Some(ov) = &ov {
+                set_if_changed!(ov, get_menu_x, set_menu_x, mx);
+                set_if_changed!(ov, get_menu_bottom, set_menu_bottom, bottom);
+                m.apply(ov);
+            }
+            region.push((px(mx), px(bottom - mh), px(MENU_W), px(mh), px(MENU_RADIUS)));
         }
         session::player_rect(
             v.id.clone(),
-            (vx * scale).round() as i32,
-            (vy * scale).round() as i32,
-            (vw * scale).round() as i32,
-            (vh * scale).round() as i32,
+            px(vx),
+            px(vy),
+            px(vw),
+            px(vh),
             players_visible && v.watching,
-            hole,
+            if fs { 0 } else { px(VIDEO_RADIUS) },
+            !chrome,
         );
 
         let buffer = num("buffer_ms") as u32;
@@ -605,7 +637,7 @@ fn relayout_inner(c: &Ctl, ui: &AppWindow) {
             ping_warn: v.ping.is_some_and(|p| p > 150),
             volume: v.volume as i32,
             muted: v.muted,
-            chrome: controls,
+            chrome,
             focused: c.focus.as_deref() == Some(v.id.as_str()),
             x,
             y,
@@ -615,9 +647,17 @@ fn relayout_inner(c: &Ctl, ui: &AppWindow) {
     }
     // Streams escondidas (outra está ampliada): player fora da tela.
     for v in c.viewers.iter().filter(|v| !shown.iter().any(|x| x.id == v.id)) {
-        session::player_rect(v.id.clone(), 0, 0, 1, 1, false, None);
+        session::player_rect(v.id.clone(), 0, 0, 1, 1, false, 0, false);
     }
-    set_if_changed!(a, get_menu_tile, set_menu_tile, s(if menu_tile { c.menu.clone().unwrap_or_default() } else { String::new() }));
+    let menu_id = s(if menu_tile { c.menu.clone().unwrap_or_default() } else { String::new() });
+    set_if_changed!(a, get_menu_tile, set_menu_tile, menu_id.clone());
+    if let Some(ov) = &ov {
+        set_if_changed!(ov, get_menu_tile, set_menu_tile, menu_id);
+        set_if_changed!(ov, get_top, set_top, top);
+        set_if_changed!(ov, get_fullscreen, set_fullscreen, fs);
+        sync(ov.get_tiles(), tiles.clone(), |m| ov.set_tiles(m));
+    }
+    overlay::set_region(if players_visible { &region } else { &[] });
     sync(a.get_tiles(), tiles, |m| a.set_tiles(m));
     set_if_changed!(a, get_has_focus, set_has_focus, c.focus.is_some());
 }
@@ -642,7 +682,7 @@ struct GearMenu {
 }
 
 impl GearMenu {
-    fn apply(&self, a: &App) {
+    fn apply(&self, a: &Ov) {
         set_if_changed!(a, get_menu_panel, set_menu_panel, s(&self.panel));
         sync(a.get_menu_fps(), self.fps.clone(), |m| a.set_menu_fps(m));
         sync(a.get_menu_quality(), self.quality.clone(), |m| a.set_menu_quality(m));
@@ -758,7 +798,10 @@ fn set_fullscreen(c: &mut Ctl, ui: &AppWindow, on: bool) {
         return;
     }
     c.fullscreen = on;
-    c.controls_until = on.then(|| Instant::now() + CONTROLS_TIME);
+    // O vídeo muda de tamanho: quem estava com os controles à mostra continua com eles.
+    if let Some((_, until)) = &mut c.hover {
+        *until = Instant::now() + CONTROLS_TIME;
+    }
     ui.window().set_fullscreen(on);
     render_general(c, ui);
     relayout(c, ui);
@@ -774,6 +817,56 @@ fn toggle_stream_fullscreen(c: &mut Ctl, ui: &AppWindow, id: &str) {
         set_fullscreen(c, ui, true);
     }
     relayout(c, ui);
+}
+
+/// Controles por cima do vídeo: (stream com eles à mostra, stream cuja janela de
+/// controles ainda tem região, que dura até o fim do esmaecer).
+fn controls_state(c: &Ctl, now: Instant) -> (Option<String>, Option<String>) {
+    match &c.hover {
+        Some((id, until)) => ((*until > now).then(|| id.clone()), (*until + CONTROLS_FADE > now).then(|| id.clone())),
+        None => (None, None),
+    }
+}
+
+/// O mouse mexeu sobre o vídeo ou os controles da stream `id`: mostra os controles dela
+/// (só dela) por mais um tempo.
+fn wake_controls(c: &mut Ctl, ui: &AppWindow, id: &str) {
+    let now = Instant::now();
+    let was_on = controls_state(c, now).0.as_deref() == Some(id);
+    c.hover = Some((id.to_string(), now + CONTROLS_TIME));
+    if !was_on {
+        c.last_controls = controls_state(c, now);
+        relayout(c, ui);
+    }
+}
+
+/// O mouse saiu do vídeo: os controles somem logo (se ele foi para os controles, eles
+/// avisam e continuam).
+fn leave_controls(c: &mut Ctl, id: &str) {
+    if let Some((h, until)) = &mut c.hover {
+        if h == id {
+            *until = (*until).min(Instant::now() + CONTROLS_LEAVE);
+        }
+    }
+}
+
+/// Cria a janela dos controles por cima do vídeo, com a principal como dona.
+fn create_overlay(c: &mut Ctl, ui: &AppWindow, main: isize) {
+    overlay::prepare(main);
+    let created = VideoOverlay::new();
+    overlay::prepare_done();
+    match created {
+        Ok(o) => {
+            o.global::<Theme>().set_dark(ui.global::<Theme>().get_dark());
+            o.global::<Ov>().set_debug_tint(std::env::var_os("AJ_OVERLAY_DEBUG").is_some());
+            wire_overlay(&o);
+            if let Err(e) = o.show() {
+                eprintln!("controles sobre o vídeo: {e}");
+            }
+            c.overlay = Some(o);
+        }
+        Err(e) => eprintln!("controles sobre o vídeo: {e}"),
+    }
 }
 
 fn refresh_public(c: &mut Ctl, ui: &AppWindow) {
@@ -840,6 +933,7 @@ fn host_config(c: &Ctl) -> Option<session::HostConfig> {
         public: c.s.public,
         title: src.name.clone(),
         password: c.s.stream_password.clone(),
+        mesh: c.s.mesh,
     })
 }
 
@@ -901,6 +995,7 @@ fn set_setting(c: &mut Ctl, ui: &AppWindow, key: &str, value: &str) {
         "abitrate" => c.s.abitrate = num().unwrap_or(c.s.abitrate),
         "volume" => c.s.volume = num().unwrap_or(c.s.volume),
         "cursor" => c.s.cursor = on,
+        "mesh" => c.s.mesh = on,
         "password" => {
             let new = value.trim().to_string();
             if new == c.s.stream_password {
@@ -1066,6 +1161,7 @@ fn stop_sharing(c: &mut Ctl, ui: &AppWindow, reason: Option<&str>) {
     }
     ui.global::<App>().set_has_preview(false);
     ui.global::<App>().set_has_info(false);
+    ui.global::<App>().set_stat_mesh(s(""));
     render_general(c, ui);
     render_host_code(c, ui);
     if let Some(r) = reason {
@@ -1279,6 +1375,16 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
             sync(a.get_peers(), peers, |m| a.set_peers(m));
             render_general(c, ui);
         }
+        "host-mesh" => {
+            let n = v["members"].as_u64().unwrap_or(0);
+            let pct = v["percent"].as_f64().unwrap_or(100.0).round() as u32;
+            let text = match n {
+                0 => String::new(),
+                1 => "Malha: 1 assistindo".to_string(),
+                n => format!("Malha: {n} · envio {pct}%"),
+            };
+            set_if_changed!(a, get_stat_mesh, set_stat_mesh, s(text));
+        }
         "host-info" => {
             let f = |k: &str| v[k].as_f64().unwrap_or(0.0);
             let hw = v["hardware"].as_bool().unwrap_or(false);
@@ -1365,6 +1471,9 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
                 "connected" => {
                     x.watching = true;
                     render_watching_list(c, ui);
+                    // Mostra os controles por um momento, para quem acabou de entrar ver
+                    // que eles existem.
+                    wake_controls(c, ui, &id);
                     relayout(c, ui);
                 }
                 "failed" => {
@@ -1412,13 +1521,8 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
             match v["kind"].as_str().unwrap_or("") {
                 "dblclick" => toggle_stream_fullscreen(c, ui, &id),
                 "down" => close_menu(c, ui),
-                "move" if c.fullscreen => {
-                    let was_hidden = !c.controls_until.is_some_and(|t| t > Instant::now());
-                    c.controls_until = Some(Instant::now() + CONTROLS_TIME);
-                    if was_hidden {
-                        relayout(c, ui);
-                    }
-                }
+                "move" => wake_controls(c, ui, &id),
+                "leave" => leave_controls(c, &id),
                 "f11" => set_fullscreen(c, ui, !c.fullscreen),
                 "escape" => set_fullscreen(c, ui, false),
                 _ => {}
@@ -1438,7 +1542,9 @@ fn wire(ui: &AppWindow) {
             let dark = !ui.global::<Theme>().get_dark();
             // Vale só para esta sessão: o app sempre abre no tema do Windows.
             ui.global::<Theme>().set_dark(dark);
-            let _ = c;
+            if let Some(o) = &c.overlay {
+                o.global::<Theme>().set_dark(dark);
+            }
             if let Some(h) = hwnd_of(ui) {
                 paint_titlebar(h, dark);
             }
@@ -1525,6 +1631,29 @@ fn wire(ui: &AppWindow) {
     });
     a.on_kick(|id| later(move |c, _| session::host_kick(c.app.clone(), id.max(0) as u64)));
     a.on_leave(|id| later(move |c, ui| end_watching(c, ui, &id, None, false)));
+    a.on_unfocus(|| {
+        later(|c, ui| {
+            c.focus = None;
+            relayout(c, ui);
+        })
+    });
+    a.on_submit_password(|p| later(move |c, ui| submit_password(c, ui, &p)));
+    a.on_cancel_password(|| {
+        later(|c, ui| {
+            c.password_for = None;
+            ui.global::<App>().set_password_prompt(false);
+            relayout(c, ui);
+        })
+    });
+    a.on_close_menu(|| later(|c, ui| close_menu(c, ui)));
+}
+
+/// Botões dos controles por cima do vídeo (janela própria, global `Ov`).
+fn wire_overlay(o: &VideoOverlay) {
+    let a = o.global::<Ov>();
+    a.on_activity(|id| later(move |c, ui| wake_controls(c, ui, &id)));
+    a.on_leave(|id| later(move |c, ui| end_watching(c, ui, &id, None, false)));
+    a.on_close_menu(|| later(|c, ui| close_menu(c, ui)));
     a.on_toggle_focus(|id| {
         later(move |c, ui| {
             if c.focus.as_deref() == Some(id.as_str()) {
@@ -1537,12 +1666,6 @@ fn wire(ui: &AppWindow) {
         })
     });
     a.on_toggle_fullscreen(|id| later(move |c, ui| toggle_stream_fullscreen(c, ui, &id)));
-    a.on_unfocus(|| {
-        later(|c, ui| {
-            c.focus = None;
-            relayout(c, ui);
-        })
-    });
     a.on_set_volume(|id, vol| later(move |c, ui| set_viewer_volume(c, ui, &id, vol.clamp(0, 100) as u32, false)));
     a.on_set_view_fps(|v| {
         later(move |c, ui| {
@@ -1561,21 +1684,12 @@ fn wire(ui: &AppWindow) {
             }
         })
     });
-    a.on_submit_password(|p| later(move |c, ui| submit_password(c, ui, &p)));
-    a.on_cancel_password(|| {
-        later(|c, ui| {
-            c.password_for = None;
-            ui.global::<App>().set_password_prompt(false);
-            relayout(c, ui);
-        })
-    });
     a.on_toggle_menu(|id| {
         if trace() {
             eprintln!("[ui {:.0}] clique na engrenagem", tms());
         }
         later(move |c, ui| toggle_menu(c, ui, &id))
     });
-    a.on_close_menu(|| later(|c, ui| close_menu(c, ui)));
     a.on_menu_resized(|h| {
         later(move |c, ui| {
             let h = h as f32;
@@ -1651,6 +1765,9 @@ fn start_updater() {
 }
 
 pub fn run() -> Result<(), slint::PlatformError> {
+    // A janela dos controles por cima do vídeo precisa de atributos do winit (dona, fora
+    // da barra de tarefas) que o Slint não expõe.
+    slint::BackendSelector::new().with_winit_window_attributes_hook(overlay::attributes_hook).select()?;
     let ui = AppWindow::new()?;
 
     let app = AppHandle::new(|name, value| {
@@ -1695,7 +1812,10 @@ pub fn run() -> Result<(), slint::PlatformError> {
             menu: None,
             menu_panel: "main".into(),
             password_for: None,
-            controls_until: None,
+            hover: None,
+            last_controls: (None, None),
+            overlay: None,
+            overlay_attached: false,
             toasts: Vec::new(),
             toast_seq: 0,
             updating: false,
@@ -1722,6 +1842,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // Ao fechar: encerra a transmissão e as conexões antes de sair.
     ui.window().on_close_requested(|| {
         with(|c, _| {
+            if let Some(o) = &c.overlay {
+                let _ = o.hide();
+            }
             if c.save_pending {
                 settings::save(&c.s);
             }
@@ -1753,21 +1876,37 @@ pub fn run() -> Result<(), slint::PlatformError> {
         });
     }
 
-    // A janela nativa só existe depois que o loop começa: pega o HWND e pinta a barra.
+    // A janela nativa só existe depois que o loop começa: pega o HWND, pinta a barra e
+    // cria a janela dos controles por cima do vídeo.
     let hwnd_timer = slint::Timer::default();
     {
         let app = app.clone();
         let weak = ui.as_weak();
         hwnd_timer.start(slint::TimerMode::Repeated, Duration::from_millis(30), move || {
             let Some(ui) = weak.upgrade() else { return };
-            if app.hwnd() != 0 {
+            if app.hwnd() == 0 {
+                if let Some(h) = hwnd_of(&ui) {
+                    app.set_hwnd(h);
+                    paint_titlebar(h, ui.global::<Theme>().get_dark());
+                    with(|c, ui| {
+                        create_overlay(c, ui, h);
+                        relayout(c, ui);
+                    });
+                }
                 return;
             }
-            if let Some(h) = hwnd_of(&ui) {
-                app.set_hwnd(h);
-                paint_titlebar(h, ui.global::<Theme>().get_dark());
-                with(|c, ui| relayout(c, ui));
-            }
+            // Depois a dos controles (a janela nativa dela também nasce com o loop rodando).
+            let main = app.hwnd();
+            with(|c, ui| {
+                if c.overlay_attached {
+                    return;
+                }
+                if let Some(oh) = c.overlay.as_ref().and_then(|o| window_hwnd(o.window())) {
+                    overlay::attach(main, oh);
+                    c.overlay_attached = true;
+                    relayout(c, ui);
+                }
+            });
         });
     }
 
@@ -1790,8 +1929,12 @@ pub fn run() -> Result<(), slint::PlatformError> {
             if c.toasts.len() != before {
                 render_toasts(c, ui);
             }
-            if c.fullscreen && c.controls_until.is_some_and(|t| t <= now) {
-                c.controls_until = None;
+            if c.hover.as_ref().is_some_and(|(_, until)| *until + CONTROLS_FADE <= now) {
+                c.hover = None;
+            }
+            let state = controls_state(c, now);
+            if state != c.last_controls {
+                c.last_controls = state;
                 relayout(c, ui);
             }
         });
@@ -1817,7 +1960,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
 /// ninguém clicar. Rodar com APPDATA apontando para uma pasta de teste (não mexe nas
 /// configurações de quem usa o app). `AJ_AUTOTEST=host`: transmite a tela principal (fora
 /// da lista "Ao vivo") e grava o código em `AJ_CODE_FILE`. `AJ_AUTOTEST=watch`: assiste o
-/// código desse arquivo a `AJ_VIEW_FPS`; com `AJ_MENU_AFTER` (s), abre o menu de engrenagem.
+/// código desse arquivo a `AJ_VIEW_FPS`; com `AJ_MENU_AFTER` (s), abre o menu de engrenagem;
+/// com `AJ_SHOW_CONTROLS`, deixa os controles por cima do vídeo à mostra.
 #[cfg(debug_assertions)]
 fn autotest() {
     let Ok(mode) = std::env::var("AJ_AUTOTEST") else { return };
@@ -1827,6 +1971,7 @@ fn autotest() {
     let mut done = false;
     let mut menu_opened = false;
     let mut last_toggle = 0u64;
+    let mut quality_set = false;
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(500), move || {
         with(|c, ui| match mode.as_str() {
             "host" => {
@@ -1835,6 +1980,9 @@ fn autotest() {
                     c.s.public = false;
                     c.s.stream_password.clear();
                     c.s.name = "Autoteste".into();
+                    // Sem áudio: com várias instâncias na mesma máquina, o host captaria o som
+                    // dos espectadores de teste (eco).
+                    c.s.audio_mode = "none".into();
                     let Some(src) = capture::list_sources().into_iter().find(|s| s.primary) else { return };
                     start_sharing(c, ui, src, None);
                 } else if !c.code.is_empty() && std::fs::read_to_string(&code_file).ok().as_deref() != Some(c.code.as_str()) {
@@ -1850,6 +1998,15 @@ fn autotest() {
                     eprintln!("[autotest] assistindo a {} fps (monitor {} Hz)", view_fps(c, ui), monitor_hz(ui));
                     start_watching(c, ui, code.trim().to_string(), None);
                 }
+                // Qualidade fixa (AJ_QUALITY=1080, por exemplo), sem a automática.
+                if let (Ok(q), false) = (std::env::var("AJ_QUALITY"), quality_set) {
+                    if let Some(v) = c.viewers.iter_mut().find(|v| v.watching) {
+                        quality_set = true;
+                        v.quality = q.clone();
+                        session::viewer_quality(&v.id, &q);
+                        eprintln!("[autotest] qualidade fixa {q}");
+                    }
+                }
                 // Abre e fecha o menu a cada 2 s, pelo mesmo caminho do clique (medir com AJ_TRACE).
                 if std::env::var_os("AJ_MENU_TOGGLE").is_some() && started.elapsed() >= Duration::from_secs(40) {
                     let tick = (started.elapsed().as_millis() / 2000) as u64;
@@ -1859,6 +2016,12 @@ fn autotest() {
                             eprintln!("[ui {:.0}] (autoteste) alterna o menu", tms());
                             toggle_menu(c, ui, &id);
                         }
+                    }
+                }
+                // Controles por cima do vídeo sempre à mostra (para conferir sem mexer o mouse).
+                if std::env::var_os("AJ_SHOW_CONTROLS").is_some() {
+                    if let Some(id) = c.viewers.iter().find(|v| v.watching).map(|v| v.id.clone()) {
+                        wake_controls(c, ui, &id);
                     }
                 }
                 let menu_after = std::env::var("AJ_MENU_AFTER").ok().and_then(|v| v.parse::<u64>().ok());

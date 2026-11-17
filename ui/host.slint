@@ -23,6 +23,8 @@ component ToggleRow inherits Rectangle {
     in property <string> title;
     in property <string> body;
     in property <bool> checked;
+    /// Selo ao lado do título (ex.: "Experimental").
+    in property <string> badge;
     callback toggled(bool);
     border-radius: 10px;
     border-width: 1px;
@@ -33,7 +35,12 @@ component ToggleRow inherits Rectangle {
         spacing: 16px;
         VerticalLayout {
             spacing: 2px;
-            Text { text: root.title; font-size: 13px; font-weight: 500; color: Theme.fg; }
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                Text { text: root.title; font-size: 13px; font-weight: 500; color: Theme.fg; vertical-alignment: center; }
+                if root.badge != "" : Badge { mono: false; bg: Theme.warn.with-alpha(0.2); ink: Theme.fg; text: root.badge; }
+            }
             Text { text: root.body; font-size: 12px; color: Theme.muted-fg; wrap: word-wrap; }
         }
         VerticalLayout {
@@ -117,6 +124,15 @@ component SettingsCard inherits Card {
                 body: "Desligue para transmitir só o conteúdo.";
                 checked: App.s-cursor;
                 toggled(v) => { App.set-setting("cursor", v ? "1" : "0"); }
+            }
+            ToggleRow {
+                title: "Malha P2P";
+                badge: "Experimental";
+                body: App.live
+                    ? "Quem assiste repassa partes do vídeo para os outros e sua internet manda menos. Vale a partir da próxima transmissão."
+                    : "Quem assiste repassa partes do vídeo para os outros e sua internet manda menos. Os espectadores se conectam entre si.";
+                checked: App.s-mesh;
+                toggled(v) => { App.set-setting("mesh", v ? "1" : "0"); }
             }
             // Senha: quem assiste precisa do código e dela (na lista pública aparece um cadeado).
             VerticalLayout {
@@ -527,6 +543,7 @@ export component HostView inherits ScrollView {
                     Badge { bg: Theme.bg.with-alpha(0.8); text: "FPS " + App.stat-fps; }
                     Badge { bg: Theme.bg.with-alpha(0.8); text: "Taxa " + App.stat-rate; }
                     if App.stat-net != "" : Badge { bg: Theme.warn; ink: #000000; text: App.stat-net; }
+                    if App.stat-mesh != "" : Badge { bg: Theme.bg.with-alpha(0.8); text: App.stat-mesh; }
                 }
             }
 

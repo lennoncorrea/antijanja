@@ -1,0 +1,464 @@
+// Controles por cima do vídeo (estilo YouTube): faixa escurecida em cima com quem
+// transmite e os números, e embaixo com som, engrenagem e tela cheia.
+//
+// O vídeo é uma janela nativa: a janela principal não consegue desenhar por cima dele.
+// Por isso isto é uma segunda janela, transparente, do tamanho da área interna da
+// principal e sempre na frente dela (ver src/overlay.rs). O Rust recorta a janela só nas
+// faixas visíveis e no menu; no resto o mouse passa direto para o vídeo.
+//
+// Medidas usadas também pelo Rust (src/ui.rs): faixa de cima 76, de baixo 84, menu 300
+// de largura, base do menu 52 acima do fim do vídeo.
+import { Theme } from "theme.slint";
+import { Tile, MenuOption } from "state.slint";
+import { Icon, Slider } from "widgets.slint";
+
+export global Ov {
+    in property <[Tile]> tiles;
+    // Onde começa a área dos tiles na janela (abaixo das barras do app).
+    in property <length> top;
+    in property <bool> fullscreen;
+    // Diagnóstico (AJ_OVERLAY_DEBUG): pinta a janela inteira de rosa translúcido.
+    in property <bool> debug-tint;
+    // Menu de engrenagem (posição na janela, calculada no Rust).
+    in property <string> menu-tile;
+    in property <string> menu-panel: "main";
+    in property <length> menu-x;
+    in property <length> menu-bottom;
+    in property <[MenuOption]> menu-fps;
+    in property <[MenuOption]> menu-quality;
+    in property <string> menu-fps-label;
+    in property <string> menu-quality-label;
+    in property <string> menu-gen-tag;
+    in property <string> menu-info;
+    in property <string> menu-fps-hint;
+    // O mouse mexeu sobre os controles desta stream (adia o sumiço).
+    callback activity(string);
+    callback leave(string);
+    callback toggle-focus(string);
+    callback toggle-fullscreen(string);
+    callback set-volume(string, int);
+    callback toggle-mute(string);
+    callback set-view-fps(string);
+    callback toggle-menu(string);
+    callback menu-resized(length);
+    callback close-menu();
+    callback menu-go(string);
+    callback pick-quality(string);
+}
+
+// Cores fixas: os controles ficam sobre o vídeo, em qualquer tema.
+global Ink {
+    out property <color> fg: #e8f1f3;
+    out property <color> soft: #c4d6da;
+    out property <color> hover: #ffffff24;
+    out property <color> cyan: #00d4ff;
+    out property <color> live: #1cc2e3;
+}
+
+component OvBtn inherits Rectangle {
+    in property <image> icon;
+    in property <string> label;
+    in property <bool> on;
+    callback clicked();
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    background: root.on || ta.has-hover ? Ink.hover : transparent;
+    Icon {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        source: root.icon;
+        tint: Ink.fg;
+        width: 20px;
+        height: 20px;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.clicked(); }
+}
+
+component OvBadge inherits Rectangle {
+    in property <string> text;
+    in property <bool> warn;
+    height: 20px;
+    width: label.preferred-width + 14px;
+    border-radius: 5px;
+    background: root.warn ? #f2c14e : #040a0b8c;
+    label := Text {
+        text: root.text;
+        font-family: Theme.mono;
+        font-size: 11px;
+        color: root.warn ? #000000 : Ink.fg;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+}
+
+// Selo da geração de quadros ("FG 2x").
+component GenTag inherits Rectangle {
+    in property <string> text;
+    height: 18px;
+    width: label.preferred-width + 12px;
+    border-radius: 4px;
+    background: Theme.feature-bg;
+    border-width: 1px;
+    border-color: Theme.primary.with-alpha(0.35);
+    label := Text {
+        text: root.text;
+        font-family: Theme.mono;
+        font-size: 10px;
+        font-weight: 600;
+        color: Theme.feature-ink;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+}
+
+// Linha do menu principal: nome, valor atual e seta.
+component MenuRow inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <string> tag;
+    callback clicked();
+    height: 44px;
+    border-radius: 8px;
+    background: ta.has-hover ? Theme.muted : transparent;
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 8px;
+        spacing: 8px;
+        Text { text: root.label; font-size: 13px; font-weight: 500; color: Theme.fg; vertical-alignment: center; horizontal-stretch: 1; }
+        Text { text: root.value; font-size: 12px; color: Theme.muted-fg; vertical-alignment: center; }
+        if root.tag != "" : VerticalLayout { alignment: center; GenTag { text: root.tag; } }
+        VerticalLayout {
+            alignment: center;
+            Icon { source: @image-url("icons/chevron-right.svg"); tint: Theme.muted-fg; width: 14px; height: 14px; }
+        }
+    }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// Opção de um submenu: marca de escolhida, nome, selo e observação.
+component OptionRow inherits Rectangle {
+    in property <MenuOption> o;
+    callback clicked();
+    height: 40px;
+    border-radius: 8px;
+    background: o.selected ? Theme.accent : ta.has-hover ? Theme.muted : transparent;
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 10px;
+        Rectangle {
+            width: 16px;
+            if root.o.selected : Icon { source: @image-url("icons/check.svg"); tint: Theme.primary; width: 14px; height: 14px; }
+        }
+        Text { text: root.o.label; font-size: 13px; font-weight: root.o.selected ? 600 : 400; color: Theme.fg; vertical-alignment: center; horizontal-stretch: 1; }
+        if root.o.tag != "" : VerticalLayout { alignment: center; GenTag { text: root.o.tag; } }
+        if root.o.note != "" : Text { text: root.o.note; font-size: 11px; color: Theme.muted-fg; vertical-alignment: center; }
+    }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+component MenuBack inherits Rectangle {
+    in property <string> title;
+    height: 40px;
+    border-radius: 8px;
+    background: ta.has-hover ? Theme.muted : transparent;
+    HorizontalLayout {
+        padding-left: 8px;
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            Icon { source: @image-url("icons/chevron-left.svg"); tint: Theme.muted-fg; width: 14px; height: 14px; }
+        }
+        Text { text: root.title; font-size: 13px; font-weight: 600; color: Theme.fg; vertical-alignment: center; }
+    }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { Ov.menu-go("main"); } }
+}
+
+component MenuDivider inherits Rectangle {
+    height: 9px;
+    Rectangle { x: 6px; width: parent.width - 12px; height: 1px; background: Theme.border; }
+}
+
+// Menu de engrenagem: qualidade e fps da stream. Altura: a do conteúdo, avisada ao Rust
+// (que recorta a janela do tamanho exato do menu).
+component GearMenu inherits Rectangle {
+    width: 300px;
+    height: lay.preferred-height;
+    background: Theme.card;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: Theme.input;
+    init => { Ov.menu-resized(self.height); }
+    changed height => { Ov.menu-resized(self.height); }
+    TouchArea { }
+    lay := VerticalLayout {
+        padding: 6px;
+        spacing: 2px;
+        alignment: start;
+        if Ov.menu-panel == "main" : MenuRow {
+            label: "Qualidade";
+            value: Ov.menu-quality-label;
+            clicked => { Ov.menu-go("quality"); }
+        }
+        if Ov.menu-panel == "main" : MenuRow {
+            label: "FPS";
+            value: Ov.menu-fps-label;
+            tag: Ov.menu-gen-tag;
+            clicked => { Ov.menu-go("fps"); }
+        }
+        if Ov.menu-panel == "main" : MenuDivider { }
+        if Ov.menu-panel == "main" : Text {
+            text: Ov.menu-info;
+            font-size: 11px;
+            color: Theme.muted-fg;
+            wrap: word-wrap;
+        }
+        if Ov.menu-panel == "fps" : MenuBack { title: "FPS para assistir"; }
+        if Ov.menu-panel == "fps" : MenuDivider { }
+        if Ov.menu-panel == "fps" : VerticalLayout {
+            spacing: 2px;
+            for o in Ov.menu-fps : OptionRow { o: o; clicked => { Ov.set-view-fps(o.value); } }
+        }
+        if Ov.menu-panel == "fps" : MenuDivider { }
+        if Ov.menu-panel == "fps" : Text {
+            text: Ov.menu-fps-hint;
+            font-size: 11px;
+            color: Theme.muted-fg;
+            wrap: word-wrap;
+        }
+        if Ov.menu-panel == "quality" : MenuBack { title: "Qualidade"; }
+        if Ov.menu-panel == "quality" : MenuDivider { }
+        if Ov.menu-panel == "quality" : VerticalLayout {
+            spacing: 2px;
+            for o in Ov.menu-quality : OptionRow { o: o; clicked => { Ov.pick-quality(o.value); } }
+        }
+        if Ov.menu-panel == "quality" : MenuDivider { }
+        if Ov.menu-panel == "quality" : Text {
+            text: "Auto: a resolução acompanha a sua rede. Uma fixa menor economiza internet.";
+            font-size: 11px;
+            color: Theme.muted-fg;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// Fundo de uma faixa: mexer o mouse adia o sumiço, clicar fecha o menu, clique duplo
+// alterna a tela cheia (como no vídeo).
+component BandArea inherits TouchArea {
+    in property <string> id;
+    pointer-event(e) => {
+        if (e.kind == PointerEventKind.move) {
+            Ov.activity(root.id);
+        } else if (e.kind == PointerEventKind.down && Ov.menu-tile != "") {
+            Ov.close-menu();
+        }
+    }
+    double-clicked => { Ov.toggle-fullscreen(root.id); }
+}
+
+component TileControls inherits Rectangle {
+    in property <Tile> t;
+    property <length> radius: Ov.fullscreen ? 0px : 11px;
+    property <bool> menu-open: Ov.menu-tile == root.t.id;
+    opacity: root.t.chrome || root.menu-open ? 1 : 0;
+    animate opacity { duration: 180ms; easing: ease-out; }
+
+    // Faixa de cima: quem transmite e os números.
+    Rectangle {
+        y: 0;
+        height: 76px;
+        border-top-left-radius: root.radius;
+        border-top-right-radius: root.radius;
+        background: @linear-gradient(180deg, #000000b8 0%, #00000000 100%);
+        BandArea { id: root.t.id; }
+        HorizontalLayout {
+            y: 0;
+            height: 52px;
+            padding-left: 14px;
+            padding-right: 12px;
+            spacing: 10px;
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 30px;
+                    height: 30px;
+                    border-radius: 15px;
+                    background: #06303b;
+                    Text {
+                        text: root.t.initials;
+                        font-size: 11px;
+                        font-weight: 700;
+                        color: Ink.cyan;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 1;
+                Text { text: root.t.name; font-size: 14px; font-weight: 600; color: Ink.fg; overflow: elide; }
+                HorizontalLayout {
+                    spacing: 6px;
+                    alignment: start;
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle { width: 7px; height: 7px; border-radius: 3.5px; background: Ink.cyan; }
+                    }
+                    Text { text: "Ao vivo, P2P"; font-size: 12px; color: Ink.live; }
+                }
+            }
+            if root.t.res != "" && root.width > 520px : VerticalLayout {
+                alignment: center;
+                HorizontalLayout {
+                    spacing: 4px;
+                    OvBadge { text: root.t.res; }
+                    if root.t.gen-tag != "" : VerticalLayout { alignment: center; GenTag { text: "FG " + root.t.gen-tag; } }
+                    OvBadge { text: root.t.rate; }
+                    if root.t.ping != "" : OvBadge { text: root.t.ping; warn: root.t.ping-warn; }
+                }
+            }
+        }
+    }
+
+    // Faixa de baixo: som, engrenagem, ampliar, tela cheia e fechar.
+    Rectangle {
+        y: parent.height - self.height;
+        height: 84px;
+        border-bottom-left-radius: root.radius;
+        border-bottom-right-radius: root.radius;
+        background: @linear-gradient(180deg, #00000000 0%, #000000c7 100%);
+        BandArea { id: root.t.id; }
+        HorizontalLayout {
+            y: parent.height - 46px;
+            height: 40px;
+            padding-left: 8px;
+            padding-right: 8px;
+            spacing: 4px;
+            VerticalLayout {
+                alignment: center;
+                OvBtn {
+                    icon: root.t.muted || root.t.volume == 0 ? @image-url("icons/volume-x.svg") : @image-url("icons/volume.svg");
+                    label: root.t.muted ? "Ativar som" : "Silenciar";
+                    clicked => { Ov.toggle-mute(root.t.id); }
+                }
+            }
+            if root.width > 300px : VerticalLayout {
+                alignment: center;
+                Slider {
+                    width: root.width > 520px ? 100px : 64px;
+                    track: #ffffff40;
+                    value: root.t.muted ? 0 : root.t.volume;
+                    changed(v) => { Ov.set-volume(root.t.id, v); }
+                }
+            }
+            if root.width > 420px : Text {
+                text: (root.t.muted ? 0 : root.t.volume) + "%";
+                width: 40px;
+                font-size: 11px;
+                font-family: Theme.mono;
+                color: Ink.soft;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            // Engrenagem: qualidade e fps. Ao lado, o multiplicador da geração de quadros.
+            VerticalLayout {
+                alignment: center;
+                gear := Rectangle {
+                    height: 36px;
+                    width: gear-row.preferred-width + 16px;
+                    border-radius: 8px;
+                    background: root.menu-open || gear-ta.has-hover ? Ink.hover : transparent;
+                    gear-row := HorizontalLayout {
+                        x: 8px;
+                        spacing: 6px;
+                        VerticalLayout {
+                            alignment: center;
+                            Icon {
+                                source: @image-url("icons/settings.svg");
+                                tint: Ink.fg;
+                                width: 18px;
+                                height: 18px;
+                            }
+                        }
+                        if root.t.gen-tag != "" : Text {
+                            text: root.t.gen-tag;
+                            font-family: Theme.mono;
+                            font-size: 11px;
+                            font-weight: 600;
+                            color: Ink.cyan;
+                            vertical-alignment: center;
+                        }
+                    }
+                    // Abre ao apertar (não ao soltar), como os menus de player de vídeo.
+                    gear-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        pointer-event(e) => {
+                            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                                Ov.toggle-menu(root.t.id);
+                            }
+                        }
+                    }
+                    accessible-role: button;
+                    accessible-action-default => { Ov.toggle-menu(root.t.id); }
+                    accessible-label: "Configurações da stream (qualidade e fps)";
+                }
+            }
+            // Em tela cheia só há uma stream: "ampliar" não faz sentido.
+            if !Ov.fullscreen : VerticalLayout {
+                alignment: center;
+                OvBtn {
+                    icon: root.t.focused ? @image-url("icons/minimize.svg") : @image-url("icons/maximize.svg");
+                    label: root.t.focused ? "Voltar para a grade" : "Ampliar";
+                    clicked => { Ov.toggle-focus(root.t.id); }
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                OvBtn {
+                    icon: Ov.fullscreen ? @image-url("icons/fullscreen-exit.svg") : @image-url("icons/fullscreen.svg");
+                    label: Ov.fullscreen ? "Sair da tela cheia (Esc)" : "Tela cheia (F11 ou duplo clique)";
+                    clicked => { Ov.toggle-fullscreen(root.t.id); }
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                OvBtn {
+                    icon: @image-url("icons/x.svg");
+                    label: "Parar de assistir";
+                    clicked => { Ov.leave(root.t.id); }
+                }
+            }
+        }
+    }
+}
+
+export component VideoOverlay inherits Window {
+    title: "AntiJanja";
+    no-frame: true;
+    background: Ov.debug-tint ? #ff00ff40 : transparent;
+    preferred-width: 640px;
+    preferred-height: 360px;
+    // A mesma área de vídeo que o Rust dá ao player (borda de 1 px fora da tela cheia).
+    property <length> border: Ov.fullscreen ? 0px : 1px;
+    for t in Ov.tiles : TileControls {
+        x: t.x + root.border;
+        y: Ov.top + t.y + root.border;
+        width: t.w - 2 * root.border;
+        height: t.h - 2 * root.border;
+        t: t;
+        visible: t.watching;
+    }
+    if Ov.menu-tile != "" : GearMenu {
+        x: Ov.menu-x;
+        y: Ov.menu-bottom - self.height;
+    }
+}

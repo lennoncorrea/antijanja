@@ -47,6 +47,9 @@ pub struct HostConfig {
     /// Senha da transmissão (vazia = sem senha).
     #[serde(default)]
     pub password: String,
+    /// Malha P2P (experimental; docs/malha-p2p.md). Vale a partir do começo da transmissão.
+    #[serde(default)]
+    pub mesh: bool,
 }
 
 impl HostConfig {
@@ -115,6 +118,19 @@ struct HostShared {
     /// Versões menores pedidas ao pipeline agora.
     extras: Mutex<Vec<ExtraReq>>,
     alive: AtomicBool,
+    /// Malha P2P (AJ_MESH=1; docs/malha-p2p.md): espectadores repassando faixas entre si.
+    /// Uma malha por versão do vídeo (0 = principal, senão a altura): quem está em 480p
+    /// troca pedaços com quem está em 480p (a qualidade automática desce quem tem a
+    /// internet pior; com uma malha só da principal, eles saíam dela).
+    mesh: Option<Mutex<HashMap<u32, Arc<crate::meshnet::MeshHub>>>>,
+    trace_sent: Mutex<(Instant, u64)>,
+    /// Último aviso da malha para o painel.
+    mesh_report: Mutex<Instant>,
+    app: AppHandle,
+    /// Chave pública com que os quadros são assinados (hex), mandada a cada espectador.
+    stream_pk: String,
+    /// Fonte dos pedaços (para atender pedidos de reparo).
+    piece_source: Arc<Mutex<crate::pieces::PieceSource>>,
 }
 
 impl HostShared {
@@ -282,13 +298,89 @@ impl HostShared {
         }
         self.assign();
         self.apply();
+        self.sync_mesh();
+    }
+
+    /// Acerta quem está na malha: espectadores conectados, recebendo pedaços e na versão
+    /// principal do vídeo (a malha repassa só ela). Cobre de uma vez as saídas
+    /// (desconexão, "bye", expulsão), a troca de versão e o canal de pedaços que chega
+    /// depois da conexão.
+    fn sync_mesh(&self) {
+        let Some(groups) = &self.mesh else { return };
+        // Quem está apto, e em qual versão.
+        let eligible: HashMap<u64, (u32, Arc<HostPeer>)> = self
+            .peers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p)| p.state == "connected" && p.pending.is_none() && p.peer.has_pieces())
+            .map(|(id, p)| (*id, (p.rendition, p.peer.clone())))
+            .collect();
+        let mut groups = groups.lock().unwrap();
+        // Primeiro as saídas (inclusive de quem trocou de versão), depois as entradas.
+        for (key, hub) in groups.iter() {
+            for id in hub.ids() {
+                if eligible.get(&id).map(|e| e.0) != Some(*key) {
+                    hub.leave(id);
+                }
+            }
+        }
+        for (id, (key, peer)) in eligible {
+            let hub = groups.entry(key).or_insert_with(|| crate::meshnet::MeshHub::new(crate::pieces::LANES as usize));
+            if !hub.contains(id) {
+                hub.join(id, peer);
+            }
+        }
+        groups.retain(|_, h| !h.ids().is_empty());
+        for hub in groups.values() {
+            hub.tick();
+        }
+        // Para o painel de quem transmite: quantos estão na malha e quanto do vídeo o host
+        // ainda manda (faixas direto / todas as faixas de quem está nela), a cada 2 s.
+        {
+            let mut last = self.mesh_report.lock().unwrap();
+            if last.elapsed() >= Duration::from_secs(2) {
+                *last = Instant::now();
+                let (mut members, mut direct) = (0usize, 0u32);
+                for hub in groups.values() {
+                    for (_, mask, _) in hub.snapshot() {
+                        members += 1;
+                        direct += (mask & ((1 << crate::pieces::LANES) - 1)).count_ones();
+                    }
+                }
+                let percent = if members > 0 { direct as f64 * 100.0 / (members as f64 * crate::pieces::LANES as f64) } else { 100.0 };
+                let _ = self.app.emit("host-mesh", serde_json::json!({ "members": members, "percent": percent.round() }));
+            }
+        }
+        if std::env::var_os("AJ_TRACE").is_some() {
+            // Diagnóstico: pedaços por segundo saindo do host e as faixas de cada um.
+            let sent: u64 = self.peers.lock().unwrap().values().map(|p| p.peer.pieces_sent.load(Ordering::Relaxed)).sum();
+            let mut last = self.trace_sent.lock().unwrap();
+            let el = last.0.elapsed().as_secs_f64();
+            if el >= 2.0 {
+                let rate = sent.saturating_sub(last.1) as f64 / el;
+                let mut parts = vec![];
+                for (key, hub) in groups.iter() {
+                    let routes: Vec<String> = hub.snapshot().iter().map(|(id, mask, _)| format!("{id}:{mask:04b}")).collect();
+                    parts.push(format!("versão {key}: {}", routes.join(" ")));
+                }
+                eprintln!("[malha host] {:.0} pedaços/s; direto {}", rate, parts.join(" | "));
+                *last = (Instant::now(), sent);
+            }
+        }
+    }
+
+    /// A malha em que o espectador `id` está (se está em alguma).
+    fn mesh_of(&self, id: u64) -> Option<Arc<crate::meshnet::MeshHub>> {
+        self.mesh.as_ref()?.lock().unwrap().values().find(|h| h.contains(id)).cloned()
     }
 }
 
 enum Media {
-    /// (versão: 0 = principal, senão a altura; dados; duração)
-    Video(u32, Bytes, Duration),
-    Audio(Bytes),
+    /// (versão: 0 = principal, senão a altura; dados; duração; horário de captura em 90 kHz)
+    Video(u32, Bytes, Duration, u32),
+    /// (Opus de 20 ms; horário de captura em 90 kHz)
+    Audio(Bytes, u32),
 }
 
 struct HostSession {
@@ -300,6 +392,8 @@ struct HostSession {
     opus: Arc<Mutex<OpusEncoder>>,
     peers: Arc<Mutex<HashMap<u64, PeerEntry>>>,
     media_tx: tokio::sync::mpsc::Sender<Media>,
+    /// Começo do relógio de mídia (áudio e vídeo carimbados nele).
+    media_epoch: Instant,
     on_offer: rendezvous::OfferFn,
     public: Option<rendezvous::PublicAnnouncer>,
     since: i64,
@@ -367,7 +461,17 @@ fn emit_peers(app: &AppHandle, peers: &Mutex<HashMap<u64, PeerEntry>>) {
     let _ = app.emit("host-peers", list);
 }
 
-fn start_audio(app: &AppHandle, cfg: &HostConfig, opus: Arc<Mutex<OpusEncoder>>, tx: tokio::sync::mpsc::Sender<Media>) -> Option<AudioCapture> {
+/// Relógio de mídia do host: 90 kHz desde o começo da transmissão. Áudio e vídeo são
+/// carimbados com o instante da captura nele (é o que permite tocar os dois juntos).
+fn media_ticks(epoch: Instant, at: Instant) -> u32 {
+    (at.saturating_duration_since(epoch).as_secs_f64() * crate::avsync::MEDIA_HZ) as u64 as u32
+}
+
+/// O Opus atrasa a saída em relação à entrada (lookahead de 6,5 ms): o pacote decodificado
+/// começa 6,5 ms antes do horário de captura do bloco que entrou.
+const OPUS_DELAY_TICKS: u32 = 585;
+
+fn start_audio(app: &AppHandle, cfg: &HostConfig, opus: Arc<Mutex<OpusEncoder>>, tx: tokio::sync::mpsc::Sender<Media>, epoch: Instant) -> Option<AudioCapture> {
     if cfg.audio_mode == "none" || cfg.audio_mode.is_empty() {
         let _ = app.emit("host-audio", serde_json::json!({ "status": "off", "detail": "" }));
         return None;
@@ -375,14 +479,17 @@ fn start_audio(app: &AppHandle, cfg: &HostConfig, opus: Arc<Mutex<OpusEncoder>>,
     let app2 = app.clone();
     let mut last_level = Instant::now();
     let app_level = app.clone();
-    let sink: audio::PcmSink = Box::new(move |pcm: Vec<u8>| {
+    let sink: audio::PcmSink = Box::new(move |pcm: Vec<u8>, at: Option<Instant>| {
         if last_level.elapsed() > Duration::from_millis(100) {
             last_level = Instant::now();
             let peak = pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]).unsigned_abs()).max().unwrap_or(0);
             let _ = app_level.emit("host-audio-level", (peak as f32 / 32768.0).sqrt());
         }
         if let Ok(pkt) = opus.lock().unwrap().encode(&pcm) {
-            let _ = tx.try_send(Media::Audio(Bytes::from(pkt)));
+            // Sem o horário do Windows: o bloco acabou de ficar pronto (≈ 20 ms atrás).
+            let at = at.unwrap_or_else(|| Instant::now().checked_sub(Duration::from_millis(20)).unwrap_or_else(Instant::now));
+            let ts = media_ticks(epoch, at).wrapping_sub(OPUS_DELAY_TICKS);
+            let _ = tx.try_send(Media::Audio(Bytes::from(pkt), ts));
         }
         true
     });
@@ -407,6 +514,30 @@ pub fn sources_list() -> Vec<Source> {
 pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
     let state = app.rdv();
     stop_host(&state);
+    // Malha P2P (docs/malha-p2p.md): vídeo em pedaços pelo canal de dados, para quem tem
+    // esse canal (AJ_PIECES=1), e os espectadores repassando faixas entre si (opção
+    // "Malha P2P" ou AJ_MESH=1, que liga os pedaços também).
+    let mesh_on = config.mesh || std::env::var_os("AJ_MESH").is_some();
+    let media_epoch = Instant::now();
+    // Chave desta transmissão para assinar os quadros (a do código muda se a senha mudar
+    // ao vivo; esta vale do começo ao fim). A pública vai para cada espectador pela
+    // conexão direta, ao conectar.
+    let stream_signer = {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).map_err(|e| e.to_string())?;
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+    };
+    let stream_pk: String = stream_signer.verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    // Malha: cada quadro vira pedaços uma vez só, os mesmos para todos; na malha a folga
+    // aguenta perder uma faixa inteira e cada quadro é assinado. Compartilhada com quem
+    // atende os pedidos de reparo.
+    let piece_source = {
+        let mut s = crate::pieces::PieceSource::new(transport::PIECE_OVERHEAD);
+        s.survive_lane = mesh_on;
+        s.signer = mesh_on.then(|| stream_signer.clone());
+        Arc::new(Mutex::new(s))
+    };
+    transport::USE_PIECES.store(mesh_on || std::env::var_os("AJ_PIECES").is_some(), Ordering::Relaxed);
     let (media_tx, mut media_rx) = tokio::sync::mpsc::channel::<Media>(240);
     let peers: Arc<Mutex<HashMap<u64, PeerEntry>>> = Arc::new(Mutex::new(HashMap::new()));
     let keyframes: Arc<Mutex<std::collections::HashSet<u32>>> = Default::default();
@@ -417,13 +548,15 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
     {
         let peers = peers.clone();
         let kf = keyframes.clone();
+        let source = piece_source.clone();
         transport::spawn(async move {
+            let use_pieces = transport::USE_PIECES.load(Ordering::Relaxed);
             while let Some(m) = media_rx.recv().await {
                 let targets: Vec<Arc<HostPeer>> = {
                     let mut peers = peers.lock().unwrap();
                     let (key, is_keyframe) = match &m {
-                        Media::Video(k, d, _) => (Some(*k), crate::media::has_nal(d, 5)),
-                        Media::Audio(_) => (None, false),
+                        Media::Video(k, d, _, _) => (Some(*k), crate::media::has_nal(d, 5)),
+                        Media::Audio(..) => (None, false),
                     };
                     peers
                         .values_mut()
@@ -439,16 +572,34 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
                         })
                         .collect()
                 };
+                let pieces = match &m {
+                    Media::Video(k, d, _, ts) if use_pieces => source.lock().unwrap().encode_at(*k, d, *ts),
+                    Media::Audio(d, ts) if use_pieces => Some(source.lock().unwrap().encode_audio(d, *ts)),
+                    _ => None,
+                };
                 for p in targets {
                     match &m {
-                        Media::Video(k, d, dur) => {
+                        Media::Video(k, d, dur, _) => {
                             // Fila do pacer cheia: quadro descartado, quem perdeu precisa de keyframe.
-                            if let Ok(false) = p.send_video(d.clone(), *dur).await {
+                            let sent = match &pieces {
+                                Some(f) if p.has_pieces() => p.send_pieces(f),
+                                _ => !matches!(p.send_video(d.clone(), *dur).await, Ok(false)),
+                            };
+                            if !sent {
                                 kf.lock().unwrap().insert(*k);
                             }
                         }
-                        Media::Audio(d) => {
-                            let _ = p.send_audio(d.clone(), Duration::from_millis(20)).await;
+                        Media::Audio(d, _) => {
+                            // Com pedaços, o áudio vai neles (sincronizado e pela malha); só
+                            // quem não tem o canal recebe pela faixa RTP.
+                            match &pieces {
+                                Some(f) if p.has_pieces() => {
+                                    p.send_pieces(f);
+                                }
+                                _ => {
+                                    let _ = p.send_audio(d.clone(), Duration::from_millis(20)).await;
+                                }
+                            }
                         }
                     }
                 }
@@ -467,8 +618,8 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
             config.source.clone(),
             config.video(),
             Callbacks {
-                on_packet: Arc::new(move |key, data, dur| {
-                    if tx.try_send(Media::Video(key, Bytes::from(data), dur)).is_err() {
+                on_packet: Arc::new(move |key, data, dur, at| {
+                    if tx.try_send(Media::Video(key, Bytes::from(data), dur, media_ticks(media_epoch, at))).is_err() {
                         kf.lock().unwrap().insert(key); // fila cheia: quadro perdido
                     }
                 }),
@@ -510,11 +661,17 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
         applied: Mutex::new(None),
         extras: Mutex::new(vec![]),
         alive: AtomicBool::new(true),
+        mesh: mesh_on.then(|| Mutex::new(HashMap::new())),
+        trace_sent: Mutex::new((Instant::now(), 0)),
+        mesh_report: Mutex::new(Instant::now()),
+        app: app.clone(),
+        stream_pk,
+        piece_source: piece_source.clone(),
     });
 
     let opus = Arc::new(Mutex::new(OpusEncoder::new(config.abitrate.clamp(32, 510))?));
     opus.lock().unwrap().set_gain(config.volume as f32 / 100.0);
-    let audio = start_audio(&app, &config, opus.clone(), media_tx.clone());
+    let audio = start_audio(&app, &config, opus.clone(), media_tx.clone(), media_epoch);
 
     // Pedidos de conexão vindos da DHT.
     let on_offer: rendezvous::OfferFn = {
@@ -558,7 +715,7 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
     let code = rendezvous::host_listen(&state, on_offer.clone(), config.password())?;
     let since = rendezvous::now_ms();
     let public = start_public(&state, &config, &code, since, 0);
-    *HOST.lock().unwrap() = Some(HostSession { code: code.clone(), config, shared: shared.clone(), video, audio, opus, peers, media_tx, on_offer, public, since });
+    *HOST.lock().unwrap() = Some(HostSession { code: code.clone(), config, shared: shared.clone(), video, audio, opus, peers, media_epoch, media_tx, on_offer, public, since });
 
     // Keyframes pedidos (no máximo 1 por segundo em cada versão) e bitrate de quem parou
     // de mandar relatório.
@@ -615,9 +772,16 @@ async fn accept_viewer(
                                 let _ = app.emit("host-viewer-joined", name.clone());
                             }
                             p.state = "connected";
-                            // As qualidades que dá para escolher (menu de quem assiste).
+                            // As qualidades que dá para escolher (menu de quem assiste) e,
+                            // na malha, a chave que assina os quadros (antes de qualquer rota).
                             let (peer, msg) = (p.peer.clone(), shared.renditions_msg());
-                            transport::spawn(async move { peer.send_message(&msg).await });
+                            let key = shared.mesh.is_some().then(|| serde_json::json!({ "t": "stream-key", "pk": shared.stream_pk }).to_string());
+                            transport::spawn(async move {
+                                if let Some(k) = key {
+                                    peer.send_message(&k).await;
+                                }
+                                peer.send_message(&msg).await;
+                            });
                         }
                         // (a lista está travada aqui: não chamar o que trava de novo)
                         shared.request_keyframe(map.get(&id).map(|p| p.rendition).unwrap_or(0));
@@ -644,7 +808,24 @@ async fn accept_viewer(
         let (shared, peers, app) = (shared.clone(), peers.clone(), app.clone());
         Arc::new(move |m: String| {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&m) else { return };
-            if v["t"] == "kf" {
+            if v["t"] == "mesh" {
+                if let Some(h) = shared.mesh_of(id) {
+                    h.on_message(id, &v);
+                }
+                return;
+            }
+            if v["t"] == "more" {
+                // Reparo: pedaços extras novos de um quadro recente, só para quem pediu.
+                let blocks: Vec<(u8, u32)> = v["b"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|x| Some((x[0].as_u64()?.min(255) as u8, x[1].as_u64()? as u32))).take(64).collect())
+                    .unwrap_or_default();
+                let extra = shared.piece_source.lock().unwrap().more(v["r"].as_u64().unwrap_or(0) as u32, v["f"].as_u64().unwrap_or(0) as u32, &blocks);
+                let peer = peers.lock().unwrap().get(&id).map(|p| p.peer.clone());
+                if let Some(p) = peer {
+                    p.send_extra(extra);
+                }
+            } else if v["t"] == "kf" {
                 shared.request_keyframe_for(id);
             } else if v["t"] == "quality" {
                 shared.set_quality(id, v["q"].as_str().unwrap_or("auto"));
@@ -730,7 +911,7 @@ pub fn host_update(app: AppHandle, config: HostConfig) -> Res<()> {
     }
     if config.audio_mode != old.audio_mode || config.audio_app != old.audio_app {
         h.audio = None;
-        h.audio = start_audio(&app, &config, h.opus.clone(), h.media_tx.clone());
+        h.audio = start_audio(&app, &config, h.opus.clone(), h.media_tx.clone(), h.media_epoch);
     }
     // Lista pública: liga/desliga e mantém os dados em dia.
     if config.public != old.public {
@@ -881,7 +1062,10 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
     playback.set_volume(vol);
 
     // Decodificação numa thread própria.
-    let (dtx, drx) = sync_channel::<(Vec<u8>, u32)>(90);
+    // Pedaços: áudio e vídeo tocam pela mesma agenda (avsync). (dados, horário, pela agenda?)
+    let sync = Arc::new(crate::avsync::SyncClock::default());
+    let audio_state = Arc::new(Mutex::new(crate::avsync::AudioState::new()?));
+    let (dtx, drx) = sync_channel::<(Vec<u8>, u32, bool)>(90);
     let bytes_in = Arc::new(AtomicUsize::new(0));
     // Quadro perdido antes do decoder (fila cheia ou erro): os seguintes dependem dele,
     // então descartamos tudo até o próximo keyframe e pedimos um ao host. Sem isso a
@@ -892,6 +1076,7 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
         let (app, bytes_in, id) = (app.clone(), bytes_in.clone(), id.clone());
         let (wait_idr, want_kf) = (wait_idr.clone(), want_kf.clone());
         let view_fps = view_fps.clone();
+        let sync = sync.clone();
         std::thread::Builder::new()
             .name("aj-decode".into())
             .spawn(move || {
@@ -905,7 +1090,9 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
                 let mut kbps_avg = 0.0f64;
                 let mut presenter = crate::framegen::Presenter::new();
                 let mut shown = 0u32;
-                while let Ok((data, ts)) = drx.recv() {
+                let mut synced_any = false;
+                while let Ok((data, ts, synced)) = drx.recv() {
+                    synced_any |= synced;
                     if wait_idr.load(Ordering::SeqCst) && !crate::media::has_nal(&data, 5) {
                         continue; // restos de antes da perda, ainda na fila
                     }
@@ -921,11 +1108,17 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
                             frames += 1;
                             // Horário certo (absorve a variação da rede e do host), no fps
                             // escolhido para assistir (descarta, mostra ou gera quadros).
-                            let at = playout.schedule(ts);
+                            // Pedaços: o horário da agenda comum com o áudio (durante a
+                            // medição inicial, mostra na hora). RTP: o buffer próprio.
+                            let at = if synced {
+                                sync.play_at(ts).map(|t| t.max(Instant::now())).unwrap_or_else(Instant::now)
+                            } else {
+                                playout.schedule(ts)
+                            };
                             shown += presenter.present(f, ts, at, view_fps.load(Ordering::Relaxed), &feed);
                         }
                     }
-                    stats.buffer_ms = playout.delay_ms().round() as u32;
+                    stats.buffer_ms = if synced_any { sync.delay_ms() } else { playout.delay_ms() }.round() as u32;
                     let el = win.elapsed();
                     if el >= Duration::from_secs(1) {
                         stats.fps = frames as f32 / el.as_secs_f32();
@@ -943,6 +1136,9 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
                                 "[decode] {:.0} fps da stream, {:.0} na tela, buffer {} ms, gerador máx {proc_max:.1} ms, chegada atrasada máx {late_max:.1} ms, {}x{}",
                                 stats.fps, stats.shown_fps, stats.buffer_ms, stats.width, stats.height
                             );
+                            if synced_any {
+                                eprintln!("[sync] {}", sync.debug());
+                            }
                         }
                         frames = 0;
                         win = Instant::now();
@@ -972,6 +1168,7 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
         let pb = playback.clone();
         let bytes_in = bytes_in.clone();
         let (wait_idr, want_kf) = (wait_idr.clone(), want_kf.clone());
+        let (bytes_in2, wait_idr2, want_kf2, dtx2) = (bytes_in.clone(), wait_idr.clone(), want_kf.clone(), dtx.clone());
         ViewerSinks {
             on_video: Arc::new(move |f, ts| {
                 bytes_in.fetch_add(f.len(), Ordering::Relaxed);
@@ -982,12 +1179,50 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
                     }
                     wait_idr.store(false, Ordering::SeqCst);
                 }
-                if dtx.try_send((f, ts)).is_err() {
+                if dtx.try_send((f, ts, false)).is_err() {
                     wait_idr.store(true, Ordering::SeqCst);
                     want_kf.store(true, Ordering::SeqCst);
                 }
             }),
             on_audio: Arc::new(move |p| pb.push(opus.lock().unwrap().decode(&p))),
+            timed: Some({
+                let (sync, state, pb) = (sync.clone(), audio_state.clone(), playback.clone());
+                let (bytes_in, wait_idr, want_kf) = (bytes_in2.clone(), wait_idr2.clone(), want_kf2.clone());
+                let dtx = dtx2.clone();
+                let attached = std::sync::atomic::AtomicBool::new(false);
+                Arc::new(move |t: transport::Timed| {
+                    let now = Instant::now();
+                    match t {
+                        transport::Timed::Video(f, ts) => {
+                            sync.observe(crate::avsync::Stream::Video, ts, now);
+                            bytes_in.fetch_add(f.len(), Ordering::Relaxed);
+                            if wait_idr.load(Ordering::SeqCst) {
+                                if !crate::media::has_nal(&f, 5) {
+                                    want_kf.store(true, Ordering::SeqCst);
+                                    return;
+                                }
+                                wait_idr.store(false, Ordering::SeqCst);
+                            }
+                            if dtx.try_send((f, ts, true)).is_err() {
+                                wait_idr.store(true, Ordering::SeqCst);
+                                want_kf.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        transport::Timed::Audio(seq, ts, opus) => {
+                            sync.observe(crate::avsync::Stream::Audio, ts, now);
+                            bytes_in.fetch_add(opus.len(), Ordering::Relaxed);
+                            // O tocador passa a seguir a agenda comum no primeiro pacote.
+                            if !attached.swap(true, Ordering::SeqCst) {
+                                pb.attach_sync(sync.clone(), state.clone());
+                            }
+                            let mut st = state.lock().unwrap();
+                            let crate::avsync::AudioState { rx, tl } = &mut *st;
+                            rx.push(seq, ts, opus);
+                            rx.run(&sync, now, tl);
+                        }
+                    }
+                }) as Arc<dyn Fn(transport::Timed) + Send + Sync>
+            }),
             on_state: Arc::new(move |e| {
                 let s = match e {
                     PeerEvent::Connected => "connected",
@@ -1102,12 +1337,15 @@ pub async fn viewer_leave(app: AppHandle, id: String) {
 }
 
 /// Área de vídeo de uma stream em pixels físicos (relativos à janela). Thread principal.
-/// `hole`: retângulo (relativo ao vídeo) recortado para um menu aparecer por cima.
-pub fn player_rect(id: String, x: i32, y: i32, width: i32, height: i32, visible: bool, hole: Option<(i32, i32, i32, i32, i32)>) {
+/// `corners`: raio dos cantos arredondados (0 = retos). `no_cursor`: esconde o cursor
+/// sobre o vídeo (controles sumiram com o mouse parado).
+#[allow(clippy::too_many_arguments)]
+pub fn player_rect(id: String, x: i32, y: i32, width: i32, height: i32, visible: bool, corners: i32, no_cursor: bool) {
     with_viewers(|m| {
         if let Some(p) = m.get(&id).and_then(|v| v.player.as_ref()) {
             p.set_rect(x, y, width, height, visible);
-            p.set_hole(hole);
+            p.set_corners(corners);
+            p.hide_cursor(no_cursor && visible);
         }
     });
 }

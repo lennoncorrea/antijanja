@@ -89,6 +89,7 @@ export struct Tile {
     ping-warn: bool,
     volume: int,
     muted: bool,
+    // Controles por cima do vídeo à mostra (somem com o mouse parado).
     chrome: bool,
     focused: bool,
     x: length,
@@ -142,6 +143,7 @@ export global App {
     in property <string> s-fps: "60";
     in property <string> s-bitrate: "0";
     in property <bool> s-cursor: true;
+    in property <bool> s-mesh;
     in property <string> s-audio-mode: "system";
     in property <string> s-audio-app;
     in property <string> s-abitrate: "192";
@@ -189,6 +191,8 @@ export global App {
     in property <string> stat-rate;
     // Limite imposto pela rede de quem assiste (vazio = sem limite).
     in property <string> stat-net;
+    /// Malha P2P ligada: quantos estão nela e quanto do envio normal o host manda.
+    in property <string> stat-mesh;
     in property <bool> hardware;
     in property <string> encoder-line;
     in property <string> encoder-detail;
@@ -208,36 +212,15 @@ export global App {
     in property <[Tile]> tiles;
     in property <bool> has-focus;
     callback leave(string);
-    callback toggle-focus(string);
-    // Tela cheia com esta stream (ou sai da tela cheia).
-    callback toggle-fullscreen(string);
-    callback set-volume(string, int);
-    callback toggle-mute(string);
+    callback unfocus();
     // fps para assistir ("0" = o da stream), vale para todas as streams. Acima do da
     // stream precisa de placa NVIDIA (geração de quadros).
     in property <bool> framegen-available;
     in property <string> view-fps: "0";
-    callback set-view-fps(string);
-    // Menu de engrenagem de uma stream (posição calculada no Rust, que também abre
-    // um buraco na janela do vídeo para o menu aparecer por cima).
+    // Stream com o menu de engrenagem aberto. Os controles por cima do vídeo e o menu
+    // ficam em outra janela (ui/overlay.slint, global Ov); aqui só o clique fora fecha.
     in property <string> menu-tile;
-    in property <string> menu-panel: "main";
-    in property <length> menu-x;
-    // Onde fica a base do menu; a altura é a do conteúdo (o menu avisa com menu-resized).
-    in property <length> menu-bottom;
-    in property <[MenuOption]> menu-fps;
-    in property <[MenuOption]> menu-quality;
-    in property <string> menu-fps-label;
-    in property <string> menu-quality-label;
-    in property <string> menu-gen-tag;
-    in property <string> menu-info;
-    in property <string> menu-fps-hint;
-    callback toggle-menu(string);
-    callback menu-resized(length);
     callback close-menu();
-    callback menu-go(string);
-    callback pick-quality(string);
-    callback unfocus();
 
     // ------------------------------------------------- Avisos e atualização
     in property <[Toast]> toasts;

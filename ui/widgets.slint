@@ -252,6 +252,8 @@ export component Slider inherits Rectangle {
     in property <int> maximum: 100;
     in property <int> step: 1;
     in property <int> value;
+    // Cor do trilho vazio (sobre o vídeo, um branco translúcido).
+    in property <color> track: Theme.muted;
     callback changed(int);
     height: 20px;
     property <float> frac: (root.value - root.minimum) * 1.0 / (root.maximum - root.minimum);
@@ -263,7 +265,7 @@ export component Slider inherits Rectangle {
         height: 6px;
         width: 100%;
         border-radius: 3px;
-        background: Theme.muted;
+        background: root.track;
     }
     Rectangle {
         y: (parent.height - 6px) / 2;
