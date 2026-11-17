@@ -1090,6 +1090,13 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
     });
     let step = |s: &str| emit_viewer(&app, "viewer-step", &id, s.into());
     step("prepare");
+    // Chaves, DHT e slot (alguns segundos de consulta à DHT) enquanto o player e o WebRTC
+    // se montam, em vez de depois.
+    let has_password = password.is_some();
+    let prep = {
+        let app = app.clone();
+        tokio::task::spawn_blocking(move || rendezvous::prepare_join(&app.rdv(), &code, password.as_deref()))
+    };
 
     // Player nativo (janela-filha), criado na thread principal.
     let parent = main_hwnd(&app)?;
@@ -1304,11 +1311,13 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
     let sid: String = sid_bytes.iter().map(|b| format!("{b:02x}")).collect();
     let payload = serde_json::json!({ "t": "offer", "sid": sid, "sdp": offer, "name": name }).to_string();
     let (app2, id_wait, stop2) = (app.clone(), id.clone(), stop.clone());
-    let has_password = password.is_some();
     let sid_tag = crate::connlog::short(&sid);
+    let prep = prep.await.map_err(|e| e.to_string())??;
+    if !viewer_alive(&id, gen) {
+        return Err("cancelado".into());
+    }
     let answer = tokio::task::spawn_blocking(move || {
-        let state = app2.rdv();
-        rendezvous::join(&state, &code, password.as_deref(), &sid, &payload, JOIN_TIMEOUT_S, &stop2, |e| {
+        rendezvous::join(prep, &sid, &payload, JOIN_TIMEOUT_S, &stop2, |e| {
             let step = match e {
                 rendezvous::JoinEvent::Published => "wait",
                 rendezvous::JoinEvent::Busy => "busy",
