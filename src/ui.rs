@@ -1962,7 +1962,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
 /// da lista "Ao vivo") e grava o código em `AJ_CODE_FILE`. `AJ_AUTOTEST=watch`: assiste o
 /// código desse arquivo a `AJ_VIEW_FPS`; com `AJ_MENU_AFTER` (s), abre o menu de engrenagem;
 /// com `AJ_SHOW_CONTROLS`, deixa os controles por cima do vídeo à mostra; com
-/// `AJ_FULLSCREEN`, põe a stream em tela cheia.
+/// `AJ_FULLSCREEN`, põe a stream em tela cheia; com `AJ_MENU_CLOSE_AFTER` (s), fecha o
+/// menu de novo.
 #[cfg(debug_assertions)]
 fn autotest() {
     let Ok(mode) = std::env::var("AJ_AUTOTEST") else { return };
@@ -2044,6 +2045,15 @@ fn autotest() {
                             relayout(c, ui);
                             eprintln!("[autotest] menu aberto");
                         }
+                    }
+                }
+                // Fecha o menu de novo (como o segundo clique na engrenagem).
+                let close_after = std::env::var("AJ_MENU_CLOSE_AFTER").ok().and_then(|v| v.parse::<u64>().ok());
+                if let (Some(after), true) = (close_after, menu_opened && c.menu.is_some()) {
+                    if started.elapsed() >= Duration::from_secs(after) {
+                        let id = c.menu.clone().unwrap_or_default();
+                        toggle_menu(c, ui, &id);
+                        eprintln!("[autotest] menu fechado");
                     }
                 }
             }
