@@ -12,7 +12,10 @@ use slint::winit_030::winit;
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicIsize, Ordering};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{ClientToScreen, CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, SetWindowRgn, RGN_OR};
+use windows::Win32::Graphics::Gdi::{
+    ClientToScreen, CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, MonitorFromWindow, SetWindowRgn, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, RGN_OR,
+};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -82,13 +85,26 @@ fn follow(main: isize) {
         let _ = GetClientRect(main, &mut r);
         let mut p = POINT::default();
         let _ = ClientToScreen(main, &mut p);
+        let (w, mut h) = (r.right.max(1), r.bottom.max(1));
+        // Em tela cheia a janela cobriria o monitor inteiro, e o Windows passa a tratar uma
+        // janela OpenGL sem bordas que cobre o monitor como "tela cheia": deixa de compô-la
+        // com transparência e o que não tem controle vira preto por cima do vídeo. Um pixel
+        // a menos de altura evita isso (a última linha não tem controle nenhum).
+        let mon = MonitorFromWindow(main, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            let m = mi.rcMonitor;
+            if p.x <= m.left && p.y <= m.top && p.x + w >= m.right && p.y + h >= m.bottom {
+                h = (m.bottom - p.y - 1).max(1);
+            }
+        }
         let _ = SetWindowPos(
             HWND(overlay as *mut _),
             None,
             p.x,
             p.y,
-            r.right.max(1),
-            r.bottom.max(1),
+            w,
+            h,
             SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
         );
     }

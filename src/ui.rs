@@ -1961,7 +1961,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
 /// configurações de quem usa o app). `AJ_AUTOTEST=host`: transmite a tela principal (fora
 /// da lista "Ao vivo") e grava o código em `AJ_CODE_FILE`. `AJ_AUTOTEST=watch`: assiste o
 /// código desse arquivo a `AJ_VIEW_FPS`; com `AJ_MENU_AFTER` (s), abre o menu de engrenagem;
-/// com `AJ_SHOW_CONTROLS`, deixa os controles por cima do vídeo à mostra.
+/// com `AJ_SHOW_CONTROLS`, deixa os controles por cima do vídeo à mostra; com
+/// `AJ_FULLSCREEN`, põe a stream em tela cheia.
 #[cfg(debug_assertions)]
 fn autotest() {
     let Ok(mode) = std::env::var("AJ_AUTOTEST") else { return };
@@ -1972,6 +1973,7 @@ fn autotest() {
     let mut menu_opened = false;
     let mut last_toggle = 0u64;
     let mut quality_set = false;
+    let mut fullscreen_done = false;
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(500), move || {
         with(|c, ui| match mode.as_str() {
             "host" => {
@@ -2016,6 +2018,14 @@ fn autotest() {
                             eprintln!("[ui {:.0}] (autoteste) alterna o menu", tms());
                             toggle_menu(c, ui, &id);
                         }
+                    }
+                }
+                // Stream em tela cheia (AJ_FULLSCREEN).
+                if std::env::var_os("AJ_FULLSCREEN").is_some() && !c.fullscreen && !fullscreen_done {
+                    if let Some(id) = c.viewers.iter().find(|v| v.watching).map(|v| v.id.clone()) {
+                        fullscreen_done = true;
+                        toggle_stream_fullscreen(c, ui, &id);
+                        eprintln!("[autotest] tela cheia");
                     }
                 }
                 // Controles por cima do vídeo sempre à mostra (para conferir sem mexer o mouse).
