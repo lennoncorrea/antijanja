@@ -83,6 +83,8 @@ export struct Tile {
     initials: string,
     watching: bool,
     step: int,
+    // O host está ocupado com outras entradas (o pedido é repetido sozinho).
+    busy: bool,
     res: string,
     rate: string,
     ping: string,

@@ -428,7 +428,7 @@ static PEER_SEQ: AtomicU64 = AtomicU64::new(0);
 /// "conectando"). Cada um segura uma PeerConnection por até ~2 min; sem limite, quem
 /// tem o código poderia mandar ofertas falsas sem parar e esgotar memória e portas.
 /// Ofertas recusadas não são marcadas como vistas: o espectador republica a cada 25 s.
-const MAX_PENDING: usize = 6;
+const MAX_PENDING: usize = 12;
 
 /// Esquece as ofertas cujas conexões já acabaram e conta as que ainda estão entrando.
 fn prune_offers(map: &mut HashMap<String, Option<(u8, String)>>, peers: &Mutex<HashMap<u64, PeerEntry>>) -> usize {
@@ -680,8 +680,26 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
         let shared = shared.clone();
         let offers: Offers = Arc::new(Mutex::new(HashMap::new()));
         Arc::new(move |code: &str, slot: u8, payload: String| {
+            use crate::connlog::{log, short};
             let Ok(msg) = serde_json::from_str::<serde_json::Value>(&payload) else { return };
-            let (Some(sdp), Some(sid)) = (msg["sdp"].as_str(), msg["sid"].as_str()) else { return };
+            let Some(sid) = msg["sid"].as_str() else { return };
+            let tag = format!("host: espectador {}", short(sid));
+            // O espectador desistiu antes de conectar: libera a vaga dele.
+            if msg["t"] == "cancel" {
+                offers.lock().unwrap().remove(sid);
+                let removed = {
+                    let mut map = peers.lock().unwrap();
+                    let id = map.iter().find(|(_, p)| p.sid == sid && p.state == "connecting").map(|(id, _)| *id);
+                    id.and_then(|id| map.remove(&id))
+                };
+                log(format!("{tag} desistiu (slot {slot}){}", if removed.is_some() { "; vaga liberada" } else { "" }));
+                if let Some(p) = removed {
+                    emit_peers(&app, &peers);
+                    transport::spawn(async move { let _ = p.peer.pc.close().await; });
+                }
+                return;
+            }
+            let Some(sdp) = msg["sdp"].as_str() else { return };
             if msg["t"] != "offer" {
                 return;
             }
@@ -692,15 +710,27 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
                 Some(Some((reply_slot, answer))) => {
                     let (reply_slot, answer, app, code) = (*reply_slot, answer.clone(), app.clone(), code.to_string());
                     drop(map);
+                    log(format!("{tag}: pedido repetido no slot {slot}; resposta de novo"));
                     std::thread::spawn(move || {
                         let _ = rendezvous::host_reply(&app.rdv(), &code, reply_slot, &answer);
                     });
                 }
-                Some(None) => {} // ainda montando a resposta
+                Some(None) => log(format!("{tag}: pedido repetido no slot {slot}; resposta ainda sendo montada")),
                 None => {
-                    if prune_offers(&mut map, &peers) >= MAX_PENDING {
-                        return; // muita gente entrando agora; o espectador tenta de novo
+                    let pending = prune_offers(&mut map, &peers);
+                    if pending >= MAX_PENDING {
+                        // Muita gente entrando agora: avisa (em vez de ficar calado) e o
+                        // espectador repete o pedido sozinho daqui a pouco.
+                        drop(map);
+                        log(format!("{tag}: ocupado ({pending} entradas pendentes); avisado no slot {slot}"));
+                        let (app, code) = (app.clone(), code.to_string());
+                        let busy = serde_json::json!({ "t": "busy", "sid": sid }).to_string();
+                        std::thread::spawn(move || {
+                            let _ = rendezvous::host_reply(&app.rdv(), &code, slot, &busy);
+                        });
+                        return;
                     }
+                    log(format!("{tag}: pedido novo no slot {slot} ({pending} pendentes)"));
                     map.insert(sid.to_string(), None);
                     drop(map);
                     let name: String = msg["name"].as_str().unwrap_or("Espectador").chars().take(40).collect();
@@ -769,6 +799,7 @@ async fn accept_viewer(
                     PeerEvent::Connected => {
                         if let Some(p) = map.get_mut(&id) {
                             if p.state == "connecting" {
+                                crate::connlog::log(format!("host: espectador {} conectado em {} ms", crate::connlog::short(&p.sid), p.joined.elapsed().as_millis()));
                                 let _ = app.emit("host-viewer-joined", name.clone());
                             }
                             p.state = "connected";
@@ -792,6 +823,10 @@ async fn accept_viewer(
                         }
                     }
                     PeerEvent::Failed | PeerEvent::Closed => {
+                        if let Some(p) = map.get(&id) {
+                            let how = if matches!(ev, PeerEvent::Failed) { "falhou" } else { "fechou" };
+                            crate::connlog::log(format!("host: conexão com o espectador {} {how} (estava {})", crate::connlog::short(&p.sid), p.state));
+                        }
                         changed = map.remove(&id).is_some();
                         if changed {
                             let _ = app.emit("host-viewer-left", name.clone());
@@ -844,9 +879,12 @@ async fn accept_viewer(
         })
     };
 
+    let tag = format!("host: espectador {}", crate::connlog::short(&sid));
+    let t = Instant::now();
     let (peer, answer) = match HostPeer::answer(sdp, true, on_state, on_message).await {
         Ok(v) => v,
         Err(e) => {
+            crate::connlog::log(format!("{tag}: falha ao montar a resposta: {e}"));
             offers.lock().unwrap().remove(&sid); // deixa o espectador tentar de novo
             let _ = app.emit("host-error", format!("Falha ao conectar {name}: {e}"));
             return;
@@ -873,6 +911,7 @@ async fn accept_viewer(
 
     let host_name = HOST.lock().unwrap().as_ref().map(|h| h.config.name.clone()).unwrap_or_default();
     let payload = serde_json::json!({ "t": "answer", "sid": sid, "sdp": answer, "name": host_name }).to_string();
+    crate::connlog::log(format!("{tag}: resposta montada em {} ms", t.elapsed().as_millis()));
     offers.lock().unwrap().insert(sid.clone(), Some((slot, payload.clone())));
     let app2 = app.clone();
     // Se a publicação falhar, o espectador republica a oferta e a resposta vai de novo.
@@ -885,6 +924,7 @@ async fn accept_viewer(
     tokio::time::sleep(Duration::from_secs(JOIN_TIMEOUT_S + 30)).await;
     let stale = peers.lock().unwrap().get(&id).is_some_and(|p| p.state == "connecting");
     if stale {
+        crate::connlog::log(format!("{tag}: não conectou em {} s; vaga liberada", JOIN_TIMEOUT_S + 30));
         peers.lock().unwrap().remove(&id);
         emit_peers(&app, &peers);
         let _ = peer.pc.close().await;
@@ -1050,6 +1090,13 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
     });
     let step = |s: &str| emit_viewer(&app, "viewer-step", &id, s.into());
     step("prepare");
+    // Chaves, DHT e slot (alguns segundos de consulta à DHT) enquanto o player e o WebRTC
+    // se montam, em vez de depois.
+    let has_password = password.is_some();
+    let prep = {
+        let app = app.clone();
+        tokio::task::spawn_blocking(move || rendezvous::prepare_join(&app.rdv(), &code, password.as_deref()))
+    };
 
     // Player nativo (janela-filha), criado na thread principal.
     let parent = main_hwnd(&app)?;
@@ -1224,6 +1271,7 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
                 }) as Arc<dyn Fn(transport::Timed) + Send + Sync>
             }),
             on_state: Arc::new(move |e| {
+                crate::connlog::log(format!("espectador (tile {}): conexão {e:?}", crate::connlog::short(&id1)));
                 let s = match e {
                     PeerEvent::Connected => "connected",
                     PeerEvent::Disconnected => "unstable",
@@ -1263,11 +1311,18 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
     let sid: String = sid_bytes.iter().map(|b| format!("{b:02x}")).collect();
     let payload = serde_json::json!({ "t": "offer", "sid": sid, "sdp": offer, "name": name }).to_string();
     let (app2, id_wait, stop2) = (app.clone(), id.clone(), stop.clone());
-    let has_password = password.is_some();
+    let sid_tag = crate::connlog::short(&sid);
+    let prep = prep.await.map_err(|e| e.to_string())??;
+    if !viewer_alive(&id, gen) {
+        return Err("cancelado".into());
+    }
     let answer = tokio::task::spawn_blocking(move || {
-        let state = app2.rdv();
-        rendezvous::join(&state, &code, password.as_deref(), &sid, &payload, JOIN_TIMEOUT_S, &stop2, || {
-            emit_viewer(&app2, "viewer-step", &id_wait, "wait".into())
+        rendezvous::join(prep, &sid, &payload, JOIN_TIMEOUT_S, &stop2, |e| {
+            let step = match e {
+                rendezvous::JoinEvent::Published => "wait",
+                rendezvous::JoinEvent::Busy => "busy",
+            };
+            emit_viewer(&app2, "viewer-step", &id_wait, step.into())
         })
     })
     .await
@@ -1288,6 +1343,7 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
     let sdp = answer["sdp"].as_str().ok_or("O host mandou uma resposta inválida.")?.to_string();
     let host_name: String = answer["name"].as_str().unwrap_or("Host").chars().take(40).collect();
     step("connect");
+    crate::connlog::log(format!("espectador {sid_tag}: conectando direto ao host"));
     let s = session.clone();
     transport::tokio_rt().spawn(async move { s.accept_answer(sdp).await }).await.map_err(|e| e.to_string())??;
 
@@ -1343,8 +1399,7 @@ pub async fn viewer_leave(app: AppHandle, id: String) {
 pub fn player_rect(id: String, x: i32, y: i32, width: i32, height: i32, visible: bool, corners: i32, no_cursor: bool) {
     with_viewers(|m| {
         if let Some(p) = m.get(&id).and_then(|v| v.player.as_ref()) {
-            p.set_rect(x, y, width, height, visible);
-            p.set_corners(corners);
+            p.place(x, y, width, height, visible, corners);
             p.hide_cursor(no_cursor && visible);
         }
     });
