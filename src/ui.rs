@@ -48,6 +48,8 @@ struct Viewer {
     code: String,
     host_name: String,
     step: i32,
+    /// O host respondeu que está ocupado com outras entradas (o pedido é repetido sozinho).
+    busy: bool,
     watching: bool,
     stats: Option<Value>,
     ping: Option<u32>,
@@ -429,7 +431,7 @@ fn render_watching_list(c: &Ctl, ui: &AppWindow) {
             let detail = if v.watching {
                 v.ping.map(|p| format!("ao vivo · {p} ms")).unwrap_or_else(|| "ao vivo".into())
             } else {
-                STEP_TEXT[v.step.clamp(0, 3) as usize].to_string()
+                if v.busy { "Host ocupado, tentando de novo".to_string() } else { STEP_TEXT[v.step.clamp(0, 3) as usize].to_string() }
             };
             let who = if v.host_name.is_empty() { &v.code } else { &v.host_name };
             WatchingItem {
@@ -625,6 +627,7 @@ fn relayout_inner(c: &Ctl, ui: &AppWindow) {
             initials: s(initials(if v.host_name.is_empty() { "?" } else { &v.host_name })),
             watching: v.watching,
             step: v.step,
+            busy: v.busy,
             res: s(if stats.is_some() {
                 let (fps, shown) = (num("fps").round() as u32, num("shown_fps").round() as u32);
                 // fps escolhido para assistir: "30→120fps" (recebidos → mostrados).
@@ -1216,6 +1219,7 @@ fn start_watching(c: &mut Ctl, ui: &AppWindow, code: String, password: Option<St
         code: code.clone(),
         host_name: String::new(),
         step: 0,
+        busy: false,
         watching: false,
         stats: None,
         ping: None,
@@ -1452,14 +1456,16 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
 
         "viewer-step" => {
             let id = id_of(&v);
-            let step = match v["value"].as_str().unwrap_or("") {
+            let value = v["value"].as_str().unwrap_or("");
+            let step = match value {
                 "publish" => 1,
-                "wait" => 2,
+                "wait" | "busy" => 2,
                 "connect" => 3,
                 _ => 0,
             };
             if let Some(x) = c.viewers.iter_mut().find(|x| x.id == id && !x.watching) {
                 x.step = step;
+                x.busy = value == "busy";
             }
             render_watching_list(c, ui);
             relayout(c, ui);
@@ -2094,7 +2100,7 @@ mod tests {
         assert_eq!(snap_fps(40.0), 40);
         assert_eq!(snap_fps(0.0), 0);
         let mut v = Viewer {
-            id: String::new(), code: String::new(), host_name: String::new(), step: 0, watching: true,
+            id: String::new(), code: String::new(), host_name: String::new(), step: 0, busy: false, watching: true,
             stats: None, ping: None, volume: 100, muted: false, quality: "auto".into(), renditions: vec![],
             nominal_fps: 0, fps_candidate: (0, 0),
         };

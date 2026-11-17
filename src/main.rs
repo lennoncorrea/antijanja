@@ -19,6 +19,7 @@ mod avsync;
 mod capture;
 mod framegen;
 mod congestion;
+mod connlog;
 mod gpu;
 mod media;
 mod mesh;

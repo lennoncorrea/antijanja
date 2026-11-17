@@ -404,17 +404,46 @@ pub fn host_stop(state: &RdvState) {
     state.host_keys.lock().unwrap().clear();
 }
 
-/// Host: publica a resposta WebRTC para o espectador no slot indicado.
+/// Tentativas de publicar uma resposta do host antes de desistir (o espectador ainda
+/// republica o pedido de tempos em tempos, e aí a resposta vai de novo).
+const REPLY_TRIES: u32 = 3;
+
+/// Uma resposta do host por vez: duas no mesmo slot ao mesmo tempo, a biblioteca da DHT
+/// recusa a segunda enquanto a primeira está saindo ("risco de conflito").
+static REPLY_LOCK: Mutex<()> = Mutex::new(());
+
+/// Host: publica a resposta WebRTC (ou o aviso de ocupado) para o espectador no slot
+/// indicado. Tenta de novo se a publicação falhar.
 pub fn host_reply(state: &RdvState, code: &str, slot: u8, payload: &str) -> Result<(), String> {
     let keys = state.host_keys.lock().unwrap().get(code).cloned().ok_or("código que não é desta transmissão")?;
     let dht = get_dht(state)?;
     // Só este host escreve nas chaves deste código, mas o relógio pode voltar
     // (ajuste do Windows): mantemos o seq sempre crescente.
     static LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-    let min = LAST.load(Ordering::SeqCst);
-    let seq = publish(&dht, &keys, Role::Host, slot % SLOTS, payload, min)?;
-    LAST.fetch_max(seq, Ordering::SeqCst);
-    Ok(())
+    let slot = slot % SLOTS;
+    let mut last_err = String::new();
+    for attempt in 1..=REPLY_TRIES {
+        let t = Instant::now();
+        let result = {
+            let _one_at_a_time = REPLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            publish(&dht, &keys, Role::Host, slot, payload, LAST.load(Ordering::SeqCst))
+        };
+        match result {
+            Ok(seq) => {
+                LAST.fetch_max(seq, Ordering::SeqCst);
+                crate::connlog::log(format!("host: resposta publicada no slot {slot} em {} ms (tentativa {attempt})", t.elapsed().as_millis()));
+                return Ok(());
+            }
+            Err(e) => {
+                crate::connlog::log(format!("host: falha ao publicar a resposta no slot {slot} (tentativa {attempt}): {e}"));
+                last_err = e;
+            }
+        }
+        if attempt < REPLY_TRIES {
+            thread::sleep(Duration::from_millis(1500 * attempt as u64));
+        }
+    }
+    Err(last_err)
 }
 
 /// Escolhe um slot (começando por um sorteado) que não esteja travado por um `seq`
@@ -437,8 +466,23 @@ fn pick_slot(dht: &Dht, keys: &Keys) -> Result<(u8, i64), String> {
     Err("Não foi possível pedir para entrar: a rede está bloqueada para este código. Peça um código novo ao host.".into())
 }
 
+/// O espectador republica o pedido nesse intervalo, caso o host não o tenha visto (a
+/// DHT perde ou demora a propagar) ou tenha respondido que estava ocupado.
+const REPUBLISH: Duration = Duration::from_secs(12);
+
+/// O que acontece durante `join`, para a interface.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum JoinEvent {
+    /// O pedido foi publicado pela primeira vez.
+    Published,
+    /// O host está ocupado com outras entradas; o pedido vai de novo sozinho.
+    Busy,
+}
+
 /// Espectador: publica a oferta e espera a resposta do host (até `timeout_secs`).
 /// `sid` identifica esta tentativa; respostas com outro `sid` são ignoradas.
+/// Se desistir (cancelado ou sem resposta), avisa o host para ele liberar a vaga.
+#[allow(clippy::too_many_arguments)]
 pub fn join(
     state: &RdvState,
     code: &str,
@@ -447,43 +491,81 @@ pub fn join(
     payload: &str,
     timeout_secs: u64,
     stop: &AtomicBool,
-    on_published: impl Fn(),
+    on_event: impl Fn(JoinEvent),
 ) -> Result<String, String> {
+    use crate::connlog::{log, short};
     // Cada espectador tem a própria flag de cancelamento: várias entradas podem
     // acontecer ao mesmo tempo (assistir várias transmissões).
     let keys = Keys::from_code(code, password)?;
     let dht = get_dht(state)?;
+    let started = Instant::now();
+    let tag = format!("espectador {}", short(sid));
+    log(format!("{tag}: entrando no código {}... (pedido de {} bytes)", short(code), payload.len()));
 
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs.clamp(10, 600));
-    let (slot, mut my_seq) = pick_slot(&dht, &keys)?;
+    let deadline = started + Duration::from_secs(timeout_secs.clamp(10, 600));
+    let (slot, mut my_seq) = pick_slot(&dht, &keys).inspect_err(|e| log(format!("{tag}: sem slot: {e}")))?;
+    log(format!("{tag}: slot {slot} escolhido em {} ms", started.elapsed().as_millis()));
     let mut last_seq = 0i64;
     let mut published_at: Option<Instant> = None;
+    let mut publishes = 0u32;
+    let mut busy = false;
 
-    while Instant::now() < deadline {
+    let err = loop {
         if stop.load(Ordering::SeqCst) {
-            return Err("cancelado".into());
+            break "cancelado".to_string();
         }
-        // Republica a oferta periodicamente, caso o host tenha perdido a primeira.
-        if published_at.is_none_or(|t| t.elapsed() > Duration::from_secs(25)) {
-            let first = published_at.is_none();
-            my_seq = publish(&dht, &keys, Role::Viewer, slot, payload, my_seq)?;
-            published_at = Some(Instant::now());
-            if first {
-                on_published();
+        if Instant::now() >= deadline {
+            break "O host não respondeu. Confira se o código está certo e se a transmissão ainda está ativa.".to_string();
+        }
+        // Republica a oferta periodicamente, caso o host tenha perdido a anterior.
+        if published_at.is_none_or(|t| t.elapsed() > REPUBLISH) {
+            let t = Instant::now();
+            match publish(&dht, &keys, Role::Viewer, slot, payload, my_seq) {
+                Ok(seq) => {
+                    my_seq = seq;
+                    publishes += 1;
+                    log(format!("{tag}: pedido publicado (vez {publishes}) em {} ms", t.elapsed().as_millis()));
+                    if publishes == 1 {
+                        on_event(JoinEvent::Published);
+                    }
+                }
+                Err(e) => {
+                    log(format!("{tag}: falha ao publicar o pedido: {e}"));
+                    // Na primeira vez nada saiu: é erro. Depois, tenta de novo mais tarde.
+                    if publishes == 0 {
+                        break e;
+                    }
+                }
             }
+            published_at = Some(Instant::now());
         }
         if let Some((seq, text)) = fetch(&dht, &keys, Role::Host, slot, last_seq) {
             last_seq = seq;
-            let matches = serde_json::from_str::<serde_json::Value>(&text)
-                .map(|v| v["sid"] == sid)
-                .unwrap_or(false);
-            if matches {
+            let v = serde_json::from_str::<serde_json::Value>(&text).unwrap_or_default();
+            if v["sid"] != sid {
+                log(format!("{tag}: resposta de outra tentativa no slot (ignorada)"));
+            } else if v["t"] == "busy" {
+                log(format!("{tag}: host ocupado com outras entradas"));
+                if !busy {
+                    busy = true;
+                    on_event(JoinEvent::Busy);
+                }
+            } else {
+                log(format!("{tag}: resposta recebida em {} ms", started.elapsed().as_millis()));
                 return Ok(text);
             }
         }
         thread::sleep(Duration::from_millis(700));
+    };
+    log(format!("{tag}: desistiu depois de {} s ({err}); pedido publicado {publishes} vez(es)", started.elapsed().as_secs()));
+    // Avisa o host (em segundo plano) para ele não guardar a vaga desta tentativa.
+    if publishes > 0 {
+        let cancel = serde_json::json!({ "t": "cancel", "sid": sid }).to_string();
+        thread::spawn(move || {
+            let _ = publish(&dht, &keys, Role::Viewer, slot, &cancel, my_seq);
+        });
     }
-    Err("O host não respondeu. Confira se o código está certo e se a transmissão ainda está ativa.".into())
+    Err(err)
 }
 
 /// A DHT já está pronta para uso?
@@ -979,11 +1061,86 @@ mod tests {
         });
         let code = host_listen(&host, on_offer, None).unwrap();
         let t = Instant::now();
-        let answer = join(&viewer, &code, None, "s1", r#"{"t":"offer","sid":"s1"}"#, 90, &AtomicBool::new(false), || {}).unwrap();
+        let answer = join(&viewer, &code, None, "s1", r#"{"t":"offer","sid":"s1"}"#, 90, &AtomicBool::new(false), |_| {}).unwrap();
         println!("resposta em {:?}", t.elapsed());
         assert!(answer.contains("answer"));
         host_stop(&host);
         assert!(host_reply(&host, &code, 0, "{}").is_err(), "depois de parar, o código não responde mais");
+    }
+
+    /// Como na vida real: host e espectador em nós da DHT diferentes, e o espectador
+    /// entrando várias vezes seguidas (sai e entra de novo). Mede quanto cada entrada leva.
+    #[test]
+    #[ignore]
+    fn live_repeated_joins() {
+        let host = Arc::new(RdvState::default());
+        let viewer = RdvState::default();
+        let _ = host.dht.set(Dht::client().unwrap());
+        let _ = viewer.dht.set(Dht::client().unwrap());
+        assert!(host.dht.get().unwrap().bootstrapped() && viewer.dht.get().unwrap().bootstrapped());
+        let h = host.clone();
+        let on_offer: OfferFn = Arc::new(move |code: &str, slot: u8, offer: String| {
+            let sid = serde_json::from_str::<serde_json::Value>(&offer).unwrap()["sid"].as_str().unwrap().to_string();
+            println!("  host viu {sid} no slot {slot}");
+            let (h, code) = (h.clone(), code.to_string());
+            thread::spawn(move || host_reply(&h, &code, slot, &serde_json::json!({ "t": "answer", "sid": sid }).to_string()).unwrap());
+        });
+        let code = host_listen(&host, on_offer, None).unwrap();
+        let runs: usize = std::env::var("AJ_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+        let mut fails = 0;
+        for i in 0..runs {
+            let sid = format!("s{i}");
+            let t = Instant::now();
+            let r = join(&viewer, &code, None, &sid, &serde_json::json!({ "t": "offer", "sid": sid }).to_string(), 90, &AtomicBool::new(false), |e| {
+                println!("  {e:?} em {:?}", t.elapsed())
+            });
+            match r {
+                Ok(_) => println!("entrada {i}: resposta em {:?}", t.elapsed()),
+                Err(e) => {
+                    fails += 1;
+                    println!("entrada {i}: FALHOU em {:?}: {e}", t.elapsed())
+                }
+            }
+        }
+        host_stop(&host);
+        assert_eq!(fails, 0);
+    }
+
+    /// Host ocupado: o primeiro pedido recebe "busy", o espectador repete sozinho e o
+    /// pedido repetido recebe a resposta.
+    #[test]
+    #[ignore]
+    fn live_busy_then_answer() {
+        let host = Arc::new(RdvState::default());
+        let viewer = RdvState::default();
+        let _ = host.dht.set(Dht::client().unwrap());
+        let _ = viewer.dht.set(Dht::client().unwrap());
+        let h = host.clone();
+        let seen = Arc::new(Mutex::new(0u32));
+        let on_offer: OfferFn = Arc::new(move |code: &str, slot: u8, offer: String| {
+            let v: serde_json::Value = serde_json::from_str(&offer).unwrap();
+            let sid = v["sid"].as_str().unwrap().to_string();
+            if v["t"] != "offer" {
+                return;
+            }
+            let n = { let mut s = seen.lock().unwrap(); *s += 1; *s };
+            let t = if n == 1 { "busy" } else { "answer" };
+            println!("  host viu o pedido {n}: responde {t}");
+            let (h, code) = (h.clone(), code.to_string());
+            thread::spawn(move || host_reply(&h, &code, slot, &serde_json::json!({ "t": t, "sid": sid }).to_string()).unwrap());
+        });
+        let code = host_listen(&host, on_offer, None).unwrap();
+        let events = Mutex::new(Vec::new());
+        let t = Instant::now();
+        let answer = join(&viewer, &code, None, "b1", r#"{"t":"offer","sid":"b1","sdp":"x"}"#, 90, &AtomicBool::new(false), |e| {
+            println!("  {e:?} em {:?}", t.elapsed());
+            events.lock().unwrap().push(e);
+        })
+        .unwrap();
+        println!("resposta em {:?}", t.elapsed());
+        assert!(answer.contains("answer"));
+        assert_eq!(*events.lock().unwrap(), vec![JoinEvent::Published, JoinEvent::Busy]);
+        host_stop(&host);
     }
 
     /// Com senha, pela DHT real: a senha certa recebe resposta; a errada, não.
@@ -1005,10 +1162,10 @@ mod tests {
         let code = host_listen(&host, on_offer, Some("pizza")).unwrap();
         println!("código com senha gerado em {:?}: {code}", t.elapsed());
         let stop = AtomicBool::new(false);
-        let wrong = join(&viewer, &code, Some("errada"), "s1", r#"{"t":"offer","sid":"s1"}"#, 25, &stop, || {});
+        let wrong = join(&viewer, &code, Some("errada"), "s1", r#"{"t":"offer","sid":"s1"}"#, 25, &stop, |_| {});
         assert!(wrong.is_err(), "senha errada não pode receber resposta");
         let t = Instant::now();
-        let right = join(&viewer, &code, Some("pizza"), "s2", r#"{"t":"offer","sid":"s2"}"#, 90, &stop, || {}).unwrap();
+        let right = join(&viewer, &code, Some("pizza"), "s2", r#"{"t":"offer","sid":"s2"}"#, 90, &stop, |_| {}).unwrap();
         println!("resposta com a senha certa em {:?}", t.elapsed());
         assert!(right.contains("answer"));
         host_stop(&host);

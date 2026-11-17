@@ -172,7 +172,7 @@ component TileView inherits Rectangle {
                         spacing: 10px;
                         Step { label: "Preparando a conexão"; phase: root.t.step > 0 ? 0 : root.t.step == 0 ? 1 : 2; }
                         Step { label: "Mandando o pedido pela rede P2P"; phase: root.t.step > 1 ? 0 : root.t.step == 1 ? 1 : 2; }
-                        Step { label: "Esperando o host responder"; phase: root.t.step > 2 ? 0 : root.t.step == 2 ? 1 : 2; }
+                        Step { label: root.t.busy ? "Host ocupado com outras entradas, tentando de novo" : "Esperando o host responder"; phase: root.t.step > 2 ? 0 : root.t.step == 2 ? 1 : 2; }
                         Step { label: "Conectando direto ao host"; phase: root.t.step > 3 ? 0 : root.t.step == 3 ? 1 : 2; }
                     }
                 }
