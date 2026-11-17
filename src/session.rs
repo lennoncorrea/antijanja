@@ -124,6 +124,9 @@ struct HostShared {
     /// internet pior; com uma malha só da principal, eles saíam dela).
     mesh: Option<Mutex<HashMap<u32, Arc<crate::meshnet::MeshHub>>>>,
     trace_sent: Mutex<(Instant, u64)>,
+    /// Último aviso da malha para o painel.
+    mesh_report: Mutex<Instant>,
+    app: AppHandle,
     /// Chave pública com que os quadros são assinados (hex), mandada a cada espectador.
     stream_pk: String,
     /// Fonte dos pedaços (para atender pedidos de reparo).
@@ -331,6 +334,23 @@ impl HostShared {
         groups.retain(|_, h| !h.ids().is_empty());
         for hub in groups.values() {
             hub.tick();
+        }
+        // Para o painel de quem transmite: quantos estão na malha e quanto do vídeo o host
+        // ainda manda (faixas direto / todas as faixas de quem está nela), a cada 2 s.
+        {
+            let mut last = self.mesh_report.lock().unwrap();
+            if last.elapsed() >= Duration::from_secs(2) {
+                *last = Instant::now();
+                let (mut members, mut direct) = (0usize, 0u32);
+                for hub in groups.values() {
+                    for (_, mask, _) in hub.snapshot() {
+                        members += 1;
+                        direct += (mask & ((1 << crate::pieces::LANES) - 1)).count_ones();
+                    }
+                }
+                let percent = if members > 0 { direct as f64 * 100.0 / (members as f64 * crate::pieces::LANES as f64) } else { 100.0 };
+                let _ = self.app.emit("host-mesh", serde_json::json!({ "members": members, "percent": percent.round() }));
+            }
         }
         if std::env::var_os("AJ_TRACE").is_some() {
             // Diagnóstico: pedaços por segundo saindo do host e as faixas de cada um.
@@ -643,6 +663,8 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
         alive: AtomicBool::new(true),
         mesh: mesh_on.then(|| Mutex::new(HashMap::new())),
         trace_sent: Mutex::new((Instant::now(), 0)),
+        mesh_report: Mutex::new(Instant::now()),
+        app: app.clone(),
         stream_pk,
         piece_source: piece_source.clone(),
     });

@@ -1069,6 +1069,7 @@ fn stop_sharing(c: &mut Ctl, ui: &AppWindow, reason: Option<&str>) {
     }
     ui.global::<App>().set_has_preview(false);
     ui.global::<App>().set_has_info(false);
+    ui.global::<App>().set_stat_mesh(s(""));
     render_general(c, ui);
     render_host_code(c, ui);
     if let Some(r) = reason {
@@ -1281,6 +1282,16 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
                 .collect();
             sync(a.get_peers(), peers, |m| a.set_peers(m));
             render_general(c, ui);
+        }
+        "host-mesh" => {
+            let n = v["members"].as_u64().unwrap_or(0);
+            let pct = v["percent"].as_f64().unwrap_or(100.0).round() as u32;
+            let text = match n {
+                0 => String::new(),
+                1 => "Malha: 1 assistindo".to_string(),
+                n => format!("Malha: {n} · envio {pct}%"),
+            };
+            set_if_changed!(a, get_stat_mesh, set_stat_mesh, s(text));
         }
         "host-info" => {
             let f = |k: &str| v[k].as_f64().unwrap_or(0.0);
