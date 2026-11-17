@@ -1839,6 +1839,9 @@ fn autotest() {
                     c.s.public = false;
                     c.s.stream_password.clear();
                     c.s.name = "Autoteste".into();
+                    // Sem áudio: com várias instâncias na mesma máquina, o host captaria o som
+                    // dos espectadores de teste (eco).
+                    c.s.audio_mode = "none".into();
                     let Some(src) = capture::list_sources().into_iter().find(|s| s.primary) else { return };
                     start_sharing(c, ui, src, None);
                 } else if !c.code.is_empty() && std::fs::read_to_string(&code_file).ok().as_deref() != Some(c.code.as_str()) {

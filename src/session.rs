@@ -1114,6 +1114,9 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
                                 "[decode] {:.0} fps da stream, {:.0} na tela, buffer {} ms, gerador máx {proc_max:.1} ms, chegada atrasada máx {late_max:.1} ms, {}x{}",
                                 stats.fps, stats.shown_fps, stats.buffer_ms, stats.width, stats.height
                             );
+                            if synced_any {
+                                eprintln!("[sync] {}", sync.debug());
+                            }
                         }
                         frames = 0;
                         win = Instant::now();

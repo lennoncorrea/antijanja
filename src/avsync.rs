@@ -36,15 +36,19 @@ const MARGIN_MS: [f64; 2] = [8.0, 30.0];
 const START_HEADROOM_MS: f64 = 30.0;
 /// Medição antes de começar a tocar.
 pub const WARMUP: Duration = Duration::from_millis(500);
-/// Janela das medições.
+/// Janela das medições (a base, o menor trânsito, olha 10 s; a necessidade de cada tipo,
+/// os últimos 5 s: um engarrafamento que passou deixa de pesar logo).
 const WINDOW_MS: f64 = 10_000.0;
+const NEED_WINDOW_MS: f64 = 5_000.0;
 /// Um tipo que não chega há esse tempo para de contar (ex.: transmissão sem áudio).
 const STALE_MS: f64 = 2_000.0;
 /// O atraso desliza no máximo isso por segundo (1% = 10 ms/s) para cima; para baixo, bem
 /// mais devagar, e só depois de sobrar por um tempo.
 const SLEW_UP: f64 = 0.010;
-const SLEW_DOWN: f64 = 0.002;
-const DOWN_AFTER_MS: f64 = 10_000.0;
+/// Para baixo: 0,5% (5 ms/s; para o áudio, uma mudança de velocidade que não se ouve),
+/// depois de sobrar por 5 s.
+const SLEW_DOWN: f64 = 0.005;
+const DOWN_AFTER_MS: f64 = 5_000.0;
 /// Limites do atraso.
 const MIN_DELAY_MS: f64 = 20.0;
 const MAX_DELAY_MS: f64 = 600.0;
@@ -111,7 +115,8 @@ impl Inner {
     fn target(&self, now_ms: f64) -> f64 {
         let mut need: f64 = MIN_DELAY_MS;
         for s in [Stream::Video, Stream::Audio] {
-            let mut v: Vec<f64> = self.window.iter().filter(|x| x.1 == s).map(|x| x.2 - self.base).collect();
+            let mut v: Vec<f64> =
+                self.window.iter().filter(|x| x.1 == s && now_ms - x.0 <= NEED_WINDOW_MS).map(|x| x.2 - self.base).collect();
             let fresh = self.window.iter().rev().find(|x| x.1 == s).is_some_and(|x| now_ms - x.0 < STALE_MS);
             if v.is_empty() || !fresh {
                 continue;
@@ -189,6 +194,22 @@ impl SyncClock {
     /// Já dá para tocar (passou o aquecimento)?
     pub fn ready(&self) -> bool {
         self.inner.lock().unwrap().delay.is_some()
+    }
+
+    /// Diagnóstico: base e, por tipo, os percentis 50/90/95/máx do trânsito acima dela.
+    pub fn debug(&self) -> String {
+        let g = self.inner.lock().unwrap();
+        let mut parts = vec![format!("atraso {:.0} ms", g.delay.unwrap_or(0.0))];
+        for (name, s) in [("vídeo", Stream::Video), ("áudio", Stream::Audio)] {
+            let mut v: Vec<f64> = g.window.iter().filter(|x| x.1 == s).map(|x| x.2 - g.base).collect();
+            if v.is_empty() {
+                continue;
+            }
+            v.sort_by(|a, b| a.total_cmp(b));
+            let q = |p: f64| v[((v.len() as f64 * p) as usize).min(v.len() - 1)];
+            parts.push(format!("{name} p50 {:.0} p90 {:.0} p95 {:.0} máx {:.0}", q(0.5), q(0.9), q(0.95), v[v.len() - 1]));
+        }
+        parts.join(", ")
     }
 
     /// Atraso atual (ms), para o diagnóstico.
@@ -813,6 +834,23 @@ mod tests {
         // 20 ms entre chegadas a 1%/s = 0,2 ms por passo.
         assert!(max_step <= 0.21, "o atraso pulou {max_step} ms de uma vez");
         assert!(c.delay_ms() > 60.0, "subiu para cobrir a fila: {}", c.delay_ms());
+    }
+
+    /// Engarrafamento de 5 s e depois volta ao normal: o atraso sobe para cobrir e depois
+    /// volta perto do necessário em menos de ~40 s (antes levava minutos).
+    #[test]
+    fn delay_comes_back_down_after_congestion() {
+        let t0 = Instant::now();
+        let c = SyncClock::new(t0);
+        let mut peak = 0.0f64;
+        for i in 0..4000 {
+            let capture = i as f64 * 20.0;
+            let lat = if (500..750).contains(&i) { 150.0 } else { 10.0 };
+            c.observe(Stream::Audio, ts_at(capture), t0 + Duration::from_secs_f64((capture + lat) / 1000.0));
+            peak = peak.max(c.delay_ms());
+        }
+        assert!(peak > 100.0, "devia ter subido no engarrafamento: {peak}");
+        assert!(c.delay_ms() < 50.0, "devia ter voltado (80 s depois): {}", c.delay_ms());
     }
 
     fn tone(at: i64, frames: usize) -> Vec<f32> {
