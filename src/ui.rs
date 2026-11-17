@@ -1827,6 +1827,7 @@ fn autotest() {
     let mut done = false;
     let mut menu_opened = false;
     let mut last_toggle = 0u64;
+    let mut quality_set = false;
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(500), move || {
         with(|c, ui| match mode.as_str() {
             "host" => {
@@ -1849,6 +1850,15 @@ fn autotest() {
                     c.s.view_fps = std::env::var("AJ_VIEW_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
                     eprintln!("[autotest] assistindo a {} fps (monitor {} Hz)", view_fps(c, ui), monitor_hz(ui));
                     start_watching(c, ui, code.trim().to_string(), None);
+                }
+                // Qualidade fixa (AJ_QUALITY=1080, por exemplo), sem a automática.
+                if let (Ok(q), false) = (std::env::var("AJ_QUALITY"), quality_set) {
+                    if let Some(v) = c.viewers.iter_mut().find(|v| v.watching) {
+                        quality_set = true;
+                        v.quality = q.clone();
+                        session::viewer_quality(&v.id, &q);
+                        eprintln!("[autotest] qualidade fixa {q}");
+                    }
                 }
                 // Abre e fecha o menu a cada 2 s, pelo mesmo caminho do clique (medir com AJ_TRACE).
                 if std::env::var_os("AJ_MENU_TOGGLE").is_some() && started.elapsed() >= Duration::from_secs(40) {

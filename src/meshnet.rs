@@ -439,6 +439,11 @@ impl MeshHub {
         self.peers.lock().unwrap().contains_key(&id)
     }
 
+    /// Ids dos espectadores na malha.
+    pub fn ids(&self) -> Vec<u64> {
+        self.peers.lock().unwrap().keys().copied().collect()
+    }
+
     pub fn join(&self, id: u64, peer: Arc<HostPeer>) {
         self.peers.lock().unwrap().insert(id, peer);
         let outs = self.coord.lock().unwrap().join(id, true);
@@ -616,12 +621,19 @@ mod tests {
             assert!(peer.has_pieces());
             viewers.push((id, Viewer { session, peer, got, corrupt }));
         }
+        // Chave que assina os quadros: vai para cada um antes de entrar na malha (como o host).
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let pk: String = signer.verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        for (_, v) in &viewers {
+            block_on(v.peer.send_message(&json!({ "t": "stream-key", "pk": pk }).to_string()));
+        }
         for (id, v) in &viewers {
             hub.join(*id, v.peer.clone());
         }
 
         let mut source = crate::pieces::PieceSource::new(crate::transport::PIECE_OVERHEAD);
         source.survive_lane = true;
+        source.signer = Some(signer);
         let (secs, drop_at) = (12u32, 7u32);
         let start = Instant::now();
         let dropped = AtomicBool::new(false);

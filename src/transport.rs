@@ -523,6 +523,10 @@ pub struct ViewerSession {
     pub mesh: Arc<crate::meshnet::ViewerMesh>,
 }
 
+/// Chave pública com que o host assina os quadros (malha). Chega pela conexão direta com
+/// o host (cifrada e autenticada pela troca feita com o código), antes de qualquer rota.
+type StreamKey = Arc<Mutex<Option<ed25519_dalek::VerifyingKey>>>;
+
 /// Callbacks de mídia do espectador.
 #[derive(Clone)]
 pub struct ViewerSinks {
@@ -564,6 +568,7 @@ impl ViewerSession {
         // Pedaços do host (fonte 0) e dos vizinhos da malha (fonte = id) num receptor só.
         let (ptx, prx) = tokio::sync::mpsc::channel::<(u64, Vec<u8>)>(4096);
         let mesh = crate::meshnet::ViewerMesh::new(stun, dc_cell.clone(), ptx.clone());
+        let stream_key: StreamKey = Arc::new(Mutex::new(None));
         {
             let tx = ptx.clone();
             spawn(async move {
@@ -577,19 +582,27 @@ impl ViewerSession {
                     }
                 }
             });
-            let (s, cell, m) = (sinks.clone(), dc_cell.clone(), mesh.clone());
-            spawn(async move { receive_pieces(prx, s, cell, m).await });
+            let (s, cell, m, k) = (sinks.clone(), dc_cell.clone(), mesh.clone(), stream_key.clone());
+            spawn(async move { receive_pieces(prx, s, cell, m, k).await });
         }
         let on_message = sinks.on_message.clone();
         let dcc = dc.clone();
-        let m = mesh.clone();
+        let (m, key) = (mesh.clone(), stream_key.clone());
         spawn(async move {
             while let Some(ev) = dcc.poll().await {
                 match ev {
                     DataChannelEvent::OnMessage(msg) => {
                         let text = String::from_utf8_lossy(&msg.data).into_owned();
-                        // Rotas e oferta/resposta da malha ficam aqui; o resto sobe.
-                        let mine = serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|v| m.on_host_message(&v));
+                        // Rotas, oferta/resposta e a chave da malha ficam aqui; o resto sobe.
+                        let v = serde_json::from_str::<serde_json::Value>(&text).ok();
+                        if let Some(pk) = v.as_ref().filter(|v| v["t"] == "stream-key").and_then(|v| v["pk"].as_str()) {
+                            let bytes: Option<[u8; 32]> = (0..32).map(|i| pk.get(i * 2..i * 2 + 2).and_then(|h| u8::from_str_radix(h, 16).ok())).collect::<Option<Vec<u8>>>().and_then(|b| b.try_into().ok());
+                            if let Some(k) = bytes.and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok()) {
+                                *key.lock().unwrap() = Some(k);
+                            }
+                            continue;
+                        }
+                        let mine = v.is_some_and(|v| m.on_host_message(&v));
                         if !mine {
                             on_message(text);
                         }
@@ -733,9 +746,12 @@ async fn receive_pieces(
     sinks: ViewerSinks,
     dc: Arc<OnceLock<Arc<dyn DataChannel>>>,
     mesh: Arc<crate::meshnet::ViewerMesh>,
+    stream_key: StreamKey,
 ) {
-    use crate::pieces::{Assembler, Header, Ordered, KIND_VIDEO};
+    use crate::pieces::{Assembler, Header, Ordered, Verifier, KIND_SIG, KIND_VIDEO};
     let mut asm = Assembler::new();
+    // Com a chave do host conhecida (malha), só passa quadro com assinatura dele.
+    let mut verifier: Option<Verifier> = None;
     let mut ord = Ordered::new();
     // Versão do vídeo que está chegando: a troca começa num keyframe da nova, com a
     // numeração dela (cada versão conta os próprios quadros).
@@ -755,21 +771,24 @@ async fn receive_pieces(
         };
         let now = Instant::now();
         let mut out = vec![];
+        let mut verified: Vec<crate::pieces::Frame> = vec![];
         match ev {
             // Pedaço repassado por um vizinho: o número sequencial é da ligação dele (a
             // perda medida para o bitrate do host é só a do caminho direto).
             Some((src, d)) if src != 0 && d.len() > 4 => {
                 let piece = &d[4..];
                 mesh.on_piece(src, piece, now).await;
-                if let Some(f) = asm.push(piece, now) {
-                    if f.kind == KIND_VIDEO {
-                        if rendition != Some(f.rendition) && f.keyframe {
-                            rendition = Some(f.rendition);
-                            ord = Ordered::new();
-                        }
-                        if rendition == Some(f.rendition) {
-                            out.extend(ord.push(f, now));
-                        }
+                if verifier.is_none() {
+                    // Pedaços de vizinho sem a chave para conferir: não confia.
+                    if let Some(k) = *stream_key.lock().unwrap() {
+                        verifier = Some(Verifier::new(k));
+                    }
+                }
+                if let Some(v) = verifier.as_mut() {
+                    if Header::read(piece).is_some_and(|h| h.kind == KIND_SIG) {
+                        verified.extend(v.on_sig(piece, now));
+                    } else if let Some(f) = asm.push(piece, now) {
+                        verified.extend(v.push(f, now));
                     }
                 }
             }
@@ -795,19 +814,43 @@ async fn receive_pieces(
                     meter.on_packet(now, d.len(), h.ts);
                 }
                 mesh.on_piece(0, piece, now).await;
-                if let Some(f) = asm.push(piece, now) {
-                    if f.kind == KIND_VIDEO {
-                        if rendition != Some(f.rendition) && f.keyframe {
-                            rendition = Some(f.rendition);
-                            ord = Ordered::new();
+                if verifier.is_none() {
+                    if let Some(k) = *stream_key.lock().unwrap() {
+                        verifier = Some(Verifier::new(k));
+                    }
+                }
+                let is_sig = Header::read(piece).is_some_and(|h| h.kind == KIND_SIG);
+                match verifier.as_mut() {
+                    Some(v) if is_sig => verified.extend(v.on_sig(piece, now)),
+                    Some(v) => {
+                        if let Some(f) = asm.push(piece, now) {
+                            verified.extend(v.push(f, now));
                         }
-                        if rendition == Some(f.rendition) {
-                            out.extend(ord.push(f, now));
+                    }
+                    // Sem malha (só o host manda, pela conexão direta): sem assinatura.
+                    None => {
+                        if let Some(f) = asm.push(piece, now) {
+                            verified.push(f);
                         }
                     }
                 }
             }
             _ => {}
+        }
+        if let Some(v) = verifier.as_mut() {
+            verified.extend(v.tick(now));
+        }
+        for f in verified.drain(..) {
+            if f.kind != KIND_VIDEO {
+                continue;
+            }
+            if rendition != Some(f.rendition) && f.keyframe {
+                rendition = Some(f.rendition);
+                ord = Ordered::new();
+            }
+            if rendition == Some(f.rendition) {
+                out.extend(ord.push(f, now));
+            }
         }
         mesh.tick(now);
         out.extend(ord.tick(now));

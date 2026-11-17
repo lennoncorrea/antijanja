@@ -115,6 +115,14 @@ struct HostShared {
     /// Versões menores pedidas ao pipeline agora.
     extras: Mutex<Vec<ExtraReq>>,
     alive: AtomicBool,
+    /// Malha P2P (AJ_MESH=1; docs/malha-p2p.md): espectadores repassando faixas entre si.
+    /// Uma malha por versão do vídeo (0 = principal, senão a altura): quem está em 480p
+    /// troca pedaços com quem está em 480p (a qualidade automática desce quem tem a
+    /// internet pior; com uma malha só da principal, eles saíam dela).
+    mesh: Option<Mutex<HashMap<u32, Arc<crate::meshnet::MeshHub>>>>,
+    trace_sent: Mutex<(Instant, u64)>,
+    /// Chave pública com que os quadros são assinados (hex), mandada a cada espectador.
+    stream_pk: String,
 }
 
 impl HostShared {
@@ -282,6 +290,61 @@ impl HostShared {
         }
         self.assign();
         self.apply();
+        self.sync_mesh();
+    }
+
+    /// Acerta quem está na malha: espectadores conectados, recebendo pedaços e na versão
+    /// principal do vídeo (a malha repassa só ela). Cobre de uma vez as saídas
+    /// (desconexão, "bye", expulsão), a troca de versão e o canal de pedaços que chega
+    /// depois da conexão.
+    fn sync_mesh(&self) {
+        let Some(groups) = &self.mesh else { return };
+        // Quem está apto, e em qual versão.
+        let eligible: HashMap<u64, (u32, Arc<HostPeer>)> = self
+            .peers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p)| p.state == "connected" && p.pending.is_none() && p.peer.has_pieces())
+            .map(|(id, p)| (*id, (p.rendition, p.peer.clone())))
+            .collect();
+        let mut groups = groups.lock().unwrap();
+        // Primeiro as saídas (inclusive de quem trocou de versão), depois as entradas.
+        for (key, hub) in groups.iter() {
+            for id in hub.ids() {
+                if eligible.get(&id).map(|e| e.0) != Some(*key) {
+                    hub.leave(id);
+                }
+            }
+        }
+        for (id, (key, peer)) in eligible {
+            let hub = groups.entry(key).or_insert_with(|| crate::meshnet::MeshHub::new(crate::pieces::LANES as usize));
+            if !hub.contains(id) {
+                hub.join(id, peer);
+            }
+        }
+        groups.retain(|_, h| !h.ids().is_empty());
+        if std::env::var_os("AJ_TRACE").is_some() {
+            // Diagnóstico: pedaços por segundo saindo do host e as faixas de cada um.
+            let sent: u64 = self.peers.lock().unwrap().values().map(|p| p.peer.pieces_sent.load(Ordering::Relaxed)).sum();
+            let mut last = self.trace_sent.lock().unwrap();
+            let el = last.0.elapsed().as_secs_f64();
+            if el >= 2.0 {
+                let rate = sent.saturating_sub(last.1) as f64 / el;
+                let mut parts = vec![];
+                for (key, hub) in groups.iter() {
+                    let routes: Vec<String> = hub.snapshot().iter().map(|(id, mask, _)| format!("{id}:{mask:04b}")).collect();
+                    parts.push(format!("versão {key}: {}", routes.join(" ")));
+                }
+                eprintln!("[malha host] {:.0} pedaços/s; direto {}", rate, parts.join(" | "));
+                *last = (Instant::now(), sent);
+            }
+        }
+    }
+
+    /// A malha em que o espectador `id` está (se está em alguma).
+    fn mesh_of(&self, id: u64) -> Option<Arc<crate::meshnet::MeshHub>> {
+        self.mesh.as_ref()?.lock().unwrap().values().find(|h| h.contains(id)).cloned()
     }
 }
 
@@ -407,9 +470,20 @@ pub fn sources_list() -> Vec<Source> {
 pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
     let state = app.rdv();
     stop_host(&state);
-    // Malha P2P, etapa 1 (docs/malha-p2p.md): vídeo em pedaços pelo canal de dados, para
-    // quem tem esse canal. Por enquanto só com AJ_PIECES=1.
-    transport::USE_PIECES.store(std::env::var_os("AJ_PIECES").is_some(), Ordering::Relaxed);
+    // Malha P2P (docs/malha-p2p.md): vídeo em pedaços pelo canal de dados, para quem tem
+    // esse canal (AJ_PIECES=1), e os espectadores repassando faixas entre si (AJ_MESH=1,
+    // que liga os pedaços também). Por enquanto só por variável de ambiente.
+    let mesh_on = std::env::var_os("AJ_MESH").is_some();
+    // Chave desta transmissão para assinar os quadros (a do código muda se a senha mudar
+    // ao vivo; esta vale do começo ao fim). A pública vai para cada espectador pela
+    // conexão direta, ao conectar.
+    let stream_signer = {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).map_err(|e| e.to_string())?;
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+    };
+    let stream_pk: String = stream_signer.verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    transport::USE_PIECES.store(mesh_on || std::env::var_os("AJ_PIECES").is_some(), Ordering::Relaxed);
     let (media_tx, mut media_rx) = tokio::sync::mpsc::channel::<Media>(240);
     let peers: Arc<Mutex<HashMap<u64, PeerEntry>>> = Arc::new(Mutex::new(HashMap::new()));
     let keyframes: Arc<Mutex<std::collections::HashSet<u32>>> = Default::default();
@@ -423,6 +497,10 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
         transport::spawn(async move {
             // Malha (etapa 2): cada quadro vira pedaços uma vez só, os mesmos para todos.
             let mut source = crate::pieces::PieceSource::new(transport::PIECE_OVERHEAD);
+            // Na malha, a folga aguenta perder uma faixa inteira (um vizinho que caiu), e
+            // cada quadro é assinado (os pedaços passam por outros espectadores).
+            source.survive_lane = mesh_on;
+            source.signer = mesh_on.then(|| stream_signer.clone());
             let use_pieces = transport::USE_PIECES.load(Ordering::Relaxed);
             while let Some(m) = media_rx.recv().await {
                 let targets: Vec<Arc<HostPeer>> = {
@@ -524,6 +602,9 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
         applied: Mutex::new(None),
         extras: Mutex::new(vec![]),
         alive: AtomicBool::new(true),
+        mesh: mesh_on.then(|| Mutex::new(HashMap::new())),
+        trace_sent: Mutex::new((Instant::now(), 0)),
+        stream_pk,
     });
 
     let opus = Arc::new(Mutex::new(OpusEncoder::new(config.abitrate.clamp(32, 510))?));
@@ -629,9 +710,16 @@ async fn accept_viewer(
                                 let _ = app.emit("host-viewer-joined", name.clone());
                             }
                             p.state = "connected";
-                            // As qualidades que dá para escolher (menu de quem assiste).
+                            // As qualidades que dá para escolher (menu de quem assiste) e,
+                            // na malha, a chave que assina os quadros (antes de qualquer rota).
                             let (peer, msg) = (p.peer.clone(), shared.renditions_msg());
-                            transport::spawn(async move { peer.send_message(&msg).await });
+                            let key = shared.mesh.is_some().then(|| serde_json::json!({ "t": "stream-key", "pk": shared.stream_pk }).to_string());
+                            transport::spawn(async move {
+                                if let Some(k) = key {
+                                    peer.send_message(&k).await;
+                                }
+                                peer.send_message(&msg).await;
+                            });
                         }
                         // (a lista está travada aqui: não chamar o que trava de novo)
                         shared.request_keyframe(map.get(&id).map(|p| p.rendition).unwrap_or(0));
@@ -658,6 +746,12 @@ async fn accept_viewer(
         let (shared, peers, app) = (shared.clone(), peers.clone(), app.clone());
         Arc::new(move |m: String| {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&m) else { return };
+            if v["t"] == "mesh" {
+                if let Some(h) = shared.mesh_of(id) {
+                    h.on_message(id, &v);
+                }
+                return;
+            }
             if v["t"] == "kf" {
                 shared.request_keyframe_for(id);
             } else if v["t"] == "quality" {

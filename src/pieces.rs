@@ -35,6 +35,10 @@ pub const HEADER: usize = 25;
 /// Tipo do conteúdo do pedaço.
 pub const KIND_VIDEO: u8 = 0;
 pub const KIND_AUDIO: u8 = 1;
+/// Assinatura de um quadro (Ed25519 do host): vai num "pedaço" próprio, um por faixa
+/// (chega a todos pela malha), antes dos pedaços do quadro.
+pub const KIND_SIG: u8 = 2;
+const SIG_LEN: usize = 64;
 /// Marcador: o quadro é um keyframe.
 pub const FLAG_KEYFRAME: u8 = 1;
 
@@ -95,6 +99,10 @@ impl Header {
             esi: u32_at(20),
             block: b[24],
         };
+        if h.kind == KIND_SIG {
+            let ok = h.len == SIG_LEN as u32 && h.symbol == SIG_LEN as u16 && h.esi == 0 && h.block == 0 && b.len() == HEADER + SIG_LEN;
+            return ok.then_some(h);
+        }
         let ok = h.kind <= KIND_AUDIO
             && (1..=MAX_FRAME as u32).contains(&h.len)
             && (1..=MAX_SYMBOL as u16).contains(&h.symbol)
@@ -269,13 +277,15 @@ pub struct PieceSource {
     pub overhead: f32,
     /// Malha: folga suficiente para perder uma faixa inteira.
     pub survive_lane: bool,
+    /// Malha: assina cada quadro (os pedaços passam por outros espectadores).
+    pub signer: Option<ed25519_dalek::SigningKey>,
 }
 
 impl PieceSource {
     pub fn new(overhead: f32) -> Self {
         let mut b = [0u8; 4];
         let _ = getrandom::fill(&mut b);
-        Self { state: Default::default(), seed: u32::from_le_bytes(b), overhead, survive_lane: false }
+        Self { state: Default::default(), seed: u32::from_le_bytes(b), overhead, survive_lane: false, signer: None }
     }
 
     /// `key`: versão (0 = principal, senão a altura). None só se o quadro for inválido;
@@ -288,8 +298,123 @@ impl PieceSource {
         *st = (frame.wrapping_add(1), ts.wrapping_add(samples));
         let keyframe = crate::media::has_nal(data, 5);
         let mut enc = FrameEncoder::new(KIND_VIDEO, key.min(u16::MAX as u32) as u16, frame, ts, data, keyframe, LANES)?;
-        let pieces = enc.pieces_with(overhead_for(keyframe, self.overhead), self.survive_lane);
+        let mut pieces = enc.pieces_with(overhead_for(keyframe, self.overhead), self.survive_lane);
+        if let Some(sk) = &self.signer {
+            // A assinatura vai na frente: quando o quadro fecha, ela já chegou.
+            let mut signed = sig_pieces(sk, &enc.header(), data);
+            signed.append(&mut pieces);
+            pieces = signed;
+        }
         Some(std::sync::Arc::new(PieceFrame { pieces, keyframe }))
+    }
+}
+
+/// O que a assinatura cobre: tudo o que descreve o quadro e os dados.
+fn digest(kind: u8, rendition: u16, frame: u32, ts: u32, data: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"antijanja quadro v1");
+    h.update(&[kind]);
+    h.update(&rendition.to_le_bytes());
+    h.update(&frame.to_le_bytes());
+    h.update(&ts.to_le_bytes());
+    h.update(&(data.len() as u32).to_le_bytes());
+    h.update(data);
+    *h.finalize().as_bytes()
+}
+
+/// Um "pedaço" de assinatura por faixa.
+fn sig_pieces(sk: &ed25519_dalek::SigningKey, h: &Header, data: &[u8]) -> Vec<Vec<u8>> {
+    use ed25519_dalek::Signer;
+    let sig = sk.sign(&digest(h.kind, h.rendition, h.frame, h.ts, data)).to_bytes();
+    (0..LANES)
+        .map(|lane| {
+            let sh = Header { kind: KIND_SIG, len: SIG_LEN as u32, symbol: SIG_LEN as u16, esi: 0, block: 0, lane, ..*h };
+            let mut out = Vec::with_capacity(HEADER + SIG_LEN);
+            sh.write(&mut out);
+            out.extend_from_slice(&sig);
+            out
+        })
+        .collect()
+}
+
+/// Quanto um quadro refeito espera pela assinatura dele antes de ser descartado.
+pub const SIG_WAIT: Duration = Duration::from_millis(100);
+
+/// Confere a assinatura de cada quadro refeito (malha: os pedaços passaram por outros
+/// espectadores, que poderiam alterá-los). Quadro sem assinatura válida não vai para o
+/// decoder.
+pub struct Verifier {
+    key: ed25519_dalek::VerifyingKey,
+    sigs: std::collections::HashMap<(u16, u32), [u8; SIG_LEN]>,
+    order: VecDeque<(u16, u32)>,
+    waiting: Vec<(Frame, Instant)>,
+    /// Quadros descartados: assinatura errada / não chegou a tempo.
+    pub forged: u64,
+    pub unsigned: u64,
+}
+
+impl Verifier {
+    pub fn new(key: ed25519_dalek::VerifyingKey) -> Self {
+        Self { key, sigs: Default::default(), order: VecDeque::new(), waiting: vec![], forged: 0, unsigned: 0 }
+    }
+
+    /// Pedaço de assinatura. Devolve quadros que esperavam por ela e agora conferem.
+    pub fn on_sig(&mut self, piece: &[u8], now: Instant) -> Vec<Frame> {
+        let Some(h) = Header::read(piece).filter(|h| h.kind == KIND_SIG) else { return vec![] };
+        let key = (h.rendition, h.frame);
+        if !self.sigs.contains_key(&key) {
+            let mut sig = [0u8; SIG_LEN];
+            sig.copy_from_slice(&piece[HEADER..]);
+            self.sigs.insert(key, sig);
+            self.order.push_back(key);
+            while self.order.len() > REMEMBER_DONE {
+                if let Some(old) = self.order.pop_front() {
+                    self.sigs.remove(&old);
+                }
+            }
+        }
+        let waiting = std::mem::take(&mut self.waiting);
+        let mut out = vec![];
+        for (f, at) in waiting {
+            match self.check_one(&f) {
+                Some(true) => out.push(f),
+                Some(false) => self.forged += 1,
+                None => self.waiting.push((f, at)),
+            }
+        }
+        out.extend(self.expire(now));
+        out
+    }
+
+    /// Quadro refeito. Devolve os que já conferem (este e/ou outros).
+    pub fn push(&mut self, f: Frame, now: Instant) -> Vec<Frame> {
+        let mut out = vec![];
+        match self.check_one(&f) {
+            Some(true) => out.push(f),
+            Some(false) => self.forged += 1,
+            None => self.waiting.push((f, now)),
+        }
+        out.extend(self.expire(now));
+        out
+    }
+
+    /// Chamar de tempos em tempos (descarta quem esperou demais pela assinatura).
+    pub fn tick(&mut self, now: Instant) -> Vec<Frame> {
+        self.expire(now)
+    }
+
+    fn expire(&mut self, now: Instant) -> Vec<Frame> {
+        let before = self.waiting.len();
+        self.waiting.retain(|(_, at)| now.saturating_duration_since(*at) < SIG_WAIT);
+        self.unsigned += (before - self.waiting.len()) as u64;
+        vec![]
+    }
+
+    /// Some(true) = confere, Some(false) = não confere, None = assinatura ainda não chegou.
+    fn check_one(&self, f: &Frame) -> Option<bool> {
+        let sig = self.sigs.get(&(f.rendition, f.frame))?;
+        let sig = ed25519_dalek::Signature::from_bytes(sig);
+        Some(self.key.verify_strict(&digest(f.kind, f.rendition, f.frame, f.ts, &f.data), &sig).is_ok())
     }
 }
 
@@ -370,6 +495,9 @@ impl Assembler {
             self.stats.invalid += 1;
             return None;
         };
+        if h.kind == KIND_SIG {
+            return None; // tratadas pelo `Verifier`
+        }
         let key = (h.kind, h.rendition, h.frame);
         if self.done.contains(&key) {
             self.stats.surplus += 1;
@@ -732,6 +860,86 @@ mod tests {
         let now = Instant::now();
         let f = pieces[..keep].iter().find_map(|p| a.push(p, now));
         assert!(f.is_some_and(|f| f.keyframe && f.data == d));
+    }
+
+    fn signing_key(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// Quadros assinados passam; adulterados, de outra chave ou sem assinatura, não.
+    #[test]
+    fn verifier_accepts_only_frames_signed_by_the_host() {
+        let sk = signing_key(7);
+        let mut src = PieceSource::new(0.25);
+        src.signer = Some(sk.clone());
+        let mut v = Verifier::new(sk.verifying_key());
+        let mut a = Assembler::new();
+        let now = Instant::now();
+        let run = |pieces: &[Vec<u8>], a: &mut Assembler, v: &mut Verifier, now: Instant| -> Vec<Frame> {
+            let mut out = vec![];
+            for p in pieces {
+                if Header::read(p).is_some_and(|h| h.kind == KIND_SIG) {
+                    out.extend(v.on_sig(p, now));
+                } else if let Some(f) = a.push(p, now) {
+                    out.extend(v.push(f, now));
+                }
+            }
+            out
+        };
+        // Normal: confere.
+        let d = data(9_000, 1);
+        let f = src.encode(0, &d, Duration::from_millis(16)).unwrap();
+        let ok = run(&f.pieces, &mut a, &mut v, now);
+        assert_eq!(ok.len(), 1);
+        assert!(ok[0].data == d);
+        // Alguém no caminho trocou um byte de todos os pedaços originais: refaz um quadro
+        // diferente, que não confere.
+        let d2 = data(9_000, 2);
+        let f2 = src.encode(0, &d2, Duration::from_millis(16)).unwrap();
+        let tampered: Vec<Vec<u8>> = f2
+            .pieces
+            .iter()
+            .map(|p| {
+                let mut p = p.clone();
+                if Header::read(&p).is_some_and(|h| h.kind == KIND_VIDEO) {
+                    p[HEADER] ^= 0xff;
+                }
+                p
+            })
+            .collect();
+        assert!(run(&tampered, &mut a, &mut v, now).is_empty());
+        assert_eq!(v.forged, 1);
+        // Assinado por outra chave (alguém se passando pelo host): não confere.
+        let mut evil = PieceSource::new(0.25);
+        evil.signer = Some(signing_key(9));
+        let mut a2 = Assembler::new();
+        let fe = evil.encode(0, &data(5_000, 3), Duration::from_millis(16)).unwrap();
+        assert!(run(&fe.pieces, &mut a2, &mut v, now).is_empty());
+        // Sem assinatura: espera um pouco e descarta.
+        let mut plain = PieceSource::new(0.25);
+        let mut a3 = Assembler::new();
+        // (outra versão do vídeo: nenhuma assinatura com esse número chegou)
+        let fp = plain.encode(480, &data(5_000, 4), Duration::from_millis(16)).unwrap();
+        assert!(run(&fp.pieces, &mut a3, &mut v, now).is_empty());
+        v.tick(now + SIG_WAIT);
+        assert_eq!(v.unsigned, 1);
+    }
+
+    /// A assinatura pode chegar depois do quadro (por outro vizinho): ele espera um pouco.
+    #[test]
+    fn verifier_waits_briefly_for_a_late_signature() {
+        let sk = signing_key(5);
+        let mut src = PieceSource::new(0.25);
+        src.signer = Some(sk.clone());
+        let mut v = Verifier::new(sk.verifying_key());
+        let mut a = Assembler::new();
+        let now = Instant::now();
+        let f = src.encode(0, &data(4_000, 1), Duration::from_millis(16)).unwrap();
+        let (sigs, rest): (Vec<_>, Vec<_>) = f.pieces.iter().partition(|p| Header::read(p).is_some_and(|h| h.kind == KIND_SIG));
+        let frame = rest.iter().find_map(|p| a.push(p, now)).unwrap();
+        assert!(v.push(frame, now).is_empty(), "sem assinatura ainda: espera");
+        let out = v.on_sig(sigs[2], now + Duration::from_millis(30));
+        assert_eq!(out.len(), 1);
     }
 
     /// Na malha, perder uma faixa inteira (qualquer uma) não pode impedir nenhum quadro.

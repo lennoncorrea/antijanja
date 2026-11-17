@@ -137,7 +137,36 @@ Plano original da etapa:
   bitrate adaptativo passa a usar a perda de pedaços.
 - Teste ponta a ponta na mesma máquina e com perda simulada.
 
-### Etapa 2: a malha
+### Etapa 2: a malha — feita (desligada por padrão: `AJ_MESH=1`)
+
+- 2a: o host codifica cada quadro uma vez só (`PieceSource`), os mesmos pedaços para
+  todos; cada espectador recebe direto só as faixas da máscara dele.
+- 2b: `mesh::routes`: cada repassador é interno em uma faixa; até 6 filhos por faixa.
+- 2c: `meshnet`: `MeshLink` (conexão entre espectadores, só o canal "aj-m"),
+  `ViewerMesh` (segue a rota, repassa na hora, avisa "fed"/"starve"), `MeshHub` +
+  `Coordinator` no host (só para de mandar uma faixa direto depois do "fed"; vizinho que
+  para devolve a faixa ao host e a ligação sai das rotas). Ofertas numeradas (uma rota nova
+  no meio não duplica a ligação), mensagens de controle esperam o canal abrir, período de
+  graça de 500 ms na troca de rota, folga que aguenta perder uma faixa inteira.
+- Uma malha por versão do vídeo (a qualidade automática desce quem tem internet pior).
+- 2d: o host assina cada quadro com uma chave da transmissão (a pública vai pela conexão
+  direta antes de qualquer rota); pedaço de vizinho só vale com a chave, e quadro sem
+  assinatura válida não vai para o decoder.
+
+Medido:
+
+- `meshnet::tests::mesh_four_viewers` (host + 4 espectadores, WebRTC real, quadros
+  assinados): upload do host 25% do "tudo para todos"; um repassador cai no meio e os
+  outros 3 recebem 720/720 quadros, sem keyframe extra.
+- App de verdade, host + 3 espectadores na mesma máquina, 1080p60: os 3 estáveis, buffer
+  ~10 ms; upload do host 58% (com 3 espectadores e 4 faixas, uma faixa fica sem repassador
+  e vai direto: o mínimo seria 50%; uma ligação caiu e voltou para o host).
+- Custo da folga na malha: +36% (quadros grandes) a +50% (pequenos), contra +25% sem malha.
+
+Falta (etapa 3): perdoar ligações ruins depois de um tempo (hoje ficam fora para sempre),
+descobrir qual vizinho mandou pedaço adulterado, nota por repassador.
+
+Plano original da etapa:
 
 - Conexões espectador↔espectador (oferta/resposta pelo canal do host), só canal de dados.
 - Host: tabela de rotas por faixa; manda a cada espectador "receba a faixa X de Y,
