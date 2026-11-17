@@ -361,6 +361,7 @@ pub fn init(app: &AppHandle) {
     thread::spawn(move || match Dht::client() {
         Ok(dht) => {
             let ok = dht.bootstrapped();
+            start_gossip(&app, &dht);
             let _ = app.rdv().dht.set(dht);
             let _ = app.emit("dht-status", ok);
         }
@@ -637,7 +638,16 @@ const PUBLIC_OVERLAP_MS: i64 = 90 * 1000;
 const MURAL_CONTEXT: &[u8] = b"antijanja mural v2:";
 
 fn public_key() -> SigningKey {
-    SigningKey::from_bytes(&blake3::derive_key("antijanja public directory v2", b"mural de transmissoes ao vivo"))
+    let phrase = format!("mural de transmissoes ao vivo{}", test_net().map(|n| format!(" (teste {n})")).unwrap_or_default());
+    SigningKey::from_bytes(&blake3::derive_key("antijanja public directory v2", phrase.as_bytes()))
+}
+
+/// Rede de teste isolada (`AJ_TEST_NET`, só na versão de desenvolvimento): o mural e a
+/// fofoca usam outra chave e outro tópico, invisíveis para os apps de verdade. Testes de
+/// transmissão pública só aqui (o autoteste transmite a tela de quem roda).
+pub fn test_net() -> Option<&'static str> {
+    static NET: OnceLock<Option<String>> = OnceLock::new();
+    NET.get_or_init(|| if cfg!(debug_assertions) { std::env::var("AJ_TEST_NET").ok().filter(|s| !s.is_empty()) } else { None }).as_deref()
 }
 
 fn public_salt(epoch: i64, slot: u8) -> Vec<u8> {
@@ -780,8 +790,70 @@ pub fn public_list(state: &RdvState) -> Result<Vec<PublicStream>, String> {
         .filter(valid)
         .map(|e| PublicStream { own: e.id == me, entry: e })
         .collect();
-    list.sort_by(|a, b| b.entry.viewers.cmp(&a.entry.viewers).then(a.entry.since.cmp(&b.entry.since)));
+    sort_public(&mut list);
     Ok(list)
+}
+
+/// Mais espectadores primeiro; empate, a mais antiga.
+fn sort_public(list: &mut [PublicStream]) {
+    list.sort_by(|a, b| b.entry.viewers.cmp(&a.entry.viewers).then(a.entry.since.cmp(&b.entry.since)));
+}
+
+/// Junta na lista um anúncio que chegou pela fofoca: vale o mais novo de cada transmissão;
+/// encerrada (ou velha) sai. Devolve se a lista mudou.
+pub fn merge_public(list: &mut Vec<PublicStream>, e: &PublicEntry) -> bool {
+    if list.iter().any(|s| s.entry.code == e.code && s.entry.ts >= e.ts) {
+        return false;
+    }
+    let before = list.len();
+    list.retain(|s| s.entry.code != e.code);
+    let removed = list.len() != before;
+    if valid(e) {
+        list.push(PublicStream { own: e.id == instance_id(), entry: e.clone() });
+        sort_public(list);
+        return true;
+    }
+    removed
+}
+
+/// O anúncio ainda vale pelo horário (os velhos saem da lista)?
+pub fn entry_alive(e: &PublicEntry) -> bool {
+    (now_ms() - e.ts).abs() < PUBLIC_TTL_MS
+}
+
+/* ========================================================================== */
+/*                  Fofoca entre os apps (docs/gossip-ao-vivo.md)               */
+/* ========================================================================== */
+
+/// Confere um anúncio do mural vindo da fofoca: assinatura do host do código anunciado e
+/// horário recente (o "encerrou" também passa). Chave: o código.
+fn gossip_check(value: &[u8]) -> Option<(String, i64)> {
+    let e = open_entry(value)?;
+    (e.code.len() < 80 && entry_alive(&e)).then(|| (e.code.clone(), e.ts))
+}
+
+/// Liga a fofoca aos anúncios do mural: cada anúncio novo vira o evento "public-entry".
+fn start_gossip(app: &AppHandle, dht: &Dht) {
+    let app = app.clone();
+    let cfg = crate::gossip::Config {
+        id: instance_id().to_string(),
+        net: test_net().unwrap_or_default().to_string(),
+        dht: Some(dht.clone()),
+        lan: true,
+        bind: std::net::Ipv4Addr::UNSPECIFIED,
+        check: Box::new(gossip_check),
+        deliver: Box::new(move |value| {
+            if let Some(e) = open_entry(value) {
+                let what = if e.gone { "encerrou" } else if e.id == instance_id() { "nosso" } else { "ao vivo" };
+                crate::connlog::log(format!("fofoca: anúncio {} ({what})", crate::connlog::short(&e.code)));
+                let _ = app.emit("public-entry", e);
+            }
+        }),
+    };
+    match crate::gossip::Gossip::start(cfg) {
+        Ok(g) => crate::gossip::install(g),
+        Err(e) => crate::connlog::log(format!("fofoca: não iniciou: {e}")),
+    }
 }
 
 /// Vaga para anunciar: a mesma de antes se ainda for nossa (ou estiver livre);
@@ -841,11 +913,14 @@ impl PublicAnnouncer {
                     }
                     let epoch = epoch_of(now_ms());
                     if let Some((_, keys)) = &signer {
-                        let slot = choose_slot(&dht, epoch, place, &me);
-                        place = Some((epoch, slot));
                         en.ts = now_ms();
                         en.id = me.clone();
                         if let Ok(value) = seal_entry(keys, &en) {
+                            // Na fofoca primeiro: chega na hora a quem está conectado; o
+                            // mural na DHT leva alguns segundos (escolher a vaga lê o mural).
+                            crate::gossip::broadcast(&value);
+                            let slot = choose_slot(&dht, epoch, place, &me);
+                            place = Some((epoch, slot));
                             let _ = put_slot(&dht, epoch, slot, &value);
                         }
                     }
@@ -855,14 +930,17 @@ impl PublicAnnouncer {
                     let _ = wake_rx.recv_timeout(PUBLIC_REFRESH.min(Duration::from_millis(to_next_epoch.max(0) as u64)));
                 }
                 // Saindo: marca a entrada como encerrada para sumir da lista na hora.
-                if let (Some((epoch, slot)), Some((code, keys))) = (place, &signer) {
+                if let Some((code, keys)) = &signer {
                     let mut en = e.lock().unwrap().clone();
                     en.code = code.clone();
                     en.gone = true;
                     en.ts = now_ms();
                     en.id = me.clone();
                     if let Ok(value) = seal_entry(keys, &en) {
-                        let _ = put_slot(&dht, epoch, slot, &value);
+                        crate::gossip::broadcast(&value);
+                        if let Some((epoch, slot)) = place {
+                            let _ = put_slot(&dht, epoch, slot, &value);
+                        }
                     }
                 }
             })
@@ -956,6 +1034,39 @@ mod tests {
         // Quem só tem o código nem consegue assinar.
         assert!(seal_entry(&Keys::from_code(&code, None).unwrap(), &e).is_err());
         assert_eq!(open_entry(b"lixo"), None);
+    }
+
+    #[test]
+    fn gossip_entries_merge_into_the_list() {
+        let (code, keys) = host();
+        let mut e = entry(&code, now_ms(), false);
+        e.name = "Ana".into();
+        let mut list = Vec::new();
+        assert!(merge_public(&mut list, &e), "anúncio novo entra");
+        assert_eq!(list.len(), 1);
+        assert!(!merge_public(&mut list, &e), "repetido não muda nada");
+        let mut older = e.clone();
+        older.ts -= 1000;
+        older.name = "Velho".into();
+        assert!(!merge_public(&mut list, &older), "mais velho não troca");
+        let mut newer = e.clone();
+        newer.ts += 1000;
+        newer.viewers = 5;
+        assert!(merge_public(&mut list, &newer));
+        assert_eq!(list[0].entry.viewers, 5);
+        let mut gone = newer.clone();
+        gone.ts += 1000;
+        gone.gone = true;
+        assert!(merge_public(&mut list, &gone), "encerrou sai da lista");
+        assert!(list.is_empty());
+        // A fofoca só aceita entrada assinada pelo host do código.
+        let sealed = seal_entry(&keys, &newer).unwrap();
+        assert_eq!(gossip_check(&sealed), Some((code.clone(), newer.ts)));
+        let (_, other) = host();
+        assert_eq!(gossip_check(&seal_entry(&other, &newer).unwrap()), None, "assinada por outra chave");
+        let mut stale = newer.clone();
+        stale.ts = now_ms() - PUBLIC_TTL_MS - 1000;
+        assert_eq!(gossip_check(&seal_entry(&keys, &stale).unwrap()), None, "velha demais");
     }
 
     #[test]

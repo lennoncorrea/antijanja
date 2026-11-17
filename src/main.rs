@@ -19,6 +19,7 @@ mod avsync;
 mod capture;
 mod framegen;
 mod fullscreen;
+mod gossip;
 mod congestion;
 mod connlog;
 mod gpu;

@@ -35,6 +35,8 @@ const MENU_RADIUS: f32 = 12.0;
 const MENU_GAP: f32 = 52.0;
 
 const PUBLIC_REFRESH: Duration = Duration::from_secs(20);
+/// Releitura do mural na DHT quando a fofoca está conectada (docs/gossip-ao-vivo.md).
+const PUBLIC_REFRESH_GOSSIP: Duration = Duration::from_secs(120);
 const TOAST_TIME: Duration = Duration::from_secs(4);
 /// Controles por cima do vídeo: somem depois desse tempo com o mouse parado, ou deste
 /// outro depois de o mouse sair do vídeo.
@@ -123,6 +125,9 @@ struct Ctl {
     public: Option<Vec<rendezvous::PublicStream>>,
     public_busy: bool,
     public_updated: Option<Instant>,
+    /// Anúncio mais novo de cada transmissão que chegou pela fofoca (docs/gossip-ao-vivo.md),
+    /// para continuar valendo quando a lista é relida pela DHT (que pode estar atrasada).
+    gossip: HashMap<String, rendezvous::PublicEntry>,
     sources: Option<Vec<capture::Source>>,
     thumbs: HashMap<String, Image>,
     picker: String,
@@ -382,6 +387,9 @@ fn render_public(c: &Ctl, ui: &AppWindow) {
     set_if_changed!(a, get_public_loading, set_public_loading, c.public.is_none());
     a.set_public_updated(s(if c.public_busy {
         "Atualizando".to_string()
+    } else if crate::gossip::peer_count() > 0 {
+        // Conectado à fofoca: a lista atualiza sozinha, na hora.
+        "ao vivo".into()
     } else {
         match c.public_updated.map(|t| t.elapsed().as_secs()) {
             None => "Atualizar".into(),
@@ -909,7 +917,12 @@ fn refresh_public(c: &mut Ctl, ui: &AppWindow) {
     bg(move || rendezvous::public_list(app.rdv()), |c, ui, r| {
         c.public_busy = false;
         match r {
-            Ok(list) => {
+            Ok(mut list) => {
+                // O que chegou pela fofoca vale sobre o mural (mais novo, ou já encerrado).
+                c.gossip.retain(|_, e| rendezvous::entry_alive(e));
+                for e in c.gossip.values() {
+                    rendezvous::merge_public(&mut list, e);
+                }
                 c.public = Some(list);
                 c.public_updated = Some(Instant::now());
             }
@@ -1376,6 +1389,18 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
     let a = ui.global::<App>();
     let id_of = |v: &Value| v["id"].as_str().unwrap_or_default().to_string();
     match name {
+        // Anúncio do "Ao vivo agora" pela fofoca: entra na lista na hora.
+        "public-entry" => {
+            let Ok(e) = serde_json::from_value::<rendezvous::PublicEntry>(v) else { return };
+            if c.gossip.get(&e.code).is_some_and(|old| old.ts >= e.ts) {
+                return;
+            }
+            c.gossip.insert(e.code.clone(), e.clone());
+            let list = c.public.get_or_insert_with(Vec::new);
+            if rendezvous::merge_public(list, &e) {
+                render_public(c, ui);
+            }
+        }
         "dht-status" => {
             c.net = if v.as_bool().unwrap_or(false) { "ok".into() } else { "err".into() };
             render_general(c, ui);
@@ -1833,6 +1858,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
             public: None,
             public_busy: false,
             public_updated: None,
+            gossip: HashMap::new(),
             sources: None,
             thumbs: HashMap::new(),
             picker: String::new(),
@@ -1948,7 +1974,19 @@ pub fn run() -> Result<(), slint::PlatformError> {
     let public_timer = slint::Timer::default();
     public_timer.start(slint::TimerMode::Repeated, PUBLIC_REFRESH, || {
         with(|c, ui| {
-            if c.view == "home" {
+            // Transmissões que pararam de se anunciar (o app fechou sem avisar) saem.
+            if let Some(list) = &mut c.public {
+                let before = list.len();
+                list.retain(|p| rendezvous::entry_alive(&p.entry));
+                if list.len() != before {
+                    render_public(c, ui);
+                }
+            }
+            // Com vizinhos na fofoca, os anúncios chegam sozinhos: a DHT só é relida de vez
+            // em quando, para pegar quem ficou de fora da fofoca.
+            let gossiping = crate::gossip::peer_count() > 0;
+            let fresh = c.public_updated.is_some_and(|t| t.elapsed() < PUBLIC_REFRESH_GOSSIP);
+            if c.view == "home" && !(gossiping && fresh) {
                 refresh_public(c, ui);
             }
         });
@@ -2013,9 +2051,21 @@ fn autotest() {
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(500), move || {
         with(|c, ui| match mode.as_str() {
             "host" => {
+                // AJ_HOST_AFTER (s): espera antes de começar (o app já aberto, como na vida real).
+                let after = std::env::var("AJ_HOST_AFTER").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                if !done && started.elapsed() < Duration::from_secs(after) {
+                    return;
+                }
                 if !done {
                     done = true;
-                    c.s.public = false;
+                    // AJ_PUBLIC: aparece no "Ao vivo agora" (testar a fofoca). Só numa rede de
+                    // teste isolada (AJ_TEST_NET): este autoteste transmite a tela de quem roda,
+                    // e a lista de verdade é vista por todo mundo.
+                    let public = std::env::var_os("AJ_PUBLIC").is_some();
+                    if public && rendezvous::test_net().is_none() {
+                        eprintln!("[autotest] AJ_PUBLIC ignorado: só com AJ_TEST_NET (rede de teste isolada)");
+                    }
+                    c.s.public = public && rendezvous::test_net().is_some();
                     c.s.stream_password.clear();
                     c.s.name = "Autoteste".into();
                     // Sem áudio: com várias instâncias na mesma máquina, o host captaria o som
