@@ -279,13 +279,20 @@ pub struct PieceSource {
     pub survive_lane: bool,
     /// Malha: assina cada quadro (os pedaços passam por outros espectadores).
     pub signer: Option<ed25519_dalek::SigningKey>,
+    /// Codificadores dos quadros recentes: geram pedaços extras quando alguém pede.
+    recent: VecDeque<(u32, u32, FrameEncoder)>,
 }
+
+/// Quadros recentes que ainda dá para reparar (~1,5 s a 60 fps).
+const KEEP_FOR_REPAIR: usize = 90;
+/// Mais pedaços extras que isso por bloco num pedido: pedido estranho.
+const MAX_REPAIR: u32 = 64;
 
 impl PieceSource {
     pub fn new(overhead: f32) -> Self {
         let mut b = [0u8; 4];
         let _ = getrandom::fill(&mut b);
-        Self { state: Default::default(), seed: u32::from_le_bytes(b), overhead, survive_lane: false, signer: None }
+        Self { state: Default::default(), seed: u32::from_le_bytes(b), overhead, survive_lane: false, signer: None, recent: VecDeque::new() }
     }
 
     /// `key`: versão (0 = principal, senão a altura). None só se o quadro for inválido;
@@ -305,7 +312,18 @@ impl PieceSource {
             signed.append(&mut pieces);
             pieces = signed;
         }
+        self.recent.push_back((key, frame, enc));
+        while self.recent.len() > KEEP_FOR_REPAIR {
+            self.recent.pop_front();
+        }
         Some(std::sync::Arc::new(PieceFrame { pieces, keyframe }))
+    }
+
+    /// Pedaços extras novos para um quadro recente: `blocks` = (bloco, quantos). Vazio se
+    /// o quadro já saiu da memória.
+    pub fn more(&mut self, key: u32, frame: u32, blocks: &[(u8, u32)]) -> Vec<Vec<u8>> {
+        let Some((_, _, enc)) = self.recent.iter_mut().find(|(k, f, _)| *k == key && *f == frame) else { return vec![] };
+        blocks.iter().flat_map(|&(b, n)| enc.repair_block(b as usize, n.min(MAX_REPAIR))).collect()
     }
 }
 
@@ -351,11 +369,13 @@ pub struct Verifier {
     /// Quadros descartados: assinatura errada / não chegou a tempo.
     pub forged: u64,
     pub unsigned: u64,
+    /// De quem vieram os pedaços dos quadros que não conferiram (quem chama esvazia).
+    pub suspects: Vec<u64>,
 }
 
 impl Verifier {
     pub fn new(key: ed25519_dalek::VerifyingKey) -> Self {
-        Self { key, sigs: Default::default(), order: VecDeque::new(), waiting: vec![], forged: 0, unsigned: 0 }
+        Self { key, sigs: Default::default(), order: VecDeque::new(), waiting: vec![], forged: 0, unsigned: 0, suspects: vec![] }
     }
 
     /// Pedaço de assinatura. Devolve quadros que esperavam por ela e agora conferem.
@@ -378,7 +398,7 @@ impl Verifier {
         for (f, at) in waiting {
             match self.check_one(&f) {
                 Some(true) => out.push(f),
-                Some(false) => self.forged += 1,
+                Some(false) => self.reject(&f),
                 None => self.waiting.push((f, at)),
             }
         }
@@ -391,11 +411,20 @@ impl Verifier {
         let mut out = vec![];
         match self.check_one(&f) {
             Some(true) => out.push(f),
-            Some(false) => self.forged += 1,
+            Some(false) => self.reject(&f),
             None => self.waiting.push((f, now)),
         }
         out.extend(self.expire(now));
         out
+    }
+
+    fn reject(&mut self, f: &Frame) {
+        self.forged += 1;
+        for s in &f.sources {
+            if !self.suspects.contains(s) {
+                self.suspects.push(*s);
+            }
+        }
     }
 
     /// Chamar de tempos em tempos (descarta quem esperou demais pela assinatura).
@@ -433,6 +462,9 @@ pub struct Frame {
     pub ts: u32,
     pub keyframe: bool,
     pub data: Vec<u8>,
+    /// De quem vieram os pedaços usados (0 = host): se o quadro não conferir com a
+    /// assinatura, um deles adulterou.
+    pub sources: Vec<u64>,
 }
 
 /// Contadores do montador (para relatórios e diagnóstico).
@@ -458,6 +490,7 @@ struct Pending {
     /// Pedaços recebidos em cada bloco.
     got: Vec<u32>,
     first_at: Instant,
+    sources: Vec<u64>,
 }
 
 /// Quanto tempo um quadro incompleto espera por pedaços antes de desistir.
@@ -489,6 +522,11 @@ impl Assembler {
     }
 
     pub fn push(&mut self, piece: &[u8], now: Instant) -> Option<Frame> {
+        self.push_from(piece, now, 0)
+    }
+
+    /// Como `push`, anotando de quem veio o pedaço (0 = host).
+    pub fn push_from(&mut self, piece: &[u8], now: Instant, src: u64) -> Option<Frame> {
         self.stats.pieces += 1;
         self.expire(now);
         let Some(h) = Header::read(piece) else {
@@ -518,7 +556,7 @@ impl Assembler {
                     Some(SourceBlockDecoder::new(b as u8, &oti(bytes, h.symbol as usize), bytes as u64))
                 })
                 .collect();
-            self.pending.insert(key, Pending { header: h, decoders, parts: vec![None; n], got: vec![0; n], first_at: now });
+            self.pending.insert(key, Pending { header: h, decoders, parts: vec![None; n], got: vec![0; n], first_at: now, sources: vec![] });
         }
         let p = self.pending.get_mut(&key).unwrap();
         // Todos os pedaços de um quadro têm que concordar no que descreve o quadro.
@@ -533,6 +571,9 @@ impl Assembler {
             return None;
         };
         p.got[b] += 1;
+        if !p.sources.contains(&src) {
+            p.sources.push(src);
+        }
         let packet = EncodingPacket::new(PayloadId::new(h.block, h.esi), piece[HEADER..].to_vec());
         // Defesa extra: um pedaço malformado não pode derrubar o app.
         let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decoder.decode(std::iter::once(packet))));
@@ -558,7 +599,7 @@ impl Assembler {
         self.stats.extra_used += used.saturating_sub(p.header.source_pieces()) as u64;
         let mut data: Vec<u8> = p.parts.into_iter().flatten().flatten().collect();
         data.truncate(p.header.len as usize);
-        Some(Frame { kind: h.kind, rendition: h.rendition, frame: h.frame, ts: h.ts, keyframe: h.keyframe(), data })
+        Some(Frame { kind: h.kind, rendition: h.rendition, frame: h.frame, ts: h.ts, keyframe: h.keyframe(), data, sources: p.sources })
     }
 
     fn remember(&mut self, key: Key) {
@@ -573,6 +614,18 @@ impl Assembler {
         let before = self.pending.len();
         self.pending.retain(|_, p| now.saturating_duration_since(p.first_at) < FRAME_DEADLINE);
         self.stats.incomplete += (before - self.pending.len()) as u64;
+    }
+
+    /// Blocos ainda abertos de um quadro pendente e quantos pedaços faltam (pelo menos) em
+    /// cada um.
+    pub fn missing_blocks(&self, kind: u8, rendition: u16, frame: u32) -> Option<Vec<(u8, u32)>> {
+        let p = self.pending.get(&(kind, rendition, frame))?;
+        Some(
+            (0..p.parts.len())
+                .filter(|&b| p.parts[b].is_none())
+                .map(|b| (b as u8, p.header.block_pieces(b as u32).saturating_sub(p.got[b]).max(1)))
+                .collect(),
+        )
     }
 
     /// Quantos pedaços ainda faltam (pelo menos) para fechar o quadro, se ele está pendente.
@@ -616,6 +669,11 @@ impl Ordered {
 
     pub fn needs_keyframe(&self) -> bool {
         self.broken
+    }
+
+    /// O quadro que está faltando enquanto os seguintes esperam (vale pedir reparo dele).
+    pub fn waiting_for(&self) -> Option<u32> {
+        self.waiting_since.and(self.next)
     }
 
     /// Quadro refeito pelo montador. Devolve os que já podem ir para o decoder, na ordem.
@@ -698,7 +756,7 @@ mod tests {
     }
 
     fn vf(n: u32, keyframe: bool) -> Frame {
-        Frame { kind: KIND_VIDEO, rendition: 0, frame: n, ts: n * 1500, keyframe, data: vec![n as u8] }
+        Frame { kind: KIND_VIDEO, rendition: 0, frame: n, ts: n * 1500, keyframe, data: vec![n as u8], sources: vec![] }
     }
 
     fn nums(v: &[Frame]) -> Vec<u32> {
@@ -909,6 +967,7 @@ mod tests {
             .collect();
         assert!(run(&tampered, &mut a, &mut v, now).is_empty());
         assert_eq!(v.forged, 1);
+        assert_eq!(v.suspects, vec![0], "os pedaços vieram do host (fonte 0) neste teste");
         // Assinado por outra chave (alguém se passando pelo host): não confere.
         let mut evil = PieceSource::new(0.25);
         evil.signer = Some(signing_key(9));
@@ -923,6 +982,29 @@ mod tests {
         assert!(run(&fp.pieces, &mut a3, &mut v, now).is_empty());
         v.tick(now + SIG_WAIT);
         assert_eq!(v.unsigned, 1);
+    }
+
+    /// Quem recebeu pedaços de menos pede mais ao host e fecha o quadro.
+    #[test]
+    fn asking_the_source_for_more_closes_a_frame() {
+        let mut src = PieceSource::new(0.25);
+        let d = data(30_000, 8);
+        let f = src.encode(0, &d, Duration::from_millis(16)).unwrap();
+        let mut a = Assembler::new();
+        let now = Instant::now();
+        // Chegou só metade.
+        for p in &f.pieces[..f.pieces.len() / 2] {
+            assert!(a.push(p, now).is_none());
+        }
+        let h = Header::read(&f.pieces[0]).unwrap();
+        let blocks = a.missing_blocks(KIND_VIDEO, 0, h.frame).unwrap();
+        let ask: Vec<(u8, u32)> = blocks.iter().map(|&(b, n)| (b, n + 1)).collect();
+        let more = src.more(0, h.frame, &ask);
+        assert!(!more.is_empty());
+        let got = more.iter().find_map(|p| a.push(p, now));
+        assert!(got.is_some_and(|g| g.data == d));
+        // Quadro que já saiu da memória: nada.
+        assert!(src.more(0, h.frame + 1000, &ask).is_empty());
     }
 
     /// A assinatura pode chegar depois do quadro (por outro vizinho): ele espera um pouco.

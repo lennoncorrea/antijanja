@@ -50,6 +50,8 @@ pub static BROKEN_FRAMES: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 pub static KEYFRAME_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Só para testes: embaralha a ordem de chegada (por mil pacotes), simulando rede real.
 pub static TEST_REORDER_PERMILLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Pedidos de reparo atendidos pelo host (diagnóstico e testes).
+pub static REPAIRS_SENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Testes: descarta essa fração (por mil) dos pedaços que chegam ao espectador.
 pub static TEST_PIECE_LOSS_PERMILLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const OPUS_PT: u8 = 111;
@@ -473,6 +475,13 @@ impl HostPeer {
         ok
     }
 
+    /// Pedaços extras pedidos por este espectador (reparo), sem filtro de faixa.
+    pub fn send_extra(&self, pieces: Vec<Vec<u8>>) {
+        if !pieces.is_empty() && self.piece_tx.try_send(pieces).is_ok() {
+            REPAIRS_SENT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Faixas que o host manda direto (bit `l` = faixa `l`).
     pub fn set_direct_lanes(&self, mask: u32) {
         self.direct_lanes.store(mask, Ordering::Relaxed);
@@ -762,6 +771,8 @@ async fn receive_pieces(
     let (mut received, mut last_seq, mut ext) = (0u64, None::<u32>, 0i64);
     let mut highest: Option<u64> = None;
     let mut rng: u32 = 0x2545_f491;
+    // Pedidos de reparo por quadro: (versão, quadro, quantas vezes, quando foi o último).
+    let mut repair_asked: std::collections::VecDeque<(u16, u32, u8, Instant)> = Default::default();
     loop {
         // Sem pedaços chegando, ainda acorda para dar quadros atrasados como perdidos.
         let ev = match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
@@ -787,7 +798,7 @@ async fn receive_pieces(
                 if let Some(v) = verifier.as_mut() {
                     if Header::read(piece).is_some_and(|h| h.kind == KIND_SIG) {
                         verified.extend(v.on_sig(piece, now));
-                    } else if let Some(f) = asm.push(piece, now) {
+                    } else if let Some(f) = asm.push_from(piece, now, src) {
                         verified.extend(v.push(f, now));
                     }
                 }
@@ -839,6 +850,10 @@ async fn receive_pieces(
         }
         if let Some(v) = verifier.as_mut() {
             verified.extend(v.tick(now));
+            if !v.suspects.is_empty() {
+                let s = std::mem::take(&mut v.suspects);
+                mesh.report_forged(&s);
+            }
         }
         for f in verified.drain(..) {
             if f.kind != KIND_VIDEO {
@@ -854,6 +869,36 @@ async fn receive_pieces(
         }
         mesh.tick(now);
         out.extend(ord.tick(now));
+        // Um quadro está faltando e os seguintes esperam: se ele chegou em parte, pede ao
+        // host os pedaços que faltam (pedaços novos: o host não precisa saber quais se
+        // perderam). Chega em um ida e volta, antes de o quadro ser dado como perdido.
+        // Os pedaços do reparo também podem se perder: pede com folga e tenta de novo
+        // (até 3 vezes, a cada 25 ms) enquanto o quadro ainda pode ser salvo.
+        if let (Some(n), Some(r)) = (ord.waiting_for(), rendition) {
+            let prev = repair_asked.iter().position(|x| x.0 == r && x.1 == n);
+            let due = match prev {
+                None => true,
+                Some(i) => repair_asked[i].2 < 3 && now.saturating_duration_since(repair_asked[i].3) >= Duration::from_millis(25),
+            };
+            if due {
+                if let Some(blocks) = asm.missing_blocks(KIND_VIDEO, r, n) {
+                    match prev {
+                        Some(i) => {
+                            repair_asked[i].2 += 1;
+                            repair_asked[i].3 = now;
+                        }
+                        None => repair_asked.push_back((r, n, 1, now)),
+                    }
+                    while repair_asked.len() > 64 {
+                        repair_asked.pop_front();
+                    }
+                    let b: Vec<[u32; 2]> = blocks.iter().map(|&(b, k)| [b as u32, k + 2 + (k * 3).div_ceil(10)]).collect();
+                    if let Some(dc) = dc.get() {
+                        let _ = dc.send_text(&serde_json::json!({ "t": "more", "r": r, "f": n, "b": b }).to_string()).await;
+                    }
+                }
+            }
+        }
         for f in out {
             (sinks.on_video)(f.data, f.ts);
         }
@@ -1242,7 +1287,7 @@ mod tests {
     fn loopback_pieces() {
         crate::media::mf_init().unwrap();
         USE_PIECES.store(true, Ordering::SeqCst);
-        for loss in [0u32, 50] {
+        for loss in [0u32, 50, 150] {
             TEST_PIECE_LOSS_PERMILLE.store(loss, Ordering::SeqCst);
             KEYFRAME_REQUESTS.store(0, Ordering::SeqCst);
             let decoded = Arc::new(AtomicUsize::new(0));
@@ -1258,6 +1303,11 @@ mod tests {
             let want_kf = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let reports = Arc::new(Mutex::new(Vec::<crate::congestion::Report>::new()));
             let (wk, rr) = (want_kf.clone(), reports.clone());
+            // Fonte dos pedaços compartilhada: o espectador pode pedir reparo.
+            let source = Arc::new(Mutex::new(crate::pieces::PieceSource::new(PIECE_OVERHEAD)));
+            let more_req = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let mr = more_req.clone();
+            REPAIRS_SENT.store(0, Ordering::SeqCst);
             let (connected_tx, connected_rx) = std::sync::mpsc::channel();
             let (peer, answer) = block_on(HostPeer::answer(
                 offer,
@@ -1266,6 +1316,9 @@ mod tests {
                 Arc::new(move |m| {
                     if m.contains("\"kf\"") { wk.store(true, Ordering::SeqCst); }
                     if let Ok(r) = serde_json::from_str::<crate::congestion::Report>(&m) { rr.lock().unwrap().push(r); }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&m) {
+                        if v["t"] == "more" { mr.lock().unwrap().push(v); }
+                    }
                 }),
             ))
             .expect("resposta");
@@ -1296,7 +1349,7 @@ mod tests {
 
             let conv = crate::media::Converter::new(1280, 720, 1280, 720, 60).unwrap();
             let mut enc = crate::media::Encoder::new(1280, 720, 60, 4_000_000, true, None).unwrap();
-            let mut source = crate::pieces::PieceSource::new(PIECE_OVERHEAD);
+
             let mut img = vec![0u8; 1280 * 720 * 4];
             let frames = 240u32;
             for i in 0..frames {
@@ -1306,9 +1359,16 @@ mod tests {
                 }
                 let nv12 = conv.convert(&img, i as i64 * 166_667, 166_667).unwrap();
                 for pkt in enc.encode(&nv12).unwrap() {
-                    if let Some(f) = source.encode(0, &pkt.data, Duration::from_micros(16_667)) {
+                    let f = source.lock().unwrap().encode(0, &pkt.data, Duration::from_micros(16_667));
+                    if let Some(f) = f {
                         peer.send_pieces(&f);
                     }
+                }
+                // Pedidos de reparo (como a sessão faz).
+                for v in more_req.lock().unwrap().drain(..) {
+                    let blocks: Vec<(u8, u32)> = v["b"].as_array().map(|a| a.iter().filter_map(|x| Some((x[0].as_u64()? as u8, x[1].as_u64()? as u32))).collect()).unwrap_or_default();
+                    let extra = source.lock().unwrap().more(v["r"].as_u64().unwrap_or(0) as u32, v["f"].as_u64().unwrap_or(0) as u32, &blocks);
+                    peer.send_extra(extra);
                 }
                 std::thread::sleep(Duration::from_millis(16));
             }
@@ -1319,19 +1379,23 @@ mod tests {
             let reports = reports.lock().unwrap();
             let mean_loss = reports.iter().map(|r| r.loss).sum::<f32>() / reports.len().max(1) as f32;
             println!(
-                "perda simulada {:.1}%: decodificados {} de {frames}, fora de ordem/erros {}, pedidos de keyframe {}, relatórios {} (perda média medida {:.1}%)",
+                "perda simulada {:.1}%: decodificados {} de {frames}, fora de ordem/erros {}, pedidos de keyframe {}, reparos {}, relatórios {} (perda média medida {:.1}%)",
                 loss as f32 / 10.0, decoded.load(Ordering::SeqCst), corrupt.load(Ordering::SeqCst),
-                KEYFRAME_REQUESTS.load(Ordering::SeqCst), reports.len(), mean_loss * 100.0
+                KEYFRAME_REQUESTS.load(Ordering::SeqCst), REPAIRS_SENT.load(Ordering::SeqCst), reports.len(), mean_loss * 100.0
             );
             assert_eq!(corrupt.load(Ordering::SeqCst), 0, "quadro fora de ordem ou que não decodificou");
             assert!(reports.len() >= 4, "o espectador devia mandar relatórios");
             if loss == 0 {
                 assert!(decoded.load(Ordering::SeqCst) >= frames as usize - 10);
                 assert!(mean_loss < 0.01);
-            } else {
+            } else if loss == 50 {
                 // 5% de perda com 25% de folga: quase todos os quadros fecham.
                 assert!(decoded.load(Ordering::SeqCst) >= frames as usize * 85 / 100);
                 assert!((mean_loss - 0.05).abs() < 0.03, "a perda medida devia ser ~5%: {mean_loss}");
+            } else {
+                // 15% de perda passa da folga em parte dos quadros: o reparo salva.
+                assert!(REPAIRS_SENT.load(Ordering::SeqCst) > 0, "devia ter pedido reparo");
+                assert!(decoded.load(Ordering::SeqCst) >= frames as usize * 90 / 100);
             }
         }
         TEST_PIECE_LOSS_PERMILLE.store(0, Ordering::SeqCst);

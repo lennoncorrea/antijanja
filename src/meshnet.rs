@@ -14,7 +14,7 @@ use crate::transport::{build_pc, err, spawn, wait_gathering, Handler, HostPeer, 
 use bytes::BytesMut;
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -125,6 +125,9 @@ struct LaneState {
     last_parent: Option<Instant>,
     /// Já reclamou do pai desta faixa (espera rota nova).
     starved: bool,
+    /// Desde quando espera o pai começar a mandar (rota nova ou depois de uma queda da
+    /// própria conexão).
+    waiting_since: Option<Instant>,
 }
 
 /// Ligação com um filho: `nonce` identifica a oferta (a resposta tem que ser dela);
@@ -148,6 +151,8 @@ struct Inner {
     old_route: Option<Route>,
     /// Ligações com filhos que saíram da rota: fecham depois do período de graça.
     retiring: Vec<(u64, Arc<MeshLink>, Instant)>,
+    /// Vizinhos já denunciados por quadro adulterado (e quando).
+    reported: HashMap<u64, Instant>,
 }
 
 /// A parte da malha de um espectador.
@@ -211,10 +216,11 @@ impl ViewerMesh {
                 g.lanes = vec![LaneState::default(); lanes];
             }
             let old_route = g.route.clone();
+            let now = Instant::now();
             for (l, st) in g.lanes.iter_mut().enumerate() {
                 let old = old_route.as_ref().and_then(|o| o.parent.get(l).copied().flatten());
                 if old != r.parent[l] {
-                    *st = LaneState::default();
+                    *st = LaneState { waiting_since: Some(now), ..Default::default() };
                 }
             }
             let want_children: std::collections::HashSet<u64> = r.children.iter().flatten().copied().collect();
@@ -355,6 +361,7 @@ impl ViewerMesh {
     /// Chamar de tempos em tempos: reclama dos vizinhos que pararam de mandar.
     pub fn tick(&self, now: Instant) {
         let mut starve: Vec<(usize, u64)> = vec![];
+        let mut own = false;
         {
             let mut g = self.inner.lock().unwrap();
             // Ligações aposentadas: fecham depois do período de graça.
@@ -366,23 +373,59 @@ impl ViewerMesh {
                 keep
             });
             let alive = g.last_any.is_some_and(|t| now.saturating_duration_since(t) < ALIVE);
-            let route_age = g.route_at.map(|t| now.saturating_duration_since(t)).unwrap_or_default();
             let Some(route) = g.route.clone() else { return };
+            let mut stopped_lanes = vec![];
             for (l, st) in g.lanes.iter_mut().enumerate() {
                 if route.parent[l].is_none() || st.starved || !alive {
                     continue;
                 }
                 let stopped = st.fed && st.last_parent.is_some_and(|t| now.saturating_duration_since(t) > STARVE_AFTER);
-                let never = !st.fed && route_age > LINK_TIMEOUT;
-                if stopped || never {
+                let never = !st.fed && st.waiting_since.is_some_and(|t| now.saturating_duration_since(t) > LINK_TIMEOUT);
+                if stopped {
+                    stopped_lanes.push(l);
+                } else if never {
                     st.starved = true;
                     starve.push((l, route.parent[l].unwrap_or(0)));
                 }
             }
+            // Duas ou mais faixas de vizinhos diferentes pararam juntas: o problema é a
+            // conexão deste espectador, não os vizinhos. A faixa volta do host sem culpar
+            // ninguém, e quando o vizinho voltar a entregar ela sai do host de novo.
+            let parents: HashSet<u64> = stopped_lanes.iter().filter_map(|&l| route.parent[l]).collect();
+            own |= parents.len() >= 2;
+            for l in stopped_lanes {
+                let st = &mut g.lanes[l];
+                if own {
+                    *st = LaneState { waiting_since: Some(now), ..Default::default() };
+                } else {
+                    st.starved = true;
+                }
+                starve.push((l, route.parent[l].unwrap_or(0)));
+            }
         }
         for (l, from) in starve {
-            dbg_mesh(&format!("a faixa {l} parou de vir de {from}"));
-            self.send_host(json!({ "t": "mesh", "ev": "starve", "lane": l, "from": from }));
+            dbg_mesh(&format!("a faixa {l} parou de vir de {from}{}", if own { " (conexão própria)" } else { "" }));
+            self.send_host(json!({ "t": "mesh", "ev": "starve", "lane": l, "from": from, "own": own }));
+        }
+    }
+
+    /// Quadros que não conferiram com a assinatura tinham pedaços destes vizinhos: avisa o
+    /// host (cada um no máximo a cada 5 s).
+    pub fn report_forged(&self, suspects: &[u64]) {
+        let now = Instant::now();
+        let mut send = vec![];
+        {
+            let mut g = self.inner.lock().unwrap();
+            for &s in suspects.iter().filter(|&&s| s != 0) {
+                if g.reported.get(&s).is_none_or(|t| now.saturating_duration_since(*t) > Duration::from_secs(5)) {
+                    g.reported.insert(s, now);
+                    send.push(s);
+                }
+            }
+        }
+        for s in send {
+            dbg_mesh(&format!("quadro adulterado com pedaços de {s}"));
+            self.send_host(json!({ "t": "mesh", "ev": "forged", "from": s }));
         }
     }
 
@@ -468,6 +511,12 @@ impl MeshHub {
         v
     }
 
+    /// Chamar de tempos em tempos (perdoa ligações, devolve rebaixados).
+    pub fn tick(&self) {
+        let outs = self.coord.lock().unwrap().expire(Instant::now());
+        self.apply(outs);
+    }
+
     /// Mensagem de um espectador. true = era da malha.
     pub fn on_message(&self, from: u64, v: &Value) -> bool {
         if v["t"] != "mesh" {
@@ -482,7 +531,14 @@ impl MeshHub {
             }
             Some("starve") => {
                 if let (Some(l), Some(p)) = (v["lane"].as_u64(), v["from"].as_u64()) {
-                    let outs = self.coord.lock().unwrap().starve(from, l as usize, p);
+                    let own = v["own"].as_bool().unwrap_or(false);
+                    let outs = self.coord.lock().unwrap().starve(from, l as usize, p, own, Instant::now());
+                    self.apply(outs);
+                }
+            }
+            Some("forged") => {
+                if let Some(p) = v["from"].as_u64() {
+                    let outs = self.coord.lock().unwrap().forged(from, p, Instant::now());
                     self.apply(outs);
                 }
             }

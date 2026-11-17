@@ -12,6 +12,7 @@
 //! precisam ir direto (ligação entre espectadores que não funcionou).
 
 use std::collections::{BTreeMap, HashSet};
+use std::time::{Duration, Instant};
 
 /// Mais filhos que isso numa faixa, os excedentes recebem a faixa direto do host.
 pub const MAX_CHILDREN: usize = 6;
@@ -93,22 +94,48 @@ pub enum Out {
     Direct { to: u64, mask: u32 },
 }
 
+/// Ligação que falhou fica fora das rotas por esse tempo (depois tenta de novo: pode ter
+/// sido um tropeço passageiro).
+pub const BAD_FORGIVE: Duration = Duration::from_secs(30);
+/// Janela das reclamações contra um repassador.
+pub const STRIKE_WINDOW: Duration = Duration::from_secs(60);
+/// Reclamações (de espectadores diferentes) que tiram alguém de repassador.
+pub const STRIKES_TO_DEMOTE: usize = 2;
+/// Quanto tempo quem foi rebaixado fica só recebendo.
+pub const DEMOTE_FOR: Duration = Duration::from_secs(60);
+
 /// Mantém as rotas da malha no host. Regra de segurança: o host só para de mandar uma
 /// faixa direto depois que o espectador avisa que já recebe essa faixa do vizinho
 /// (`fed`); se o vizinho parar de mandar (`starve`), o host volta a mandar e evita aquela
-/// ligação nas próximas rotas.
+/// ligação por um tempo. Repassador que atrapalha espectadores diferentes (ou manda quadro
+/// adulterado) deixa de repassar por um tempo.
 pub struct Coordinator {
     lanes: usize,
+    /// Quem está na malha e se pode repassar (capacidade informada).
     members: BTreeMap<u64, bool>,
     routes: BTreeMap<u64, Route>,
     fed: HashSet<(u64, usize)>,
-    bad: HashSet<(u64, u64)>,
+    /// Ligações (pai, filho) fora das rotas, e desde quando.
+    bad: BTreeMap<(u64, u64), Instant>,
     masks: BTreeMap<u64, u32>,
+    /// Reclamações contra cada repassador: (quando, quem reclamou, peso).
+    strikes: BTreeMap<u64, Vec<(Instant, u64, usize)>>,
+    /// Rebaixados (só recebem) até quando.
+    demoted: BTreeMap<u64, Instant>,
 }
 
 impl Coordinator {
     pub fn new(lanes: usize) -> Self {
-        Self { lanes, members: BTreeMap::new(), routes: BTreeMap::new(), fed: HashSet::new(), bad: HashSet::new(), masks: BTreeMap::new() }
+        Self {
+            lanes,
+            members: BTreeMap::new(),
+            routes: BTreeMap::new(),
+            fed: HashSet::new(),
+            bad: BTreeMap::new(),
+            masks: BTreeMap::new(),
+            strikes: BTreeMap::new(),
+            demoted: BTreeMap::new(),
+        }
     }
 
     pub fn route(&self, id: u64) -> Option<&Route> {
@@ -120,6 +147,10 @@ impl Coordinator {
         self.masks.get(&id).copied().unwrap_or(u32::MAX)
     }
 
+    pub fn is_demoted(&self, id: u64) -> bool {
+        self.demoted.contains_key(&id)
+    }
+
     pub fn join(&mut self, id: u64, relay: bool) -> Vec<Out> {
         self.members.insert(id, relay);
         self.recompute()
@@ -129,7 +160,9 @@ impl Coordinator {
         self.members.remove(&id);
         self.masks.remove(&id);
         self.fed.retain(|&(c, _)| c != id);
-        self.bad.retain(|&(a, b)| a != id && b != id);
+        self.bad.retain(|&(a, b), _| a != id && b != id);
+        self.strikes.remove(&id);
+        self.demoted.remove(&id);
         self.recompute()
     }
 
@@ -142,14 +175,60 @@ impl Coordinator {
         self.update_masks()
     }
 
-    /// `child` parou de receber a faixa `lane` do pai `from`: volta a receber do host e a
-    /// ligação sai das rotas. Ignorado se `from` não é mais o pai dessa faixa.
-    pub fn starve(&mut self, child: u64, lane: usize, from: u64) -> Vec<Out> {
+    /// `child` parou de receber a faixa `lane` do pai `from`: volta a receber do host.
+    /// `own`: várias faixas pararam juntas no `child` (a conexão dele é que está ruim): o
+    /// vizinho não leva a culpa e a rota fica. Senão a ligação sai das rotas por um tempo e
+    /// o vizinho leva uma reclamação. Ignorado se `from` não é mais o pai dessa faixa.
+    pub fn starve(&mut self, child: u64, lane: usize, from: u64, own: bool, now: Instant) -> Vec<Out> {
         if self.parent_of(child, lane) != Some(from) {
             return vec![];
         }
-        self.bad.insert((from, child));
+        if own {
+            self.fed.remove(&(child, lane));
+            return self.update_masks();
+        }
+        self.bad.insert((from, child), now);
+        self.strike(from, child, 1, now);
         self.recompute()
+    }
+
+    /// Um quadro com pedaços de `from` não conferiu com a assinatura: a ligação sai das
+    /// rotas e `from` leva reclamação dobrada (adulterar é pior que falhar).
+    pub fn forged(&mut self, child: u64, from: u64, now: Instant) -> Vec<Out> {
+        if !self.members.contains_key(&from) || from == child {
+            return vec![];
+        }
+        self.bad.insert((from, child), now);
+        self.strike(from, child, STRIKES_TO_DEMOTE, now);
+        self.recompute()
+    }
+
+    fn strike(&mut self, parent: u64, child: u64, weight: usize, now: Instant) {
+        let list = self.strikes.entry(parent).or_default();
+        list.retain(|(t, _, _)| now.saturating_duration_since(*t) < STRIKE_WINDOW);
+        list.push((now, child, weight));
+        // Conta por quem reclamou (um espectador com a conexão ruim não derruba ninguém).
+        let mut by_child: BTreeMap<u64, usize> = BTreeMap::new();
+        for (_, c, w) in list.iter() {
+            let e = by_child.entry(*c).or_default();
+            *e = (*e).max(*w);
+        }
+        if by_child.values().sum::<usize>() >= STRIKES_TO_DEMOTE {
+            self.demoted.insert(parent, now + DEMOTE_FOR);
+            self.strikes.remove(&parent);
+        }
+    }
+
+    /// Chamar de tempos em tempos: perdoa ligações e devolve quem foi rebaixado.
+    pub fn expire(&mut self, now: Instant) -> Vec<Out> {
+        let (b0, d0) = (self.bad.len(), self.demoted.len());
+        self.bad.retain(|_, t| now.saturating_duration_since(*t) < BAD_FORGIVE);
+        self.demoted.retain(|_, until| now < *until);
+        if self.bad.len() != b0 || self.demoted.len() != d0 {
+            self.recompute()
+        } else {
+            vec![]
+        }
     }
 
     fn parent_of(&self, child: u64, lane: usize) -> Option<u64> {
@@ -157,8 +236,10 @@ impl Coordinator {
     }
 
     fn recompute(&mut self) -> Vec<Out> {
-        let members: Vec<Member> = self.members.iter().map(|(&id, &relay)| Member { id, relay }).collect();
-        let new = routes(&members, self.lanes, &self.bad);
+        let members: Vec<Member> =
+            self.members.iter().map(|(&id, &relay)| Member { id, relay: relay && !self.demoted.contains_key(&id) }).collect();
+        let bad: HashSet<(u64, u64)> = self.bad.keys().copied().collect();
+        let new = routes(&members, self.lanes, &bad);
         let mut out = vec![];
         for (id, r) in &new {
             if self.routes.get(id) != Some(r) {
@@ -271,7 +352,7 @@ mod tests {
         let parent = c.route(6).unwrap().parent[0].unwrap();
         // O pai parou de mandar a faixa 0 para o 6: rota nova sem essa ligação, e a faixa
         // volta direto até o pai novo confirmar.
-        let out = c.starve(6, 0, parent);
+        let out = c.starve(6, 0, parent, false, Instant::now());
         assert!(out.iter().any(|o| matches!(o, Out::Route { to: 6, .. })));
         assert_ne!(c.route(6).unwrap().parent[0], Some(parent));
         assert!(c.direct_mask(6) & 1 != 0);
@@ -295,7 +376,90 @@ mod tests {
         c.join(1, true);
         assert!(c.fed(1, 0, 2).is_empty(), "sozinho, tudo vem do host");
         assert_eq!(c.direct_mask(1), 0b1111);
-        assert!(c.starve(1, 0, 2).is_empty());
+        assert!(c.starve(1, 0, 2, false, Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn coordinator_forgives_bad_links_after_a_while() {
+        let mut c = Coordinator::new(4);
+        for id in 1..=8 {
+            c.join(id, true);
+        }
+        feed_all(&mut c, 1..=8);
+        let t0 = Instant::now();
+        let parent = c.route(6).unwrap().parent[0].unwrap();
+        c.starve(6, 0, parent, false, t0);
+        assert_ne!(c.route(6).unwrap().parent[0], Some(parent));
+        assert!(c.expire(t0 + BAD_FORGIVE / 2).is_empty(), "ainda fora");
+        let out = c.expire(t0 + BAD_FORGIVE);
+        assert!(!out.is_empty());
+        assert_eq!(c.route(6).unwrap().parent[0], Some(parent), "perdoada: volta à rota original");
+    }
+
+    #[test]
+    fn a_relay_that_fails_different_viewers_stops_relaying_for_a_while() {
+        let mut c = Coordinator::new(4);
+        for id in 1..=8 {
+            c.join(id, true);
+        }
+        feed_all(&mut c, 1..=8);
+        let t0 = Instant::now();
+        // O 1 repassa a faixa 0. Falha para um filho: só a ligação sai.
+        let kids: Vec<u64> = (2..=8).filter(|&id| c.route(id).unwrap().parent[0] == Some(1)).collect();
+        assert!(kids.len() >= 2);
+        c.starve(kids[0], 0, 1, false, t0);
+        assert!(!c.is_demoted(1));
+        // Falha para outro filho: rebaixado, ninguém mais recebe dele.
+        let p = c.route(kids[1]).unwrap().parent[0];
+        if p == Some(1) {
+            c.starve(kids[1], 0, 1, false, t0);
+        } else {
+            c.forged(kids[1], 1, t0);
+        }
+        assert!(c.is_demoted(1));
+        for id in 2..=8 {
+            assert!(!c.route(id).unwrap().parent.contains(&Some(1)), "{id} ainda recebe do rebaixado");
+        }
+        assert!(c.route(1).unwrap().children.iter().all(|x| x.is_empty()));
+        // Depois de um tempo volta a repassar.
+        c.expire(t0 + DEMOTE_FOR);
+        assert!(!c.is_demoted(1));
+        assert!(c.route(1).unwrap().children.iter().any(|x| !x.is_empty()));
+    }
+
+    #[test]
+    fn the_same_viewer_complaining_twice_does_not_demote_anyone() {
+        let mut c = Coordinator::new(4);
+        for id in 1..=8 {
+            c.join(id, true);
+        }
+        feed_all(&mut c, 1..=8);
+        let t0 = Instant::now();
+        let parent = c.route(6).unwrap().parent[0].unwrap();
+        c.starve(6, 0, parent, false, t0);
+        c.expire(t0 + BAD_FORGIVE);
+        feed_all(&mut c, 1..=8);
+        let again = c.route(6).unwrap().parent[0].unwrap();
+        c.starve(6, 0, again, false, t0 + BAD_FORGIVE);
+        assert!(!c.is_demoted(parent) && !c.is_demoted(again), "a conexão do 6 é que é ruim");
+    }
+
+    #[test]
+    fn own_connection_trouble_returns_the_lane_without_blaming_the_neighbor() {
+        let mut c = Coordinator::new(4);
+        for id in 1..=4 {
+            c.join(id, true);
+        }
+        feed_all(&mut c, 1..=4);
+        let r = c.route(2).unwrap().clone();
+        let lane = (0..4).find(|&l| r.parent[l].is_some()).unwrap();
+        let out = c.starve(2, lane, r.parent[lane].unwrap(), true, Instant::now());
+        assert!(c.direct_mask(2) & (1 << lane) != 0, "a faixa volta a vir do host");
+        assert_eq!(c.route(2).unwrap(), &r, "a rota fica");
+        assert!(out.iter().all(|o| !matches!(o, Out::Route { .. })));
+        // Quando o vizinho volta a entregar, o host para de novo.
+        c.fed(2, lane, r.parent[lane].unwrap());
+        assert!(c.direct_mask(2) & (1 << lane) == 0);
     }
 
     #[test]

@@ -123,6 +123,8 @@ struct HostShared {
     trace_sent: Mutex<(Instant, u64)>,
     /// Chave pública com que os quadros são assinados (hex), mandada a cada espectador.
     stream_pk: String,
+    /// Fonte dos pedaços (para atender pedidos de reparo).
+    piece_source: Arc<Mutex<crate::pieces::PieceSource>>,
 }
 
 impl HostShared {
@@ -324,6 +326,9 @@ impl HostShared {
             }
         }
         groups.retain(|_, h| !h.ids().is_empty());
+        for hub in groups.values() {
+            hub.tick();
+        }
         if std::env::var_os("AJ_TRACE").is_some() {
             // Diagnóstico: pedaços por segundo saindo do host e as faixas de cada um.
             let sent: u64 = self.peers.lock().unwrap().values().map(|p| p.peer.pieces_sent.load(Ordering::Relaxed)).sum();
@@ -483,6 +488,15 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
         ed25519_dalek::SigningKey::from_bytes(&seed)
     };
     let stream_pk: String = stream_signer.verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    // Malha: cada quadro vira pedaços uma vez só, os mesmos para todos; na malha a folga
+    // aguenta perder uma faixa inteira e cada quadro é assinado. Compartilhada com quem
+    // atende os pedidos de reparo.
+    let piece_source = {
+        let mut s = crate::pieces::PieceSource::new(transport::PIECE_OVERHEAD);
+        s.survive_lane = mesh_on;
+        s.signer = mesh_on.then(|| stream_signer.clone());
+        Arc::new(Mutex::new(s))
+    };
     transport::USE_PIECES.store(mesh_on || std::env::var_os("AJ_PIECES").is_some(), Ordering::Relaxed);
     let (media_tx, mut media_rx) = tokio::sync::mpsc::channel::<Media>(240);
     let peers: Arc<Mutex<HashMap<u64, PeerEntry>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -494,13 +508,8 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
     {
         let peers = peers.clone();
         let kf = keyframes.clone();
+        let source = piece_source.clone();
         transport::spawn(async move {
-            // Malha (etapa 2): cada quadro vira pedaços uma vez só, os mesmos para todos.
-            let mut source = crate::pieces::PieceSource::new(transport::PIECE_OVERHEAD);
-            // Na malha, a folga aguenta perder uma faixa inteira (um vizinho que caiu), e
-            // cada quadro é assinado (os pedaços passam por outros espectadores).
-            source.survive_lane = mesh_on;
-            source.signer = mesh_on.then(|| stream_signer.clone());
             let use_pieces = transport::USE_PIECES.load(Ordering::Relaxed);
             while let Some(m) = media_rx.recv().await {
                 let targets: Vec<Arc<HostPeer>> = {
@@ -524,7 +533,7 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
                         .collect()
                 };
                 let pieces = match &m {
-                    Media::Video(k, d, dur) if use_pieces => source.encode(*k, d, *dur),
+                    Media::Video(k, d, dur) if use_pieces => source.lock().unwrap().encode(*k, d, *dur),
                     _ => None,
                 };
                 for p in targets {
@@ -605,6 +614,7 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
         mesh: mesh_on.then(|| Mutex::new(HashMap::new())),
         trace_sent: Mutex::new((Instant::now(), 0)),
         stream_pk,
+        piece_source: piece_source.clone(),
     });
 
     let opus = Arc::new(Mutex::new(OpusEncoder::new(config.abitrate.clamp(32, 510))?));
@@ -752,7 +762,18 @@ async fn accept_viewer(
                 }
                 return;
             }
-            if v["t"] == "kf" {
+            if v["t"] == "more" {
+                // Reparo: pedaços extras novos de um quadro recente, só para quem pediu.
+                let blocks: Vec<(u8, u32)> = v["b"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|x| Some((x[0].as_u64()?.min(255) as u8, x[1].as_u64()? as u32))).take(64).collect())
+                    .unwrap_or_default();
+                let extra = shared.piece_source.lock().unwrap().more(v["r"].as_u64().unwrap_or(0) as u32, v["f"].as_u64().unwrap_or(0) as u32, &blocks);
+                let peer = peers.lock().unwrap().get(&id).map(|p| p.peer.clone());
+                if let Some(p) = peer {
+                    p.send_extra(extra);
+                }
+            } else if v["t"] == "kf" {
                 shared.request_keyframe_for(id);
             } else if v["t"] == "quality" {
                 shared.set_quality(id, v["q"].as_str().unwrap_or("auto"));
