@@ -8,7 +8,8 @@
 //! - áudio: WASAPI com controle por aplicativo + Opus (`audio`)
 //! - exibição: wgpu numa janela-filha nativa (`player`), geração de quadros com a
 //!   NVIDIA Optical Flow (`nvof`, `framegen`)
-//! - interface: Slint (`ui`, arquivos em `ui/`), sem navegador embutido
+//! - interface: Slint (`ui`, arquivos em `ui/`), sem navegador embutido; os controles
+//!   por cima do vídeo ficam numa janela transparente própria (`overlay`)
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agenda;
@@ -23,6 +24,7 @@ mod media;
 mod mesh;
 mod meshnet;
 mod nvof;
+mod overlay;
 mod pieces;
 mod player;
 mod playout;

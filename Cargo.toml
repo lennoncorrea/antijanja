@@ -15,7 +15,8 @@ embed-resource = "3"
 
 [dependencies]
 # Interface
-slint = { version = "1.18", features = ["raw-window-handle-06"] }
+# unstable-winit-030: atributos da janela dos controles por cima do vídeo (src/overlay.rs)
+slint = { version = "1.18", features = ["raw-window-handle-06", "unstable-winit-030"] }
 arboard = { version = "3", default-features = false }
 raw-window-handle = "0.6"
 # Atualização automática (releases do GitHub, assinadas com minisign)

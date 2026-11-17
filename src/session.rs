@@ -1337,12 +1337,15 @@ pub async fn viewer_leave(app: AppHandle, id: String) {
 }
 
 /// Área de vídeo de uma stream em pixels físicos (relativos à janela). Thread principal.
-/// `hole`: retângulo (relativo ao vídeo) recortado para um menu aparecer por cima.
-pub fn player_rect(id: String, x: i32, y: i32, width: i32, height: i32, visible: bool, hole: Option<(i32, i32, i32, i32, i32)>) {
+/// `corners`: raio dos cantos arredondados (0 = retos). `no_cursor`: esconde o cursor
+/// sobre o vídeo (controles sumiram com o mouse parado).
+#[allow(clippy::too_many_arguments)]
+pub fn player_rect(id: String, x: i32, y: i32, width: i32, height: i32, visible: bool, corners: i32, no_cursor: bool) {
     with_viewers(|m| {
         if let Some(p) = m.get(&id).and_then(|v| v.player.as_ref()) {
             p.set_rect(x, y, width, height, visible);
-            p.set_hole(hole);
+            p.set_corners(corners);
+            p.hide_cursor(no_cursor && visible);
         }
     });
 }

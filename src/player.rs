@@ -17,7 +17,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetStockObject, HBRUSH, BLACK_BRUSH};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_F11};
+use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_F11};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub type Res<T> = Result<T, String>;
@@ -29,6 +29,11 @@ fn tag_of(hwnd: HWND) -> String {
     TAGS.lock().unwrap().as_ref().and_then(|m| m.get(&(hwnd.0 as isize)).cloned()).unwrap_or_default()
 }
 static LAST_MOVE: AtomicIsize = AtomicIsize::new(0);
+static LAST_MOVE_HWND: AtomicIsize = AtomicIsize::new(0);
+/// Mensagem do Windows quando o mouse sai da janela (pedida com `TrackMouseEvent`).
+const WM_MOUSELEAVE: u32 = 0x02A3;
+/// Janelas de vídeo com o cursor escondido (controles sumiram com o mouse parado).
+static NO_CURSOR: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
 
 /// Testes: (horário do present, gerado?, quanto esperou pelo get_current_texture).
 #[cfg(test)]
@@ -47,9 +52,9 @@ enum Msg {
 pub struct Player {
     hwnd: isize,
     tx: SyncSender<Msg>,
-    /// Retângulo recortado da janela (menu por cima do vídeo), para não refazer à toa.
-    /// (Junto com o tamanho da janela: a região é recalculada se ela mudar.)
-    hole: std::cell::Cell<Option<((i32, i32, i32, i32, i32), (i32, i32))>>,
+    /// Raio dos cantos arredondados aplicado, junto com o tamanho da janela (a região é
+    /// refeita se um dos dois mudar).
+    corners: std::cell::Cell<Option<(i32, (i32, i32))>>,
     /// Posição atual (para não reposicionar a janela à toa a cada atualização da tela).
     rect: std::cell::Cell<Option<(i32, i32, i32, i32, bool)>>,
 }
@@ -71,11 +76,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             emit("player-input", "dblclick");
             LRESULT(0)
         }
+        WM_SETCURSOR if NO_CURSOR.lock().unwrap().contains(&(hwnd.0 as isize)) => {
+            SetCursor(None);
+            LRESULT(1)
+        }
+        WM_MOUSELEAVE => {
+            emit("player-input", "leave");
+            LRESULT(0)
+        }
         WM_MOUSEMOVE => {
-            // No máximo ~5 eventos por segundo.
+            // Avisa quando o mouse sair (WM_MOUSELEAVE).
+            let mut track = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+            let _ = TrackMouseEvent(&mut track);
+            // No máximo ~5 eventos por segundo (na hora, se o mouse passou para outro vídeo).
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as isize).unwrap_or(0);
-            if now - LAST_MOVE.load(Ordering::Relaxed) > 200 {
+            if now - LAST_MOVE.load(Ordering::Relaxed) > 200 || LAST_MOVE_HWND.load(Ordering::Relaxed) != hwnd.0 as isize {
                 LAST_MOVE.store(now, Ordering::Relaxed);
+                LAST_MOVE_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
                 emit("player-input", "move");
             }
             LRESULT(0)
@@ -144,40 +161,50 @@ impl Player {
             .spawn(move || render_thread(raw, rx, ready_tx))
             .map_err(|e| e.to_string())?;
         ready_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| "o player não iniciou".to_string())??;
-        Ok(Player { hwnd: raw, tx, hole: std::cell::Cell::new(None), rect: std::cell::Cell::new(None) })
+        Ok(Player { hwnd: raw, tx, corners: std::cell::Cell::new(None), rect: std::cell::Cell::new(None) })
     }
 
-    /// Recorta um retângulo da janela do vídeo (relativo a ela, pixels físicos): o que a
-    /// interface desenha ali (um menu) aparece por cima do vídeo. None = sem recorte.
-    /// `hole`: (x, y, largura, altura, raio dos cantos), em pixels físicos.
-    pub fn set_hole(&self, hole: Option<(i32, i32, i32, i32, i32)>) {
-        use windows::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, SetWindowRgn, HRGN, RGN_DIFF};
+    /// Arredonda os cantos da janela do vídeo (raio em pixels físicos; 0 = cantos retos),
+    /// para acompanhar a borda arredondada do tile.
+    pub fn set_corners(&self, radius: i32) {
+        use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
         unsafe {
             let hwnd = HWND(self.hwnd as *mut _);
             let mut r = windows::Win32::Foundation::RECT::default();
             let _ = GetClientRect(hwnd, &mut r);
-            let key = hole.map(|h| (h, (r.right, r.bottom)));
-            if self.hole.get() == key {
+            let key = Some((radius, (r.right, r.bottom)));
+            if self.corners.get() == key {
                 return;
             }
-            self.hole.set(key);
-            if std::env::var_os("AJ_TRACE").is_some() {
-                eprintln!("[player] recorte {hole:?} (janela {}x{})", r.right, r.bottom);
+            self.corners.set(key);
+            if radius <= 0 {
+                SetWindowRgn(hwnd, None, true);
+            } else {
+                let region = CreateRoundRectRgn(0, 0, r.right + 1, r.bottom + 1, radius * 2, radius * 2);
+                // A janela passa a ser dona da região (não apagar).
+                SetWindowRgn(hwnd, Some(region), true);
             }
-            match hole {
-                None => {
-                    SetWindowRgn(hwnd, None, true);
-                }
-                Some((x, y, w, h, radius)) => {
-                    let full = CreateRectRgn(0, 0, r.right.max(1), r.bottom.max(1));
-                    // Cantos arredondados como os do menu (um buraco reto deixava aparecer
-                    // o fundo nos quatro cantos, fora da borda do menu).
-                    let cut = CreateRoundRectRgn(x, y, x + w + 1, y + h + 1, radius * 2, radius * 2);
-                    CombineRgn(Some(full), Some(full), Some(cut), RGN_DIFF);
-                    let _ = DeleteObject(cut.into());
-                    // A janela passa a ser dona da região (não apagar `full`).
-                    SetWindowRgn(hwnd, Some(HRGN(full.0)), true);
-                }
+        }
+    }
+
+    /// Esconde o cursor sobre o vídeo (controles sumiram com o mouse parado). Thread
+    /// principal (a mesma da janela, para o `SetCursor` valer na hora).
+    pub fn hide_cursor(&self, hide: bool) {
+        {
+            let mut list = NO_CURSOR.lock().unwrap();
+            if list.contains(&self.hwnd) == hide {
+                return;
+            }
+            if hide {
+                list.push(self.hwnd);
+            } else {
+                list.retain(|h| *h != self.hwnd);
+            }
+        }
+        unsafe {
+            let mut p = windows::Win32::Foundation::POINT::default();
+            if GetCursorPos(&mut p).is_ok() && WindowFromPoint(p).0 as isize == self.hwnd {
+                SetCursor(if hide { None } else { LoadCursorW(None, IDC_ARROW).ok() });
             }
         }
     }
@@ -217,6 +244,7 @@ impl Player {
         if let Some(m) = TAGS.lock().unwrap().as_mut() {
             m.remove(&self.hwnd);
         }
+        NO_CURSOR.lock().unwrap().retain(|h| *h != self.hwnd);
         let _ = self.tx.send(Msg::Stop);
         std::thread::sleep(Duration::from_millis(30));
         unsafe {
@@ -756,18 +784,18 @@ mod tests {
         println!("pixel no centro do player: {:?}", p.0);
         assert!(p.0[0] > 180 && p.0[1] < 80 && p.0[2] < 80, "esperava vermelho, veio {:?}", p.0);
 
-        // Buraco para um menu: dentro dele aparece a janela de trás (não o vídeo vermelho).
-        player.set_hole(Some((300, 150, 120, 80, 12)));
+        // Cantos arredondados: no canto aparece a janela de trás, no meio continua o vídeo.
+        player.set_corners(24);
         pump(200);
-        let inside = mon.capture_region((100 + 360 - mx) as u32, (100 + 190 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
-        let outside = mon.capture_region((100 + 200 - mx) as u32, (100 + 190 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
-        println!("com buraco: dentro {inside:?}, fora {outside:?}");
-        assert!(!(inside[0] > 180 && inside[1] < 80), "o buraco devia mostrar a janela de trás: {inside:?}");
-        assert!(outside[0] > 180 && outside[1] < 80, "fora do buraco continua o vídeo: {outside:?}");
-        player.set_hole(None);
+        let corner = mon.capture_region((100 + 1 - mx) as u32, (100 + 1 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
+        let middle = mon.capture_region((420 - mx) as u32, (280 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
+        println!("com cantos: canto {corner:?}, meio {middle:?}");
+        assert!(!(corner[0] > 180 && corner[1] < 80), "o canto devia mostrar a janela de trás: {corner:?}");
+        assert!(middle[0] > 180 && middle[1] < 80, "o meio continua o vídeo: {middle:?}");
+        player.set_corners(0);
         pump(200);
-        let back = mon.capture_region((100 + 360 - mx) as u32, (100 + 190 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
-        assert!(back[0] > 180 && back[1] < 80, "sem buraco, o vídeo volta: {back:?}");
+        let back = mon.capture_region((100 + 1 - mx) as u32, (100 + 1 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
+        assert!(back[0] > 180 && back[1] < 80, "sem cantos, o vídeo volta até a ponta: {back:?}");
 
         // Geração de quadros: o gerado na metade entre vermelho e azul (sem movimento) é a
         // mistura, e o azul aparece no horário marcado.
