@@ -165,8 +165,34 @@ pub fn audio_apps() -> Result<Vec<AudioApp>, String> {
 
 /// Status da captura: ("capturing" | "waiting" | "error", detalhe).
 pub type StatusFn = Arc<dyn Fn(&str, &str) + Send + Sync>;
-/// Recebe blocos de 20 ms em PCM 16 bits estéreo (48 kHz). Devolve `false` para parar.
-pub type PcmSink = Box<dyn FnMut(Vec<u8>) -> bool + Send>;
+/// Recebe blocos de 20 ms em PCM 16 bits estéreo (48 kHz) e o instante em que a primeira
+/// amostra foi capturada (relógio de alta precisão do Windows; None se ele não informou).
+/// Devolve `false` para parar.
+pub type PcmSink = Box<dyn FnMut(Vec<u8>, Option<Instant>) -> bool + Send>;
+
+/// Relógio de alta precisão do Windows em unidades de 100 ns (o que o WASAPI usa nos
+/// horários de captura).
+fn qpc_100ns() -> u64 {
+    use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+    let (mut c, mut f) = (0i64, 0i64);
+    unsafe {
+        let _ = QueryPerformanceCounter(&mut c);
+        let _ = QueryPerformanceFrequency(&mut f);
+    }
+    if f <= 0 {
+        return 0;
+    }
+    (c as i128 * 10_000_000 / f as i128) as u64
+}
+
+/// Converte um horário do WASAPI (100 ns do relógio de alta precisão) em `Instant`.
+fn instant_from_qpc(t: u64) -> Instant {
+    let (now_i, now_q) = (Instant::now(), qpc_100ns());
+    if t >= now_q || now_q == 0 {
+        return now_i;
+    }
+    now_i.checked_sub(Duration::from_nanos((now_q - t).saturating_mul(100))).unwrap_or(now_i)
+}
 
 /// Captura de áudio em andamento; para ao ser descartada.
 pub struct AudioCapture {
@@ -293,23 +319,33 @@ pub struct Playback {
     tx: std::sync::mpsc::SyncSender<Vec<f32>>,
     volume: Arc<std::sync::atomic::AtomicU32>,
     stop: Arc<AtomicBool>,
+    /// Modo sincronizado (áudio em pedaços): o relógio comum e o áudio na linha do tempo.
+    sync: SyncSlot,
 }
+
+type SyncSlot = Arc<std::sync::Mutex<Option<(Arc<crate::avsync::SyncClock>, Arc<std::sync::Mutex<crate::avsync::AudioState>>)>>>;
 
 impl Playback {
     pub fn start() -> Result<Self, String> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(50);
         let volume = Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits()));
         let stop = Arc::new(AtomicBool::new(false));
-        let (v, s) = (volume.clone(), stop.clone());
+        let sync: SyncSlot = Arc::new(std::sync::Mutex::new(None));
+        let (v, s, y) = (volume.clone(), stop.clone(), sync.clone());
         thread::Builder::new()
             .name("audio-playback".into())
             .spawn(move || {
-                if let Err(e) = playback_thread(rx, v, s) {
+                if let Err(e) = playback_thread(rx, v, s, y) {
                     eprintln!("reprodução de áudio: {e}");
                 }
             })
             .map_err(err)?;
-        Ok(Self { tx, volume, stop })
+        Ok(Self { tx, volume, stop, sync })
+    }
+
+    /// Passa a tocar pelo relógio comum (áudio em pedaços, sincronizado com o vídeo).
+    pub fn attach_sync(&self, clock: Arc<crate::avsync::SyncClock>, state: Arc<std::sync::Mutex<crate::avsync::AudioState>>) {
+        *self.sync.lock().unwrap() = Some((clock, state));
     }
 
     /// 0.0 a 1.0
@@ -352,6 +388,7 @@ fn playback_thread(
     rx: std::sync::mpsc::Receiver<Vec<f32>>,
     volume: Arc<std::sync::atomic::AtomicU32>,
     stop: Arc<AtomicBool>,
+    sync: SyncSlot,
 ) -> Result<(), String> {
     let _ = initialize_mta();
     let device = DeviceEnumerator::new().map_err(err)?.get_default_device(Direction::Render).map_err(err)?;
@@ -363,6 +400,9 @@ fn playback_thread(
         .map_err(err)?;
     let event = client.set_get_eventhandle().map_err(err)?;
     let render = client.get_audiorenderclient().map_err(err)?;
+    // Latência do dispositivo depois do buffer (100 ns): entra no horário em que cada bloco
+    // sai de fato no alto-falante.
+    let stream_latency = Duration::from_nanos(client.get_stream_latency().unwrap_or(0).max(0) as u64 * 100);
     client.start_stream().map_err(err)?;
 
     // Buffer de jitter: começa a tocar com ~60 ms; acima de ~200 ms descarta o excesso.
@@ -373,6 +413,30 @@ fn playback_thread(
     let mut playing = false;
 
     while !stop.load(Ordering::SeqCst) {
+        let synced = sync.lock().unwrap().clone();
+        if let Some((clock, state)) = synced {
+            // Modo sincronizado: cada bloco sai do ponto da linha do tempo que deve estar
+            // tocando no instante em que ele vai sair no alto-falante.
+            while rx.try_recv().is_ok() {}
+            if event.wait_for_event(100).is_err() {
+                continue;
+            }
+            let frames = client.get_available_space_in_frames().map_err(err)? as usize;
+            if frames == 0 {
+                continue;
+            }
+            let padding = client.get_current_padding().unwrap_or(0) as f64;
+            let now = Instant::now();
+            let heard_at = now + Duration::from_secs_f64(padding / 48_000.0) + stream_latency;
+            let pcm = crate::avsync::render_block(&clock, &mut state.lock().unwrap(), now, heard_at, frames);
+            let vol = f32::from_bits(volume.load(Ordering::Relaxed));
+            let mut out = Vec::with_capacity(frames * 8);
+            for s in pcm {
+                out.extend_from_slice(&(s * vol).to_le_bytes());
+            }
+            render.write_to_device(&out, None).map_err(err)?;
+            continue;
+        }
         while let Ok(chunk) = rx.try_recv() {
             queue.extend(chunk);
         }
@@ -412,13 +476,41 @@ fn sleep_unless(stop: &AtomicBool, total: Duration) {
     }
 }
 
+/// Entrega os blocos completos de 20 ms da fila (f32 → i16), cada um com o horário de
+/// captura dele. `false` = quem recebe pediu para parar.
+fn emit_chunks(
+    queue: &mut VecDeque<u8>,
+    queue_t: &mut Option<u64>,
+    chunk_bytes: usize,
+    chunk_t: u64,
+    sink: &mut dyn FnMut(Vec<u8>, Option<Instant>) -> bool,
+) -> bool {
+    while queue.len() >= chunk_bytes {
+        let mut out = Vec::with_capacity(CHUNK_FRAMES * 4);
+        let raw: Vec<u8> = queue.drain(..chunk_bytes).collect();
+        for sample in raw.chunks_exact(4) {
+            let f = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
+            let s = (f.clamp(-1.0, 1.0) * 32767.0) as i16;
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        let at = queue_t.map(instant_from_qpc);
+        if let Some(t) = queue_t.as_mut() {
+            *t += chunk_t;
+        }
+        if !sink(out, at) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Captura até ser parado ou até o processo-alvo mudar (ex.: Discord abriu/fechou).
 fn run_capture(
     (pid, include): (u32, bool),
     mode: &Mode,
     sys: &mut System,
     stop: &AtomicBool,
-    sink: &mut dyn FnMut(Vec<u8>) -> bool,
+    sink: &mut dyn FnMut(Vec<u8>, Option<Instant>) -> bool,
 ) -> Result<(), String> {
     let format = WaveFormat::new(32, 32, SampleType::Float, 48_000, 2, None);
     let mut client = AudioClient::new_application_loopback_client(pid, include)
@@ -438,6 +530,10 @@ fn run_capture(
     let chunk_bytes = CHUNK_FRAMES * BYTES_PER_FRAME_F32;
     let mut queue: VecDeque<u8> = VecDeque::with_capacity(chunk_bytes * 8);
     let mut last_check = Instant::now();
+    // Horário de captura (100 ns do relógio de alta precisão) da primeira amostra na fila.
+    let mut queue_t: Option<u64> = None;
+    // 20 ms em unidades de 100 ns.
+    let chunk_t = (CHUNK_FRAMES as u64) * 10_000_000 / 48_000;
 
     let result = loop {
         if stop.load(Ordering::SeqCst) {
@@ -465,19 +561,32 @@ fn run_capture(
             if info.flags.silent {
                 queue.range_mut(before..).for_each(|b| *b = 0);
             }
+            // Horário da captura: o do primeiro quadro deste pacote. Se ele não emenda com o
+            // que já estava na fila (o áudio parou e voltou), o resto antigo sai completado
+            // com silêncio e a fila recomeça no horário novo (cada bloco leva o horário certo).
+            let ts = (info.timestamp > 0).then_some(info.timestamp);
+            let before_frames = (before / BYTES_PER_FRAME_F32) as u64;
+            let expected = queue_t.map(|t| t + before_frames * 10_000_000 / 48_000);
+            let continuous = match (expected, ts) {
+                (Some(e), Some(t)) => (t as i64 - e as i64).abs() < 50_000, // 5 ms
+                _ => true,
+            };
+            if before == 0 {
+                queue_t = ts;
+            } else if !continuous {
+                let new: Vec<u8> = queue.drain(before..).collect();
+                let pad = (chunk_bytes - before % chunk_bytes) % chunk_bytes;
+                queue.extend(std::iter::repeat_n(0u8, pad));
+                if !emit_chunks(&mut queue, &mut queue_t, chunk_bytes, chunk_t, sink) {
+                    stop.store(true, Ordering::SeqCst);
+                    break;
+                }
+                queue.extend(new);
+                queue_t = ts;
+            }
         }
-        while queue.len() >= chunk_bytes {
-            let mut out = Vec::with_capacity(CHUNK_FRAMES * 4);
-            let raw: Vec<u8> = queue.drain(..chunk_bytes).collect();
-            for sample in raw.chunks_exact(4) {
-                let f = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
-                let s = (f.clamp(-1.0, 1.0) * 32767.0) as i16;
-                out.extend_from_slice(&s.to_le_bytes());
-            }
-            if !sink(out) {
-                stop.store(true, Ordering::SeqCst); // a janela fechou
-                break;
-            }
+        if !emit_chunks(&mut queue, &mut queue_t, chunk_bytes, chunk_t, sink) {
+            stop.store(true, Ordering::SeqCst); // a janela fechou
         }
     };
     let _ = client.stop_stream();
@@ -487,6 +596,108 @@ fn run_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// O tocador de verdade (WASAPI) no modo sincronizado: toca um tom contínuo vindo de
+    /// pacotes Opus (como chegam pela malha, com o relógio comum) e, ao mesmo tempo, captura
+    /// o próprio áudio que está saindo (captura por aplicativo do Windows). O que saiu não
+    /// pode ter buraco. Toca baixinho (2%) por ~5 s.
+    /// `cargo test synced_playback_on_the_real_device -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn synced_playback_on_the_real_device() {
+        use crate::avsync::{AudioState, Stream, SyncClock, MEDIA_HZ, PACKET_SAMPLES};
+        let _ = initialize_mta();
+        let t0 = Instant::now();
+        let clock = Arc::new(SyncClock::new(t0));
+        let state = Arc::new(std::sync::Mutex::new(AudioState::new().unwrap()));
+        let pb = Playback::start().unwrap();
+        pb.set_volume(0.02);
+        pb.attach_sync(clock.clone(), state.clone());
+
+        // Captura o áudio deste processo enquanto toca.
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<i16>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let cap = {
+            let (captured, stop) = (captured.clone(), stop.clone());
+            thread::spawn(move || {
+                let _ = initialize_mta();
+                let exe = std::env::current_exe().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+                let mut sys = snapshot().unwrap();
+                let mut sink = |pcm: Vec<u8>, _: Option<Instant>| {
+                    let mut c = captured.lock().unwrap();
+                    c.extend(pcm.chunks_exact(4).map(|b| i16::from_le_bytes([b[0], b[1]])));
+                    true
+                };
+                // A captura confere o alvo a cada 3 s e pode recomeçar: repete até o fim.
+                while !stop.load(Ordering::SeqCst) {
+                    run_capture((std::process::id(), true), &Mode::Include(exe.clone()), &mut sys, &stop, &mut sink).expect("captura");
+                }
+            })
+        };
+
+        // Pacotes de 20 ms de um tom de 440 Hz, chegando em tempo real (15 ms depois da
+        // "captura", com variação de até 8 ms).
+        let mut enc = opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio).unwrap();
+        let mut out = vec![0u8; 4000];
+        let mut rng = 3u32;
+        for k in 0..250u32 {
+            let cap_ms = k as f64 * 20.0;
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            let arrive = t0 + Duration::from_secs_f64((cap_ms + 15.0 + (rng % 8) as f64) / 1000.0);
+            if let Some(w) = arrive.checked_duration_since(Instant::now()) {
+                thread::sleep(w);
+            }
+            let pcm: Vec<i16> = (0..PACKET_SAMPLES)
+                .flat_map(|i| {
+                    let t = (k as usize * PACKET_SAMPLES + i) as f32 / 48_000.0;
+                    let v = ((t * 440.0 * std::f32::consts::TAU).sin() * 20_000.0) as i16;
+                    [v, v]
+                })
+                .collect();
+            let n = enc.encode(&pcm, &mut out).unwrap();
+            let ts = (cap_ms * MEDIA_HZ / 1000.0) as u32;
+            clock.observe(Stream::Audio, ts, Instant::now());
+            let mut st = state.lock().unwrap();
+            let AudioState { rx, tl } = &mut *st;
+            rx.push(k, ts, out[..n].to_vec());
+            rx.run(&clock, Instant::now(), tl);
+        }
+        thread::sleep(Duration::from_millis(300));
+        stop.store(true, Ordering::SeqCst);
+        cap.join().unwrap();
+        drop(pb);
+
+        let c = captured.lock().unwrap();
+        let left: Vec<i16> = c.iter().step_by(2).copied().collect();
+        let first = left.iter().position(|v| v.unsigned_abs() > 50).expect("não saiu som nenhum");
+        let last = left.iter().rposition(|v| v.unsigned_abs() > 50).unwrap();
+        // Buracos: trechos de 2 ms seguidos sem som entre o começo e o fim do tom.
+        let mut gaps = 0;
+        let mut quiet = 0;
+        for v in &left[first..last] {
+            if v.unsigned_abs() < 8 {
+                quiet += 1;
+                if quiet == 96 {
+                    gaps += 1;
+                }
+            } else {
+                quiet = 0;
+            }
+        }
+        let st = state.lock().unwrap();
+        println!("captura: {:.2} s no total, tom de {:.2} s a {:.2} s", left.len() as f64 / 48_000.0, first as f64 / 48_000.0, last as f64 / 48_000.0);
+        println!(
+            "som capturado: {:.2} s de tom, buracos {gaps}; FEC {}, PLC {}, pulos {}, faltando {}",
+            (last - first) as f64 / 48_000.0, st.rx.fec, st.rx.plc, st.tl.snaps, st.tl.missing
+        );
+        // A captura por aplicativo para de entregar quando é reiniciada (ela confere o alvo a
+        // cada 3 s): a verificação cobre a janela da primeira captura (~2,3 s de tom).
+        assert!((last - first) as f64 / 48_000.0 > 2.0, "tocou pouco");
+        assert_eq!(gaps, 0, "buraco no som que saiu");
+        assert_eq!(st.tl.snaps, 0);
+    }
 
     /// Precisa de um dispositivo de áudio: `cargo test audio -- --ignored --nocapture`
     #[test]
@@ -501,7 +712,7 @@ mod tests {
         let stopper = stop.clone();
         thread::spawn(move || { thread::sleep(Duration::from_secs(4)); stopper.store(true, Ordering::SeqCst); });
         let mut chunks = 0usize;
-        let mut sink = |pcm: Vec<u8>| { assert_eq!(pcm.len(), CHUNK_FRAMES * 4); chunks += 1; true };
+        let mut sink = |pcm: Vec<u8>, _: Option<Instant>| { assert_eq!(pcm.len(), CHUNK_FRAMES * 4); chunks += 1; true };
         let target = resolve(&Mode::System, &sys).unwrap();
         run_capture(target, &Mode::System, &mut sys, &stop, &mut sink).expect("captura");
         println!("blocos de 20 ms capturados em 4 s: {chunks} (0 = nada tocando)");

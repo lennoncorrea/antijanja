@@ -77,7 +77,9 @@ pub enum Msg {
 
 pub struct Callbacks {
     /// (versão: 0 = principal, senão a altura; dados Annex B; duração do quadro)
-    pub on_packet: Arc<dyn Fn(u32, Vec<u8>, Duration) + Send + Sync>,
+    /// (versão, dados, duração, instante em que o quadro capturado chegou: o horário de
+    /// captura usado para sincronizar com o áudio)
+    pub on_packet: Arc<dyn Fn(u32, Vec<u8>, Duration, Instant) + Send + Sync>,
     pub on_info: Arc<dyn Fn(VideoInfo) + Send + Sync>,
     pub on_preview: Arc<dyn Fn(String) + Send + Sync>,
     pub on_error: Arc<dyn Fn(String) + Send + Sync>,
@@ -186,6 +188,9 @@ struct Extra {
 const NET_FPS_MIN_INTERVAL: Duration = Duration::from_secs(10);
 
 struct State {
+    /// Horário de captura do quadro sendo codificado (chegada dele ao pipeline; um quadro
+    /// repetido, sem novo, leva o horário do tick).
+    capture_at: Instant,
     /// O que está valendo agora: o escolhido por quem transmite, limitado pela rede.
     settings: VideoSettings,
     /// O escolhido por quem transmite.
@@ -371,7 +376,7 @@ impl State {
             match x.enc.encode(&scaled) {
                 Ok(packets) => {
                     for (i, pk) in packets.into_iter().enumerate() {
-                        (cb.on_packet)(x.height, pk.data, if i == 0 { interval } else { Duration::ZERO });
+                        (cb.on_packet)(x.height, pk.data, if i == 0 { interval } else { Duration::ZERO }, self.capture_at);
                     }
                 }
                 Err(_) => broken.push(x.height),
@@ -438,7 +443,7 @@ impl State {
                 let mut bytes = 0;
                 for (i, pk) in packets.into_iter().enumerate() {
                     bytes += pk.data.len();
-                    (cb.on_packet)(0, pk.data, if i == 0 { interval } else { Duration::ZERO });
+                    (cb.on_packet)(0, pk.data, if i == 0 { interval } else { Duration::ZERO }, self.capture_at);
                 }
                 self.encode_extras(&nv12, t, dur, interval, cb);
                 Some(bytes)
@@ -500,7 +505,7 @@ fn run(
             })
             .ok();
     }
-    let mut st = State { user: settings.clone(), net_bps: None, net_fps: None, net_fps_changed: None, extras: vec![], extra_reqs: vec![], extra_failed: vec![], settings, gpu, active: None, want_keyframe: true, last_nv12: None, frame_size: None, start: Instant::now(), convert_errors: 0, frame_index: 0 };
+    let mut st = State { user: settings.clone(), net_bps: None, net_fps: None, net_fps_changed: None, extras: vec![], extra_reqs: vec![], extra_failed: vec![], settings, gpu, active: None, want_keyframe: true, last_nv12: None, frame_size: None, start: Instant::now(), convert_errors: 0, frame_index: 0, capture_at: Instant::now() };
     let mut pending: Option<Pending> = None;
     let mut next_due = Instant::now();
     // Relógio de vídeo: cada tick é 1/fps. A duração de cada quadro no RTP = ticks avançados,
@@ -515,6 +520,7 @@ fn run(
     let (mut win_frames, mut win_bytes, mut win_start) = (0u32, 0usize, Instant::now());
     let mut win_time = Duration::ZERO;
     let mut fresh_count = 0u32;
+    let mut pending_at = Instant::now();
 
     loop {
         let interval = Duration::from_secs_f64(1.0 / st.settings.fps.max(1) as f64);
@@ -549,6 +555,7 @@ fn run(
             }
             Ok(Msg::Capture(CaptureMsg::Frame(f))) => {
                 st.frame_size = Some((f.width, f.height));
+                pending_at = Instant::now();
                 pending = Some(Pending::Cpu(f));
                 fresh = true;
                 fresh_count += 1;
@@ -562,6 +569,7 @@ fn run(
                 if let (Some(Pending::Gpu(old)), Some(gpu)) = (&pending, st.gpu.as_mut()) {
                     gpu.discard(old);
                 }
+                pending_at = Instant::now();
                 pending = Some(Pending::Gpu(f));
                 fresh_count += 1;
                 fresh = true;
@@ -669,6 +677,7 @@ fn run(
             }
         }
         let t0 = Instant::now();
+        st.capture_at = if pending.is_some() { pending_at } else { t0 };
         let result = st.encode_pending(&mut pending, &cb, rtp_dur);
         if result.is_some() {
             last_tick = tick.max(last_tick + 1);
@@ -780,7 +789,7 @@ mod tests {
             src.id,
             VideoSettings { res: 1080, fps: 60, bitrate: 12000, cursor: true },
             Callbacks {
-                on_packet: Arc::new(move |_, _, _| { p.fetch_add(1, Ordering::SeqCst); }),
+                on_packet: Arc::new(move |_, _, _, _| { p.fetch_add(1, Ordering::SeqCst); }),
                 on_info: Arc::new(move |i| {
                     println!("  {} hw={} zero-copy={} {}x{} {:.1} fps {} kb/s (alvo {}) encode {:.1} ms, capturados {:.0}/s", i.encoder, i.hardware, i.zero_copy, i.width, i.height, i.fps, i.kbps, i.target_kbps, i.encode_ms, i.captured_fps);
                     inf.lock().unwrap().push(i);
@@ -814,7 +823,7 @@ mod tests {
             src.id,
             VideoSettings { res: 1080, fps: 30, bitrate: 8000, cursor: true },
             Callbacks {
-                on_packet: Arc::new(move |k, d, _| p.lock().unwrap().entry(k).or_default().push(d)),
+                on_packet: Arc::new(move |k, d, _, _| p.lock().unwrap().entry(k).or_default().push(d)),
                 on_info: Arc::new(move |i| inf.lock().unwrap().push(i)),
                 on_preview: Arc::new(|_| {}),
                 on_error: Arc::new(|e| println!("  ERRO {e}")),
@@ -883,7 +892,7 @@ mod tests {
             src.id,
             VideoSettings { res: 1080, fps: 60, bitrate: 12000, cursor: true },
             Callbacks {
-                on_packet: Arc::new(move |_, d, _| {
+                on_packet: Arc::new(move |_, d, _, _| {
                     let key = crate::media::has_nal(&d, 5);
                     f.lock().unwrap().push((Instant::now(), d.len(), key));
                 }),

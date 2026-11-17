@@ -641,6 +641,12 @@ mod tests {
     /// Host e `n` espectadores conectados de verdade (WebRTC na mesma máquina), com a chave
     /// dos quadros entregue e todos na malha.
     fn setup(n: u64, want_kf: Arc<AtomicBool>) -> (Arc<MeshHub>, Vec<(u64, Viewer)>, ed25519_dalek::SigningKey) {
+        setup_with(n, want_kf, &|_| None)
+    }
+
+    type TimedFn = Arc<dyn Fn(crate::transport::Timed) + Send + Sync>;
+
+    fn setup_with(n: u64, want_kf: Arc<AtomicBool>, make_timed: &dyn Fn(u64) -> Option<TimedFn>) -> (Arc<MeshHub>, Vec<(u64, Viewer)>, ed25519_dalek::SigningKey) {
         let hub = MeshHub::new(crate::pieces::LANES as usize);
         let mut viewers: Vec<(u64, Viewer)> = vec![];
         for id in 1..=n {
@@ -657,6 +663,7 @@ mod tests {
                 on_audio: Arc::new(|_| {}),
                 on_state: Arc::new(|_| {}),
                 on_message: Arc::new(|_| {}),
+                timed: make_timed(id),
             };
             let (session, offer) = block_on(ViewerSession::offer(sinks, false)).expect("oferta");
             let (h, wk) = (hub.clone(), want_kf.clone());
@@ -699,6 +706,221 @@ mod tests {
             hub.join(*id, v.peer.clone());
         }
         (hub, viewers, signer)
+    }
+
+
+    /// O que um espectador viu e ouviu no teste de sincronia.
+    #[derive(Default)]
+    struct AvLog {
+        /// Horário em que cada quadro de flash seria mostrado (instante, número).
+        flashes: Vec<(Instant, u32)>,
+        /// Horário em que cada bipe sairia no alto-falante.
+        beeps: Vec<Instant>,
+        /// Áudio que saiu (só a amplitude, para achar cortes) depois que começou.
+        out: Vec<f32>,
+        late_frames: usize,
+    }
+
+    /// Flash e bipe no mesmo instante de captura, a cada segundo, por uma malha de 4
+    /// espectadores (um repassador cai no meio). Em cada espectador, mede a diferença entre
+    /// quando o flash seria mostrado e quando o bipe sairia no alto-falante, e se o áudio
+    /// teve algum corte.
+    /// `cargo test av_sync_through_the_mesh -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn av_sync_through_the_mesh() {
+        use crate::avsync::{AudioState, Stream, SyncClock, AUDIO_HZ, MEDIA_HZ};
+        use crate::transport::Timed;
+        const DEVICE_LATENCY: Duration = Duration::from_millis(20);
+        let logs: Vec<Arc<Mutex<AvLog>>> = (0..4).map(|_| Arc::new(Mutex::new(AvLog::default()))).collect();
+        let states: Vec<(Arc<SyncClock>, Arc<Mutex<AudioState>>)> =
+            (0..4).map(|_| (Arc::new(SyncClock::default()), Arc::new(Mutex::new(AudioState::new().unwrap())))).collect();
+        let make = |id: u64| -> Option<TimedFn> {
+            let (sync, state) = states[(id - 1) as usize].clone();
+            let log = logs[(id - 1) as usize].clone();
+            Some(Arc::new(move |t: Timed| {
+                let now = Instant::now();
+                match t {
+                    Timed::Video(f, ts) => {
+                        sync.observe(Stream::Video, ts, now);
+                        if let (Some(idx), Some(at)) = (intact(&f), sync.play_at(ts)) {
+                            let mut l = log.lock().unwrap();
+                            if at < now {
+                                l.late_frames += 1;
+                            }
+                            if idx % 60 == 30 {
+                                l.flashes.push((at.max(now), idx));
+                            }
+                        }
+                    }
+                    Timed::Audio(seq, ts, opus) => {
+                        sync.observe(Stream::Audio, ts, now);
+                        let mut st = state.lock().unwrap();
+                        let AudioState { rx, tl } = &mut *st;
+                        rx.push(seq, ts, opus);
+                        rx.run(&sync, now, tl);
+                    }
+                }
+            }))
+        };
+        let want_kf = Arc::new(AtomicBool::new(false));
+        let (hub, viewers, signer) = setup_with(4, want_kf.clone(), &make);
+
+        // "Placas de som" dos espectadores: pedem 10 ms a cada 10 ms; cada bloco sai no
+        // alto-falante 20 ms depois (+ o que já estava no buffer, aqui nada).
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut devices = vec![];
+        for i in 0..4 {
+            let (sync, state) = states[i].clone();
+            let (log, stop) = (logs[i].clone(), stop.clone());
+            devices.push(std::thread::spawn(move || {
+                let start = Instant::now();
+                let mut k = 0u64;
+                let mut was_quiet = true;
+                while !stop.load(Ordering::SeqCst) {
+                    let due = start + Duration::from_millis(10 * k);
+                    if let Some(w) = due.checked_duration_since(Instant::now()) {
+                        std::thread::sleep(w);
+                    }
+                    k += 1;
+                    let now = Instant::now();
+                    let heard_at = now + DEVICE_LATENCY;
+                    if !sync.ready() {
+                        continue;
+                    }
+                    let pcm = crate::avsync::render_block(&sync, &mut state.lock().unwrap(), now, heard_at, 480);
+                    let mut l = log.lock().unwrap();
+                    for (j, fr) in pcm.chunks_exact(2).enumerate() {
+                        let loud = fr[0].abs() > 0.2;
+                        if loud && was_quiet {
+                            l.beeps.push(heard_at + Duration::from_secs_f64(j as f64 / AUDIO_HZ));
+                        }
+                        if loud {
+                            was_quiet = false;
+                        } else if fr[0].abs() < 0.02 {
+                            was_quiet = true;
+                        }
+                        l.out.push(fr[0]);
+                    }
+                }
+            }));
+        }
+
+        // Host: vídeo a 60 fps e áudio Opus de 20 ms, carimbados no mesmo relógio (como a
+        // sessão faz). Um tom baixo contínuo (para achar cortes) e um bipe forte de 20 ms
+        // a cada segundo, no mesmo instante de captura do quadro de flash.
+        let mut source = crate::pieces::PieceSource::new(crate::transport::PIECE_OVERHEAD);
+        source.survive_lane = true;
+        source.signer = Some(signer);
+        let mut enc = opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio).unwrap();
+        enc.set_inband_fec(true).unwrap();
+        enc.set_packet_loss_perc(10).unwrap();
+        let mut opus_out = vec![0u8; 4000];
+        let ticks = |ms: f64| (ms * MEDIA_HZ / 1000.0) as u64 as u32;
+        let (secs, drop_at) = (14u32, 8u32);
+        let start = Instant::now();
+        let (mut vi, mut ai) = (0u32, 0u32);
+        let mut dropped = false;
+        while vi < 60 * secs {
+            let tv = vi as f64 * 1000.0 / 60.0;
+            let ta = ai as f64 * 20.0;
+            let next = tv.min(ta);
+            if let Some(w) = (start + Duration::from_secs_f64(next / 1000.0)).checked_duration_since(Instant::now()) {
+                std::thread::sleep(w);
+            }
+            if ta <= tv {
+                // Bipe no pacote cujo começo coincide com um flash (t = 500 ms + n s).
+                let beep = (ai as i64 - 25) >= 0 && (ai as i64 - 25) % 50 == 0;
+                let pcm: Vec<i16> = (0..960)
+                    .flat_map(|i| {
+                        let t = (ai as usize * 960 + i) as f32 / 48_000.0;
+                        let v = if beep { (t * 1000.0 * std::f32::consts::TAU).sin() * 0.6 } else { (t * 220.0 * std::f32::consts::TAU).sin() * 0.05 };
+                        let v = (v * 32767.0) as i16;
+                        [v, v]
+                    })
+                    .collect();
+                let n = enc.encode(&pcm, &mut opus_out).unwrap();
+                // Como a sessão: horário da captura menos o atraso do Opus.
+                let ts = ticks(ta).wrapping_sub(585);
+                let f = source.encode_audio(&opus_out[..n], ts);
+                for (id, v) in &viewers {
+                    if !(dropped && *id == 1) {
+                        v.peer.send_pieces(&f);
+                    }
+                }
+                ai += 1;
+            } else {
+                let key = vi % 60 == 0 || want_kf.swap(false, Ordering::SeqCst);
+                let f = source.encode_at(0, &frame_kf(vi, key), ticks(tv)).unwrap();
+                for (id, v) in &viewers {
+                    if !(dropped && *id == 1) {
+                        v.peer.send_pieces(&f);
+                    }
+                }
+                if vi == 60 * drop_at {
+                    dropped = true;
+                    let (s, p) = (viewers[0].1.session.clone(), viewers[0].1.peer.clone());
+                    s.mesh.close();
+                    let _ = block_on(s.pc.close());
+                    let _ = block_on(p.pc.close());
+                }
+                if vi == 60 * drop_at + 30 {
+                    hub.leave(1);
+                }
+                if vi % 30 == 0 {
+                    hub.tick();
+                }
+                vi += 1;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(800));
+        stop.store(true, Ordering::SeqCst);
+        for d in devices {
+            d.join().unwrap();
+        }
+
+        for i in 1..4usize {
+            let l = logs[i].lock().unwrap();
+            let st = states[i].1.lock().unwrap();
+            // Para cada flash, o bipe mais perto.
+            let mut offsets = vec![];
+            for (at, _) in &l.flashes {
+                if let Some(b) = l.beeps.iter().min_by_key(|b| if **b > *at { **b - *at } else { *at - **b }) {
+                    let ms = if *b > *at { (*b - *at).as_secs_f64() * 1000.0 } else { -((*at - *b).as_secs_f64() * 1000.0) };
+                    offsets.push(ms);
+                }
+            }
+            // Cortes: trechos de 2 ms sem som no meio (o tom baixo está sempre tocando).
+            // Sem o começo (aquecimento) e o fim (o host parou; o "alto-falante" segue 0,8 s).
+            let body = &l.out[48_000.min(l.out.len())..l.out.len().saturating_sub(72_000)];
+            let mut cuts = 0;
+            let mut zeros = 0;
+            let mut where_s = vec![];
+            for (n, v) in body.iter().enumerate() {
+                if v.abs() < 1e-5 {
+                    zeros += 1;
+                    if zeros == 96 {
+                        cuts += 1;
+                        where_s.push(((48_000 + n) as f64 / 48_000.0 * 100.0).round() / 100.0);
+                    }
+                } else {
+                    zeros = 0;
+                }
+            }
+            println!("  espectador {}: cortes em {:?} s (desde o começo do áudio), tarde {}, faltando {}", i + 1, where_s, st.rx.late, st.tl.missing);
+            let worst = offsets.iter().map(|x: &f64| x.abs()).fold(0.0, f64::max);
+            println!(
+                "espectador {}: {} flashes, {} bipes, diferença bipe−flash {:?} ms (pior {:.1}), cortes no áudio {}, pulos {}, FEC {}, PLC {}, quadros atrasados {}, atraso {:.0} ms",
+                i + 1, l.flashes.len(), l.beeps.len(),
+                offsets.iter().map(|x| (x * 10.0).round() / 10.0).collect::<Vec<_>>(), worst,
+                cuts, st.tl.snaps, st.rx.fec, st.rx.plc, l.late_frames, states[i].0.delay_ms()
+            );
+            assert!(l.flashes.len() >= secs as usize - 2, "flashes faltando");
+            assert!(offsets.len() >= l.flashes.len() - 1);
+            assert!(worst < 20.0, "espectador {}: áudio e vídeo fora de sincronia ({worst:.1} ms)", i + 1);
+            assert_eq!(cuts, 0, "espectador {}: corte no áudio", i + 1);
+            assert_eq!(st.tl.snaps, 0, "espectador {}: o áudio pulou", i + 1);
+        }
     }
 
     /// Um espectador passa a adulterar tudo o que repassa. Ninguém pode receber quadro
@@ -782,6 +1004,7 @@ mod tests {
                 on_audio: Arc::new(|_| {}),
                 on_state: Arc::new(|_| {}),
                 on_message: Arc::new(|_| {}),
+                timed: None,
             };
             let (session, offer) = block_on(ViewerSession::offer(sinks, false)).expect("oferta");
             let h = hub.clone();

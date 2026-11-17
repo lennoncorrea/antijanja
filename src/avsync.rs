@@ -61,7 +61,14 @@ struct Inner {
     last_update: f64,
     surplus_since: Option<f64>,
     first_seen: Option<f64>,
+    /// Áudio tocando: (instante em que uma amostra sai no alto-falante, o instante de mídia
+    /// dela em ms, quando foi informado). É o relógio mestre do vídeo.
+    audio_ref: Option<(Instant, f64, Instant)>,
 }
+
+/// O relógio do áudio vale para o vídeo enquanto o tocador informar a posição com essa
+/// frequência (pede a cada ~10 ms).
+const AUDIO_REF_FRESH: Duration = Duration::from_millis(200);
 
 /// O relógio comum de áudio e vídeo de uma stream (compartilhado entre as threads).
 pub struct SyncClock {
@@ -154,6 +161,7 @@ impl SyncClock {
                 last_update: 0.0,
                 surplus_since: None,
                 first_seen: None,
+                audio_ref: None,
             }),
         }
     }
@@ -189,11 +197,33 @@ impl SyncClock {
     }
 
     /// Quando tocar o que tem este timestamp. None durante o aquecimento.
+    ///
+    /// Com áudio tocando, o áudio é o relógio mestre: o horário sai da posição que o
+    /// tocador informou (o que está saindo no alto-falante agora). Assim a sincronia é
+    /// exata mesmo enquanto o áudio corrige a velocidade aos poucos (deriva da placa de
+    /// som, atraso deslizando): o vídeo acompanha o que de fato se ouve.
     pub fn play_at(&self, ts: u32) -> Option<Instant> {
         let g = self.inner.lock().unwrap();
         let d = g.delay?;
-        let ms = g.media_ms_peek(ts) + g.base + d;
+        let media = g.media_ms_peek(ts);
+        if let Some((heard, at_ms, updated)) = g.audio_ref {
+            if updated.elapsed() < AUDIO_REF_FRESH {
+                let ahead = media - at_ms;
+                return Some(if ahead >= 0.0 {
+                    heard + Duration::from_secs_f64(ahead / 1000.0)
+                } else {
+                    heard.checked_sub(Duration::from_secs_f64(-ahead / 1000.0)).unwrap_or(heard)
+                });
+            }
+        }
+        let ms = media + g.base + d;
         Some(g.start + Duration::from_secs_f64(ms.max(0.0) / 1000.0))
+    }
+
+    /// O tocador de áudio informa: a amostra com o instante de mídia `media_ms` sai no
+    /// alto-falante em `heard_at`.
+    pub fn set_audio_position(&self, heard_at: Instant, media_ms: f64) {
+        self.inner.lock().unwrap().audio_ref = Some((heard_at, media_ms, Instant::now()));
     }
 
     /// O instante de mídia (ms) que deve estar tocando no horário local `t` (o inverso de
@@ -357,6 +387,22 @@ impl AudioTimeline {
     }
 }
 
+/// Um bloco para o dispositivo de áudio: decodifica o que chegou, tira da linha do tempo o
+/// trecho que deve sair em `heard_at` (quando a primeira amostra do bloco sai no
+/// alto-falante) e informa a posição ao relógio (o áudio é o mestre do vídeo).
+pub fn render_block(clock: &SyncClock, state: &mut AudioState, now: Instant, heard_at: Instant, frames: usize) -> Vec<f32> {
+    let AudioState { rx, tl } = state;
+    rx.run(clock, now, tl);
+    let target = clock.media_ms_at(heard_at).map(|ms| ms * AUDIO_HZ / 1000.0);
+    let pcm = tl.pull(frames, target);
+    // Posição depois do bloco = a amostra que sai `frames` depois de `heard_at`.
+    if let (Some(_), Some(pos)) = (target, tl.position()) {
+        let end = heard_at + Duration::from_secs_f64(frames as f64 / AUDIO_HZ);
+        clock.set_audio_position(end, pos * 1000.0 / AUDIO_HZ);
+    }
+    pcm
+}
+
 /// Amostra de mídia (48 kHz) de um timestamp em ms de mídia.
 pub fn audio_sample_at(media_ms: f64) -> i64 {
     (media_ms * AUDIO_HZ / 1000.0).round() as i64
@@ -364,12 +410,27 @@ pub fn audio_sample_at(media_ms: f64) -> i64 {
 
 /* ============================================================ pacotes de áudio */
 
+/// O áudio de uma stream em pedaços: o receptor (ordem, FEC, PLC) e a linha do tempo.
+pub struct AudioState {
+    pub rx: AudioReceiver,
+    pub tl: AudioTimeline,
+}
+
+impl AudioState {
+    pub fn new() -> Result<Self, String> {
+        Ok(Self { rx: AudioReceiver::new()?, tl: AudioTimeline::new() })
+    }
+}
+
 /// Duração de um pacote de áudio (20 ms) em ticks de 90 kHz e em amostras.
 pub const PACKET_TICKS: u32 = 1_800;
 pub const PACKET_SAMPLES: usize = 960;
 /// Pacote que falta: espera até esse tempo antes da hora de tocar e então disfarça a
 /// falta (correção de erro do próximo pacote, ou o preenchimento do Opus).
 const CONCEAL_LEAD: Duration = Duration::from_millis(40);
+/// Disfarces seguidos sem nenhum pacote depois (3 = 60 ms; o Opus vai suavizando até o
+/// silêncio, sem estalo).
+const MAX_BLIND: u32 = 3;
 
 /// Recebe os pacotes Opus (fora de ordem, repetidos: chegam por duas faixas da malha),
 /// decodifica na ordem e põe na linha do tempo, cada um no horário da captura. Pacote
@@ -380,8 +441,14 @@ pub struct AudioReceiver {
     /// Pacotes à espera, por número: (timestamp 90 kHz, dados).
     packets: std::collections::BTreeMap<u32, (u32, Vec<u8>)>,
     next: Option<u32>,
-    /// Timestamp do último pacote decodificado (o próximo deve ser +20 ms).
+    /// Timestamp do último pacote decodificado ou disfarçado (o próximo deve ser +20 ms).
     last_ts: Option<u32>,
+    /// Disfarces seguidos sem nenhum pacote depois (a falta pode ser só atraso, ou o host
+    /// em pausa: quando nada toca lá, ele não manda pacotes).
+    blind: u32,
+    /// Números já tocados (a segunda cópia, pela outra faixa, conta como repetida e não
+    /// como atrasada).
+    played: VecDeque<u32>,
     pcm: Vec<f32>,
     /// Diagnóstico.
     pub decoded: u64,
@@ -398,6 +465,8 @@ impl AudioReceiver {
             packets: Default::default(),
             next: None,
             last_ts: None,
+            blind: 0,
+            played: VecDeque::new(),
             pcm: vec![0.0; 5760 * 2],
             decoded: 0,
             fec: 0,
@@ -410,8 +479,23 @@ impl AudioReceiver {
     /// Pacote que chegou (`seq` = número do pacote, `ts` = captura em 90 kHz).
     pub fn push(&mut self, seq: u32, ts: u32, data: Vec<u8>) {
         if self.next.is_some_and(|n| seq < n) {
-            self.late += 1; // já tocou (ou foi disfarçado)
+            if self.played.contains(&seq) {
+                self.duplicate += 1; // a cópia da outra faixa
+            } else {
+                self.late += 1; // chegou depois da hora (foi disfarçado)
+            }
             return;
+        }
+        // O pacote esperado chegou depois de disfarces "às cegas": se o horário dele já
+        // foi coberto, chegou tarde; se é depois (o host estava em pausa), vale normal.
+        if self.blind > 0 && self.next == Some(seq) {
+            let covered = self.last_ts.is_some_and(|t| (ts.wrapping_sub(t) as i32) <= 0);
+            self.blind = 0;
+            if covered {
+                self.late += 1;
+                self.next = Some(seq + 1);
+                return;
+            }
         }
         if self.packets.contains_key(&seq) {
             self.duplicate += 1;
@@ -438,11 +522,29 @@ impl AudioReceiver {
                 let out = self.decode(&data, false);
                 self.emit(ts, out, clock, tl);
                 self.decoded += 1;
+                self.blind = 0;
+                self.played.push_back(n);
+                if self.played.len() > 128 {
+                    self.played.pop_front();
+                }
                 self.next = Some(n + 1);
                 continue;
             }
-            // Falta o `n`. Sem nada depois dele, não há o que fazer ainda.
-            let Some((&after, _)) = self.packets.iter().next() else { return };
+            // Falta o `n` e nada chegou depois dele: na hora de tocar, preenche (até 60 ms)
+            // em vez de deixar sair silêncio, sem dar o `n` por perdido (pode ser só atraso,
+            // ou o host em pausa).
+            let Some((&after, _)) = self.packets.iter().next() else {
+                let Some(last) = self.last_ts else { return };
+                let expected = last.wrapping_add(PACKET_TICKS);
+                let due = clock.play_at(expected).is_some_and(|at| now + CONCEAL_LEAD / 2 >= at);
+                if due && self.blind < MAX_BLIND {
+                    self.blind += 1;
+                    self.plc += 1;
+                    let out = self.decode(&[], false);
+                    self.emit(expected, out, clock, tl);
+                }
+                return;
+            };
             let expected = self.last_ts.map(|t| t.wrapping_add(PACKET_TICKS)).unwrap_or_else(|| {
                 // Sem referência: estima pelo seguinte.
                 self.packets[&after].0.wrapping_sub(PACKET_TICKS * (after - n))
@@ -572,6 +674,41 @@ mod tests {
             }
         }
         runs
+    }
+
+    /// O host para de mandar (nada tocando lá) e volta: o receptor preenche um pouco e
+    /// depois aceita normalmente o pacote que chega depois da pausa (não é "atrasado").
+    #[test]
+    fn a_pause_on_the_host_does_not_drop_the_audio_that_comes_back() {
+        let t0 = Instant::now();
+        let clock = SyncClock::new(t0);
+        let mut rx = AudioReceiver::new().unwrap();
+        let mut tl = AudioTimeline::new();
+        let packets = opus_packets(80);
+        let mut out = vec![];
+        for step in 0..400usize {
+            let now_ms = step as f64 * 10.0;
+            let now = t0 + Duration::from_secs_f64(now_ms / 1000.0);
+            // Pacotes 0..39 em seguida; pausa de 1 s; 40..79 com os horários depois da pausa.
+            for k in 0..80usize {
+                let cap = if k < 40 { k as f64 * 20.0 } else { k as f64 * 20.0 + 1000.0 };
+                let arrival = cap + 15.0;
+                if arrival > now_ms - 10.0 && arrival <= now_ms {
+                    let ts = (cap * 90.0) as u32;
+                    clock.observe(Stream::Audio, ts, now);
+                    rx.push(k as u32, ts, packets[k].clone());
+                }
+            }
+            rx.run(&clock, now, &mut tl);
+            let target = clock.media_ms_at(now).map(|ms| ms * AUDIO_HZ / 1000.0);
+            if target.is_some() {
+                out.extend(tl.pull(480, target));
+            }
+        }
+        assert_eq!(rx.late, 0, "o áudio depois da pausa foi descartado");
+        // Até MAX_BLIND na pausa e outros tantos no fim (os pacotes acabam de vez).
+        assert!(rx.plc >= 1 && rx.plc <= 2 * MAX_BLIND as u64, "preenche só um pouco na pausa: plc {} fec {} decoded {} late {} dup {}", rx.plc, rx.fec, rx.decoded, rx.late, rx.duplicate);
+        assert_eq!(rx.decoded, 80);
     }
 
     #[test]

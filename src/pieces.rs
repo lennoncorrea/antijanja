@@ -41,6 +41,8 @@ pub const KIND_SIG: u8 = 2;
 const SIG_LEN: usize = 64;
 /// Marcador: o quadro é um keyframe.
 pub const FLAG_KEYFRAME: u8 = 1;
+/// Marcador (áudio): a assinatura do host vem depois dos dados.
+pub const FLAG_SIGNED: u8 = 2;
 
 /// Cabeçalho de um pedaço (little-endian, 25 bytes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +101,12 @@ impl Header {
             esi: u32_at(20),
             block: b[24],
         };
+        if h.kind == KIND_AUDIO {
+            // Um pacote Opus inteiro (+ assinatura, se tiver) num pedaço só.
+            let sig = if h.flags & FLAG_SIGNED != 0 { SIG_LEN } else { 0 };
+            let ok = h.len >= 1 && h.symbol as usize == h.len as usize + sig && h.esi == 0 && h.block == 0 && b.len() == HEADER + h.symbol as usize;
+            return ok.then_some(h);
+        }
         if h.kind == KIND_SIG {
             let ok = h.len == SIG_LEN as u32 && h.symbol == SIG_LEN as u16 && h.esi == 0 && h.block == 0 && b.len() == HEADER + SIG_LEN;
             return ok.then_some(h);
@@ -267,6 +275,8 @@ pub fn lane_of(piece: &[u8]) -> Option<u8> {
 pub struct PieceFrame {
     pub pieces: Vec<Vec<u8>>,
     pub keyframe: bool,
+    /// Áudio: vai na frente do vídeo (sem esperar o ritmo do pacer).
+    pub audio: bool,
 }
 
 /// Numera e codifica os quadros de cada versão do vídeo, uma vez só para todos.
@@ -281,6 +291,8 @@ pub struct PieceSource {
     pub signer: Option<ed25519_dalek::SigningKey>,
     /// Codificadores dos quadros recentes: geram pedaços extras quando alguém pede.
     recent: VecDeque<(u32, u32, FrameEncoder)>,
+    /// Número do próximo pacote de áudio.
+    audio_seq: u32,
 }
 
 /// Quadros recentes que ainda dá para reparar (~1,5 s a 60 fps).
@@ -292,7 +304,7 @@ impl PieceSource {
     pub fn new(overhead: f32) -> Self {
         let mut b = [0u8; 4];
         let _ = getrandom::fill(&mut b);
-        Self { state: Default::default(), seed: u32::from_le_bytes(b), overhead, survive_lane: false, signer: None, recent: VecDeque::new() }
+        Self { state: Default::default(), seed: u32::from_le_bytes(b), overhead, survive_lane: false, signer: None, recent: VecDeque::new(), audio_seq: 0 }
     }
 
     /// `key`: versão (0 = principal, senão a altura). None só se o quadro for inválido;
@@ -316,7 +328,24 @@ impl PieceSource {
         while self.recent.len() > KEEP_FOR_REPAIR {
             self.recent.pop_front();
         }
-        Some(std::sync::Arc::new(PieceFrame { pieces, keyframe }))
+        Some(std::sync::Arc::new(PieceFrame { pieces, keyframe, audio: false }))
+    }
+
+    /// Como `encode`, com o horário de captura (90 kHz do relógio comum com o áudio) em vez
+    /// de somar as durações.
+    pub fn encode_at(&mut self, key: u32, data: &[u8], ts: u32) -> Option<std::sync::Arc<PieceFrame>> {
+        let seed = self.seed;
+        let st = self.state.entry(key).or_insert((0, seed));
+        st.1 = ts;
+        self.encode(key, data, Duration::ZERO)
+    }
+
+    /// Um pacote de áudio (Opus, 20 ms) capturado em `ts` (90 kHz): vai inteiro em duas
+    /// faixas diferentes (dois vizinhos na malha; o que chegar primeiro vale), assinado.
+    pub fn encode_audio(&mut self, data: &[u8], ts: u32) -> std::sync::Arc<PieceFrame> {
+        let seq = self.audio_seq;
+        self.audio_seq = self.audio_seq.wrapping_add(1);
+        std::sync::Arc::new(PieceFrame { pieces: audio_pieces(seq, ts, data, self.signer.as_ref()), keyframe: false, audio: true })
     }
 
     /// Pedaços extras novos para um quadro recente: `blocks` = (bloco, quantos). Vazio se
@@ -325,6 +354,57 @@ impl PieceSource {
         let Some((_, _, enc)) = self.recent.iter_mut().find(|(k, f, _)| *k == key && *f == frame) else { return vec![] };
         blocks.iter().flat_map(|&(b, n)| enc.repair_block(b as usize, n.min(MAX_REPAIR))).collect()
     }
+}
+
+/// Os pedaços de um pacote de áudio: o mesmo pacote em duas faixas diferentes.
+pub fn audio_pieces(seq: u32, ts: u32, data: &[u8], signer: Option<&ed25519_dalek::SigningKey>) -> Vec<Vec<u8>> {
+    use ed25519_dalek::Signer;
+    if data.is_empty() || data.len() + SIG_LEN > MAX_SYMBOL {
+        return vec![];
+    }
+    let sig = signer.map(|sk| sk.sign(&digest(KIND_AUDIO, 0, seq, ts, data)).to_bytes());
+    let lanes = [(seq % LANES as u32) as u8, ((seq + LANES as u32 / 2) % LANES as u32) as u8];
+    lanes
+        .iter()
+        .map(|&lane| {
+            let h = Header {
+                kind: KIND_AUDIO,
+                rendition: 0,
+                frame: seq,
+                ts,
+                len: data.len() as u32,
+                symbol: (data.len() + if sig.is_some() { SIG_LEN } else { 0 }) as u16,
+                flags: if sig.is_some() { FLAG_SIGNED } else { 0 },
+                lane,
+                esi: 0,
+                block: 0,
+            };
+            let mut out = Vec::with_capacity(HEADER + h.symbol as usize);
+            h.write(&mut out);
+            out.extend_from_slice(data);
+            if let Some(s) = &sig {
+                out.extend_from_slice(s);
+            }
+            out
+        })
+        .collect()
+}
+
+/// Lê um pedaço de áudio: (número, horário, Opus). Com `key`, só vale se estiver assinado
+/// por ela (malha: passou por outros espectadores).
+pub fn parse_audio(piece: &[u8], key: Option<&ed25519_dalek::VerifyingKey>) -> Option<(u32, u32, Vec<u8>)> {
+    let h = Header::read(piece).filter(|h| h.kind == KIND_AUDIO)?;
+    let data = &piece[HEADER..HEADER + h.len as usize];
+    if let Some(k) = key {
+        if h.flags & FLAG_SIGNED == 0 {
+            return None;
+        }
+        let mut sig = [0u8; SIG_LEN];
+        sig.copy_from_slice(&piece[HEADER + h.len as usize..HEADER + h.len as usize + SIG_LEN]);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig);
+        k.verify_strict(&digest(KIND_AUDIO, 0, h.frame, h.ts, data), &sig).ok()?;
+    }
+    Some((h.frame, h.ts, data.to_vec()))
 }
 
 /// O que a assinatura cobre: tudo o que descreve o quadro e os dados.
@@ -590,8 +670,8 @@ impl Assembler {
             self.stats.invalid += 1;
             return None;
         };
-        if h.kind == KIND_SIG {
-            return None; // tratadas pelo `Verifier`
+        if h.kind == KIND_SIG || h.kind == KIND_AUDIO {
+            return None; // assinaturas: `Verifier`; áudio: `parse_audio`
         }
         let key = (h.kind, h.rendition, h.frame);
         if self.done.contains(&key) {
@@ -1139,6 +1219,36 @@ mod tests {
         assert!(v.push(frame, now).is_empty(), "sem assinatura ainda: espera");
         let out = v.on_sig(sigs[2], now + Duration::from_millis(30));
         assert_eq!(out.len(), 1);
+    }
+
+    /// Pacote de áudio em pedaços: duas faixas diferentes, assinado; adulterado ou de
+    /// outra chave não passa.
+    #[test]
+    fn audio_pieces_go_on_two_lanes_and_are_signed() {
+        let sk = signing_key(4);
+        let mut src = PieceSource::new(0.25);
+        src.signer = Some(sk.clone());
+        let opus = vec![7u8; 300];
+        let f = src.encode_audio(&opus, 1234);
+        assert!(f.audio);
+        assert_eq!(f.pieces.len(), 2);
+        let lanes: Vec<u8> = f.pieces.iter().map(|p| lane_of(p).unwrap()).collect();
+        assert_ne!(lanes[0], lanes[1]);
+        let key = sk.verifying_key();
+        for p in &f.pieces {
+            assert_eq!(parse_audio(p, Some(&key)), Some((0, 1234, opus.clone())));
+        }
+        let mut bad = f.pieces[0].clone();
+        bad[HEADER + 10] ^= 1;
+        assert!(parse_audio(&bad, Some(&key)).is_none());
+        assert!(parse_audio(&f.pieces[0], Some(&signing_key(5).verifying_key())).is_none());
+        // Sem malha (sem chave para conferir): passa, e o montador de vídeo ignora.
+        let mut plain = PieceSource::new(0.25);
+        let g = plain.encode_audio(&opus, 99);
+        assert_eq!(parse_audio(&g.pieces[0], None), Some((0, 99, opus.clone())));
+        assert!(Assembler::new().push(&g.pieces[0], Instant::now()).is_none());
+        // Sem assinatura quando a chave é exigida: não passa.
+        assert!(parse_audio(&g.pieces[0], Some(&key)).is_none());
     }
 
     /// Na malha, perder uma faixa inteira (qualquer uma) não pode impedir nenhum quadro.
