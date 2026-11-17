@@ -14,6 +14,7 @@
 mod agenda;
 mod app;
 mod audio;
+mod avsync;
 mod capture;
 mod framegen;
 mod congestion;
