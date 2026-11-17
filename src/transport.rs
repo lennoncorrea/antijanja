@@ -793,6 +793,7 @@ async fn receive_pieces(
                     // Pedaços de vizinho sem a chave para conferir: não confia.
                     if let Some(k) = *stream_key.lock().unwrap() {
                         verifier = Some(Verifier::new(k));
+                        asm.keep_raw = true;
                     }
                 }
                 if let Some(v) = verifier.as_mut() {
@@ -828,6 +829,7 @@ async fn receive_pieces(
                 if verifier.is_none() {
                     if let Some(k) = *stream_key.lock().unwrap() {
                         verifier = Some(Verifier::new(k));
+                        asm.keep_raw = true;
                     }
                 }
                 let is_sig = Header::read(piece).is_some_and(|h| h.kind == KIND_SIG);
@@ -850,6 +852,7 @@ async fn receive_pieces(
         }
         if let Some(v) = verifier.as_mut() {
             verified.extend(v.tick(now));
+            verified.extend(v.retry(&asm, now));
             if !v.suspects.is_empty() {
                 let s = std::mem::take(&mut v.suspects);
                 mesh.report_forged(&s);

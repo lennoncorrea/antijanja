@@ -369,13 +369,17 @@ pub struct Verifier {
     /// Quadros descartados: assinatura errada / não chegou a tempo.
     pub forged: u64,
     pub unsigned: u64,
+    /// Quadros que não conferiam e foram salvos remontando sem o vizinho que adulterou.
+    pub rescued: u64,
+    /// Quadros que não conferiram, esperando os pedaços que sobram para tentar remontar.
+    rejected: Vec<(Frame, Instant)>,
     /// De quem vieram os pedaços dos quadros que não conferiram (quem chama esvazia).
     pub suspects: Vec<u64>,
 }
 
 impl Verifier {
     pub fn new(key: ed25519_dalek::VerifyingKey) -> Self {
-        Self { key, sigs: Default::default(), order: VecDeque::new(), waiting: vec![], forged: 0, unsigned: 0, suspects: vec![] }
+        Self { key, sigs: Default::default(), order: VecDeque::new(), waiting: vec![], forged: 0, unsigned: 0, rescued: 0, rejected: vec![], suspects: vec![] }
     }
 
     /// Pedaço de assinatura. Devolve quadros que esperavam por ela e agora conferem.
@@ -397,8 +401,8 @@ impl Verifier {
         let mut out = vec![];
         for (f, at) in waiting {
             match self.check_one(&f) {
-                Some(true) => out.push(f),
-                Some(false) => self.reject(&f),
+                Some(true) => out.push(Frame { raw: vec![], ..f }),
+                Some(false) => out.extend(self.reject(f)),
                 None => self.waiting.push((f, at)),
             }
         }
@@ -410,21 +414,62 @@ impl Verifier {
     pub fn push(&mut self, f: Frame, now: Instant) -> Vec<Frame> {
         let mut out = vec![];
         match self.check_one(&f) {
-            Some(true) => out.push(f),
-            Some(false) => self.reject(&f),
+            Some(true) => out.push(Frame { raw: vec![], ..f }),
+            Some(false) => out.extend(self.reject(f)),
             None => self.waiting.push((f, now)),
         }
         out.extend(self.expire(now));
         out
     }
 
-    fn reject(&mut self, f: &Frame) {
+    /// O quadro não conferiu: espera os pedaços que ainda vão chegar dele (`retry`).
+    fn reject(&mut self, f: Frame) -> Option<Frame> {
         self.forged += 1;
-        for s in &f.sources {
-            if !self.suspects.contains(s) {
-                self.suspects.push(*s);
+        self.rejected.push((f, Instant::now()));
+        None
+    }
+
+    /// Para cada quadro que não conferiu: tenta remontá-lo sem os pedaços de cada vizinho,
+    /// um de cada vez (a folga para perder uma faixa costuma dar). Se sem os de X ele
+    /// confere, X adulterou e o quadro está salvo. Passado o prazo sem conseguir, todos os
+    /// vizinhos que contribuíram ficam suspeitos. Chamar depois de cada pedaço.
+    pub fn retry(&mut self, asm: &Assembler, now: Instant) -> Vec<Frame> {
+        let mut out = vec![];
+        let rejected = std::mem::take(&mut self.rejected);
+        for (f, at) in rejected {
+            let raw = asm.raw_of(f.kind, f.rendition, f.frame).unwrap_or(&[]);
+            let mut candidates: Vec<u64> = raw.iter().map(|(s, _)| *s).filter(|&s| s != 0).collect();
+            candidates.sort_unstable();
+            candidates.dedup();
+            let mut saved = None;
+            for &culprit in &candidates {
+                let mut a = Assembler::new();
+                if let Some(g) = raw.iter().filter(|(s, _)| *s != culprit).find_map(|(s, p)| a.push_from(p, now, *s)) {
+                    if self.check_one(&g) == Some(true) {
+                        saved = Some((culprit, g));
+                        break;
+                    }
+                }
+            }
+            match saved {
+                Some((culprit, g)) => {
+                    self.rescued += 1;
+                    if !self.suspects.contains(&culprit) {
+                        self.suspects.push(culprit);
+                    }
+                    out.push(g);
+                }
+                None if now.saturating_duration_since(at) >= SIG_WAIT * 2 => {
+                    for s in f.sources.iter().filter(|&&s| s != 0) {
+                        if !self.suspects.contains(s) {
+                            self.suspects.push(*s);
+                        }
+                    }
+                }
+                None => self.rejected.push((f, at)),
             }
         }
+        out
     }
 
     /// Chamar de tempos em tempos (descarta quem esperou demais pela assinatura).
@@ -465,6 +510,9 @@ pub struct Frame {
     /// De quem vieram os pedaços usados (0 = host): se o quadro não conferir com a
     /// assinatura, um deles adulterou.
     pub sources: Vec<u64>,
+    /// Os pedaços recebidos e de quem (só com `Assembler::keep_raw`): permitem remontar o
+    /// quadro sem os de um vizinho, para achar quem adulterou e salvar o quadro.
+    pub raw: Vec<(u64, Vec<u8>)>,
 }
 
 /// Contadores do montador (para relatórios e diagnóstico).
@@ -491,6 +539,7 @@ struct Pending {
     got: Vec<u32>,
     first_at: Instant,
     sources: Vec<u64>,
+    raw: Vec<(u64, Vec<u8>)>,
 }
 
 /// Quanto tempo um quadro incompleto espera por pedaços antes de desistir.
@@ -508,7 +557,15 @@ pub struct Assembler {
     pending: BTreeMap<Key, Pending>,
     done: VecDeque<Key>,
     pub stats: Stats,
+    /// Guarda os pedaços de cada quadro até ele sair (malha: para achar quem adulterou).
+    pub keep_raw: bool,
+    /// Pedaços dos quadros recém-fechados, inclusive os que chegam depois (com
+    /// `keep_raw`): é com eles que dá para remontar sem os de um vizinho.
+    done_raw: BTreeMap<Key, Vec<(u64, Vec<u8>)>>,
 }
+
+/// Quadros recém-fechados cujos pedaços ficam guardados.
+const KEEP_RAW_FRAMES: usize = 32;
 
 impl Default for Assembler {
     fn default() -> Self {
@@ -518,7 +575,7 @@ impl Default for Assembler {
 
 impl Assembler {
     pub fn new() -> Self {
-        Self { pending: BTreeMap::new(), done: VecDeque::new(), stats: Stats::default() }
+        Self { pending: BTreeMap::new(), done: VecDeque::new(), stats: Stats::default(), keep_raw: false, done_raw: BTreeMap::new() }
     }
 
     pub fn push(&mut self, piece: &[u8], now: Instant) -> Option<Frame> {
@@ -539,6 +596,11 @@ impl Assembler {
         let key = (h.kind, h.rendition, h.frame);
         if self.done.contains(&key) {
             self.stats.surplus += 1;
+            if let Some(raw) = self.done_raw.get_mut(&key) {
+                if raw.len() < 4096 {
+                    raw.push((src, piece.to_vec()));
+                }
+            }
             return None;
         }
         if !self.pending.contains_key(&key) {
@@ -556,7 +618,7 @@ impl Assembler {
                     Some(SourceBlockDecoder::new(b as u8, &oti(bytes, h.symbol as usize), bytes as u64))
                 })
                 .collect();
-            self.pending.insert(key, Pending { header: h, decoders, parts: vec![None; n], got: vec![0; n], first_at: now, sources: vec![] });
+            self.pending.insert(key, Pending { header: h, decoders, parts: vec![None; n], got: vec![0; n], first_at: now, sources: vec![], raw: vec![] });
         }
         let p = self.pending.get_mut(&key).unwrap();
         // Todos os pedaços de um quadro têm que concordar no que descreve o quadro.
@@ -573,6 +635,9 @@ impl Assembler {
         p.got[b] += 1;
         if !p.sources.contains(&src) {
             p.sources.push(src);
+        }
+        if self.keep_raw {
+            p.raw.push((src, piece.to_vec()));
         }
         let packet = EncodingPacket::new(PayloadId::new(h.block, h.esi), piece[HEADER..].to_vec());
         // Defesa extra: um pedaço malformado não pode derrubar o app.
@@ -592,14 +657,23 @@ impl Assembler {
         if p.parts.iter().any(|x| x.is_none()) {
             return None;
         }
-        let p = self.pending.remove(&key).unwrap();
+        let mut p = self.pending.remove(&key).unwrap();
         self.remember(key);
+        if self.keep_raw {
+            self.done_raw.insert(key, std::mem::take(&mut p.raw));
+            while self.done_raw.len() > KEEP_RAW_FRAMES {
+                let first = *self.done_raw.keys().next().unwrap();
+                // O mais antigo pelo número do quadro (dentro da mesma versão, crescente).
+                let oldest = self.done_raw.keys().min_by_key(|k| k.2).copied().unwrap_or(first);
+                self.done_raw.remove(&oldest);
+            }
+        }
         self.stats.frames += 1;
         let used: u32 = p.got.iter().sum();
         self.stats.extra_used += used.saturating_sub(p.header.source_pieces()) as u64;
         let mut data: Vec<u8> = p.parts.into_iter().flatten().flatten().collect();
         data.truncate(p.header.len as usize);
-        Some(Frame { kind: h.kind, rendition: h.rendition, frame: h.frame, ts: h.ts, keyframe: h.keyframe(), data, sources: p.sources })
+        Some(Frame { kind: h.kind, rendition: h.rendition, frame: h.frame, ts: h.ts, keyframe: h.keyframe(), data, sources: p.sources, raw: vec![] })
     }
 
     fn remember(&mut self, key: Key) {
@@ -614,6 +688,11 @@ impl Assembler {
         let before = self.pending.len();
         self.pending.retain(|_, p| now.saturating_duration_since(p.first_at) < FRAME_DEADLINE);
         self.stats.incomplete += (before - self.pending.len()) as u64;
+    }
+
+    /// Pedaços guardados de um quadro recém-fechado (com `keep_raw`).
+    pub fn raw_of(&self, kind: u8, rendition: u16, frame: u32) -> Option<&[(u64, Vec<u8>)]> {
+        self.done_raw.get(&(kind, rendition, frame)).map(|v| v.as_slice())
     }
 
     /// Blocos ainda abertos de um quadro pendente e quantos pedaços faltam (pelo menos) em
@@ -756,7 +835,7 @@ mod tests {
     }
 
     fn vf(n: u32, keyframe: bool) -> Frame {
-        Frame { kind: KIND_VIDEO, rendition: 0, frame: n, ts: n * 1500, keyframe, data: vec![n as u8], sources: vec![] }
+        Frame { kind: KIND_VIDEO, rendition: 0, frame: n, ts: n * 1500, keyframe, data: vec![n as u8], sources: vec![], raw: vec![] }
     }
 
     fn nums(v: &[Frame]) -> Vec<u32> {
@@ -967,7 +1046,7 @@ mod tests {
             .collect();
         assert!(run(&tampered, &mut a, &mut v, now).is_empty());
         assert_eq!(v.forged, 1);
-        assert_eq!(v.suspects, vec![0], "os pedaços vieram do host (fonte 0) neste teste");
+        assert!(v.suspects.is_empty(), "pedaços do host (fonte 0) nunca são suspeitos");
         // Assinado por outra chave (alguém se passando pelo host): não confere.
         let mut evil = PieceSource::new(0.25);
         evil.signer = Some(signing_key(9));
@@ -1005,6 +1084,44 @@ mod tests {
         assert!(got.is_some_and(|g| g.data == d));
         // Quadro que já saiu da memória: nada.
         assert!(src.more(0, h.frame + 1000, &ask).is_empty());
+    }
+
+    /// Um vizinho adultera os pedaços da faixa dele: o quadro é salvo sem eles e só ele
+    /// fica suspeito (os outros vizinhos, honestos, não).
+    #[test]
+    fn verifier_finds_the_neighbor_that_tampered_and_saves_the_frame() {
+        let sk = signing_key(3);
+        let mut src = PieceSource::new(0.25);
+        src.survive_lane = true;
+        src.signer = Some(sk.clone());
+        let mut v = Verifier::new(sk.verifying_key());
+        let mut a = Assembler::new();
+        a.keep_raw = true;
+        let now = Instant::now();
+        let d = data(20_000, 6);
+        let f = src.encode(0, &d, Duration::from_millis(16)).unwrap();
+        // Cada faixa chega de um vizinho (ids 11..14); o da faixa 1 adultera.
+        let mut out = vec![];
+        for p in &f.pieces {
+            let h = Header::read(p).unwrap();
+            let who = 11 + h.lane as u64;
+            if h.kind == KIND_SIG {
+                out.extend(v.on_sig(p, now));
+                continue;
+            }
+            let mut p = p.clone();
+            if h.lane == 1 {
+                p[HEADER] ^= 0x55;
+            }
+            if let Some(fr) = a.push_from(&p, now, who) {
+                out.extend(v.push(fr, now));
+            }
+            out.extend(v.retry(&a, now));
+        }
+        assert_eq!(out.len(), 1, "o quadro foi salvo");
+        assert!(out[0].data == d);
+        assert_eq!(v.suspects, vec![12], "só o vizinho da faixa 1");
+        assert_eq!(v.rescued, 1);
     }
 
     /// A assinatura pode chegar depois do quadro (por outro vizinho): ele espera um pouco.

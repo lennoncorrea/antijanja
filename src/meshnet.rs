@@ -162,11 +162,21 @@ pub struct ViewerMesh {
     to_host: Arc<OnceLock<Arc<dyn DataChannel>>>,
     /// Pedaços que chegam dos vizinhos vão para o mesmo receptor dos pedaços do host.
     pieces_tx: tokio::sync::mpsc::Sender<(u64, Vec<u8>)>,
+    /// Testes: este espectador adultera tudo o que repassa (um vizinho mal-intencionado).
+    #[cfg(test)]
+    pub tamper: std::sync::atomic::AtomicBool,
 }
 
 impl ViewerMesh {
     pub fn new(stun: bool, to_host: Arc<OnceLock<Arc<dyn DataChannel>>>, pieces_tx: tokio::sync::mpsc::Sender<(u64, Vec<u8>)>) -> Arc<Self> {
-        Arc::new(Self { stun, inner: Mutex::new(Inner::default()), to_host, pieces_tx })
+        Arc::new(Self {
+            stun,
+            inner: Mutex::new(Inner::default()),
+            to_host,
+            pieces_tx,
+            #[cfg(test)]
+            tamper: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     fn send_host(&self, msg: Value) {
@@ -352,6 +362,17 @@ impl ViewerMesh {
         if fed_now {
             dbg_mesh(&format!("recebendo a faixa {lane} de {src}"));
             self.send_host(json!({ "t": "mesh", "ev": "fed", "lane": lane, "from": src }));
+        }
+        #[cfg(test)]
+        if self.tamper.load(Ordering::Relaxed) && !targets.is_empty() {
+            let mut bad = piece.to_vec();
+            if bad.len() > crate::pieces::HEADER {
+                bad[crate::pieces::HEADER] ^= 0xff;
+            }
+            for t in targets {
+                t.send(&bad).await;
+            }
+            return;
         }
         for t in targets {
             t.send(piece).await;
@@ -615,6 +636,124 @@ mod tests {
         peer: Arc<HostPeer>,
         got: Arc<Mutex<Vec<u32>>>,
         corrupt: Arc<AtomicUsize>,
+    }
+
+    /// Host e `n` espectadores conectados de verdade (WebRTC na mesma máquina), com a chave
+    /// dos quadros entregue e todos na malha.
+    fn setup(n: u64, want_kf: Arc<AtomicBool>) -> (Arc<MeshHub>, Vec<(u64, Viewer)>, ed25519_dalek::SigningKey) {
+        let hub = MeshHub::new(crate::pieces::LANES as usize);
+        let mut viewers: Vec<(u64, Viewer)> = vec![];
+        for id in 1..=n {
+            let got = Arc::new(Mutex::new(Vec::new()));
+            let corrupt = Arc::new(AtomicUsize::new(0));
+            let (g, c) = (got.clone(), corrupt.clone());
+            let sinks = ViewerSinks {
+                on_video: Arc::new(move |d, _| match intact(&d) {
+                    Some(i) => g.lock().unwrap().push(i),
+                    None => {
+                        c.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+                on_audio: Arc::new(|_| {}),
+                on_state: Arc::new(|_| {}),
+                on_message: Arc::new(|_| {}),
+            };
+            let (session, offer) = block_on(ViewerSession::offer(sinks, false)).expect("oferta");
+            let (h, wk) = (hub.clone(), want_kf.clone());
+            let (ctx, crx) = std::sync::mpsc::channel();
+            let (peer, answer) = block_on(HostPeer::answer(
+                offer,
+                false,
+                Arc::new(move |e| {
+                    if e == crate::transport::PeerEvent::Connected {
+                        let _ = ctx.send(());
+                    }
+                }),
+                Arc::new(move |m| {
+                    if let Ok(v) = serde_json::from_str::<Value>(&m) {
+                        if v["t"] == "kf" {
+                            wk.store(true, Ordering::SeqCst);
+                        }
+                        h.on_message(id, &v);
+                    }
+                }),
+            ))
+            .expect("resposta");
+            block_on(session.accept_answer(answer)).unwrap();
+            crx.recv_timeout(Duration::from_secs(10)).expect("não conectou");
+            for _ in 0..100 {
+                if peer.has_pieces() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(peer.has_pieces());
+            viewers.push((id, Viewer { session, peer, got, corrupt }));
+        }
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let pk: String = signer.verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        for (_, v) in &viewers {
+            block_on(v.peer.send_message(&json!({ "t": "stream-key", "pk": pk }).to_string()));
+        }
+        for (id, v) in &viewers {
+            hub.join(*id, v.peer.clone());
+        }
+        (hub, viewers, signer)
+    }
+
+    /// Um espectador passa a adulterar tudo o que repassa. Ninguém pode receber quadro
+    /// adulterado; ele tem que ser descoberto e parar de repassar, e os outros se recuperam.
+    /// `cargo test mesh_evil_relay -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn mesh_evil_relay() {
+        let want_kf = Arc::new(AtomicBool::new(false));
+        let (hub, viewers, signer) = setup(5, want_kf.clone());
+        let mut source = crate::pieces::PieceSource::new(crate::transport::PIECE_OVERHEAD);
+        source.survive_lane = true;
+        source.signer = Some(signer);
+        let (secs, evil_at) = (14u32, 5u32);
+        let start = Instant::now();
+        let mut last_kf = Instant::now() - Duration::from_secs(5);
+        let evil = 2u64;
+        for idx in 0..60 * secs {
+            let at = start + Duration::from_micros(idx as u64 * 16_667);
+            if let Some(w) = at.checked_duration_since(Instant::now()) {
+                std::thread::sleep(w);
+            }
+            let mut key = idx % 60 == 0;
+            if want_kf.swap(false, Ordering::SeqCst) && last_kf.elapsed() >= Duration::from_secs(1) {
+                key = true;
+            }
+            if key {
+                last_kf = Instant::now();
+            }
+            let f = source.encode(0, &frame_kf(idx, key), Duration::from_micros(16_667)).unwrap();
+            for (_, v) in &viewers {
+                v.peer.send_pieces(&f);
+            }
+            if idx == 60 * evil_at {
+                viewers[(evil - 1) as usize].1.session.mesh.tamper.store(true, Ordering::SeqCst);
+            }
+            if idx % 30 == 0 {
+                hub.tick();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(600));
+        let snap = hub.snapshot();
+        let evil_children: usize = snap.iter().find(|x| x.0 == evil).and_then(|x| x.2.as_ref()).map(|r| r.children.iter().map(|c| c.len()).sum()).unwrap_or(0);
+        println!("filhos do adulterador no fim: {evil_children}");
+        let total = 60 * secs;
+        for (id, v) in &viewers {
+            let got = v.got.lock().unwrap();
+            let last3 = got.iter().filter(|&&i| i >= total - 180).count();
+            println!("espectador {id}: {} de {total} quadros, {} corrompidos entregues, últimos 3 s: {last3} de 180", got.len(), v.corrupt.load(Ordering::SeqCst));
+            assert_eq!(v.corrupt.load(Ordering::SeqCst), 0, "quadro adulterado chegou ao decoder");
+            if *id != evil {
+                assert!(last3 >= 170, "espectador {id} não se recuperou");
+            }
+        }
+        assert_eq!(evil_children, 0, "o adulterador devia ter parado de repassar");
     }
 
     /// Host e 4 espectadores na mesma máquina, malha ligada. Confere que todos recebem os

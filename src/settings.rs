@@ -25,6 +25,8 @@ pub struct Settings {
     pub view_fps: u32,
     /// Senha da transmissão (vazia = sem senha). Quem assiste precisa do código e dela.
     pub stream_password: String,
+    /// Malha P2P (experimental): quem assiste repassa partes do vídeo para os outros.
+    pub mesh: bool,
 }
 
 impl Default for Settings {
@@ -44,6 +46,7 @@ impl Default for Settings {
             view_volume: 100,
             view_fps: 0,
             stream_password: String::new(),
+            mesh: false,
         }
     }
 }

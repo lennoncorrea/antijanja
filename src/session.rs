@@ -47,6 +47,9 @@ pub struct HostConfig {
     /// Senha da transmissão (vazia = sem senha).
     #[serde(default)]
     pub password: String,
+    /// Malha P2P (experimental; docs/malha-p2p.md). Vale a partir do começo da transmissão.
+    #[serde(default)]
+    pub mesh: bool,
 }
 
 impl HostConfig {
@@ -476,9 +479,9 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
     let state = app.rdv();
     stop_host(&state);
     // Malha P2P (docs/malha-p2p.md): vídeo em pedaços pelo canal de dados, para quem tem
-    // esse canal (AJ_PIECES=1), e os espectadores repassando faixas entre si (AJ_MESH=1,
-    // que liga os pedaços também). Por enquanto só por variável de ambiente.
-    let mesh_on = std::env::var_os("AJ_MESH").is_some();
+    // esse canal (AJ_PIECES=1), e os espectadores repassando faixas entre si (opção
+    // "Malha P2P" ou AJ_MESH=1, que liga os pedaços também).
+    let mesh_on = config.mesh || std::env::var_os("AJ_MESH").is_some();
     // Chave desta transmissão para assinar os quadros (a do código muda se a senha mudar
     // ao vivo; esta vale do começo ao fim). A pública vai para cada espectador pela
     // conexão direta, ao conectar.

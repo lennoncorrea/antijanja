@@ -178,7 +178,27 @@ Plano original da etapa:
 - Teste com várias instâncias na mesma máquina (modo de autoteste com N espectadores):
   upload do host vs. número de espectadores, atraso por camada.
 
-### Etapa 3: detectar e reagir
+### Etapa 3: detectar e reagir — feita
+
+- Ligação ruim volta às rotas depois de 30 s (`BAD_FORGIVE`).
+- Repassador que falha para espectadores diferentes fica 60 s só recebendo; o mesmo
+  espectador reclamando várias vezes não rebaixa ninguém (é a conexão dele).
+- "Minha internet" vs. "vizinho": duas ou mais faixas de vizinhos diferentes parando
+  juntas = conexão do próprio espectador; a faixa volta do host sem culpar ninguém.
+- Reparo: quadro faltando, chegado em parte, pede ao host pedaços extras novos (o host
+  guarda os codificadores de ~1,5 s), com folga e até 3 tentativas. Com 15% de perda:
+  223/240 quadros (178 sem reparo).
+- Adulteração: quadro que não confere é remontado sem os pedaços de cada vizinho, um de
+  cada vez (o montador guarda os pedaços, inclusive os que chegam depois); o que conferir
+  aponta o culpado com certeza e salva o quadro. Sem conseguir em 200 ms, todos os
+  vizinhos que contribuíram ficam suspeitos. Adulterar pesa o dobro na nota.
+- Teste `mesh_evil_relay` (5 espectadores, um passa a adulterar tudo o que repassa):
+  nenhum quadro adulterado chega ao decoder, o adulterador termina sem filhos e os outros
+  voltam a 100% (numa rodada todos os quadros foram salvos; noutra perderam ~1 s).
+- Opção "Malha P2P (experimental)" nas configurações do host (vale no começo da
+  transmissão); `AJ_MESH=1` continua forçando.
+
+Plano original da etapa:
 
 - Medidas por vizinho e por faixa; "vizinho ruim" vs. "minha internet ruim".
 - Pedido de pedaços extras para quadro que não fechou.

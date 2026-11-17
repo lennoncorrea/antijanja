@@ -118,6 +118,14 @@ component SettingsCard inherits Card {
                 checked: App.s-cursor;
                 toggled(v) => { App.set-setting("cursor", v ? "1" : "0"); }
             }
+            ToggleRow {
+                title: "Malha P2P (experimental)";
+                body: App.live
+                    ? "Quem assiste repassa partes do vídeo para os outros e sua internet manda menos. Vale a partir da próxima transmissão."
+                    : "Quem assiste repassa partes do vídeo para os outros e sua internet manda menos. Os espectadores se conectam entre si.";
+                checked: App.s-mesh;
+                toggled(v) => { App.set-setting("mesh", v ? "1" : "0"); }
+            }
             // Senha: quem assiste precisa do código e dela (na lista pública aparece um cadeado).
             VerticalLayout {
                 spacing: 6px;

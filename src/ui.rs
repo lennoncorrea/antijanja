@@ -326,6 +326,7 @@ fn render_settings(c: &Ctl, ui: &AppWindow) {
     set_if_changed!(a, get_s_fps, set_s_fps, s(st.fps.to_string()));
     set_if_changed!(a, get_s_bitrate, set_s_bitrate, s(st.bitrate.to_string()));
     set_if_changed!(a, get_s_cursor, set_s_cursor, st.cursor);
+    set_if_changed!(a, get_s_mesh, set_s_mesh, st.mesh);
     set_if_changed!(a, get_s_audio_mode, set_s_audio_mode, s(if st.audio_mode.is_empty() { "system" } else { &st.audio_mode }));
     set_if_changed!(a, get_s_audio_app, set_s_audio_app, s(&st.audio_app));
     set_if_changed!(a, get_s_abitrate, set_s_abitrate, s(st.abitrate.to_string()));
@@ -840,6 +841,7 @@ fn host_config(c: &Ctl) -> Option<session::HostConfig> {
         public: c.s.public,
         title: src.name.clone(),
         password: c.s.stream_password.clone(),
+        mesh: c.s.mesh,
     })
 }
 
@@ -901,6 +903,7 @@ fn set_setting(c: &mut Ctl, ui: &AppWindow, key: &str, value: &str) {
         "abitrate" => c.s.abitrate = num().unwrap_or(c.s.abitrate),
         "volume" => c.s.volume = num().unwrap_or(c.s.volume),
         "cursor" => c.s.cursor = on,
+        "mesh" => c.s.mesh = on,
         "password" => {
             let new = value.trim().to_string();
             if new == c.s.stream_password {
