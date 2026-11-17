@@ -302,6 +302,13 @@ fn hwnd_of(ui: &AppWindow) -> Option<isize> {
     window_hwnd(ui.window())
 }
 
+/// Tamanho da área interna da janela, em pixels físicos.
+fn client_size(hwnd: isize) -> Option<(u32, u32)> {
+    let mut r = windows::Win32::Foundation::RECT::default();
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetClientRect(windows::Win32::Foundation::HWND(hwnd as *mut _), &mut r).ok()? };
+    (r.right > 0 && r.bottom > 0).then_some((r.right as u32, r.bottom as u32))
+}
+
 fn window_hwnd(window: &slint::Window) -> Option<isize> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let handle = window.window_handle();
@@ -545,8 +552,15 @@ fn trace() -> bool {
 fn relayout_inner(c: &Ctl, ui: &AppWindow) {
     let a = ui.global::<App>();
     let scale = ui.window().scale_factor();
-    let size = ui.window().size();
-    let (w, h) = (size.width as f32 / scale, size.height as f32 / scale);
+    // Tamanho da área interna direto do Windows: logo depois de a janela mudar (tela cheia,
+    // por exemplo) ele já está certo, enquanto o do Slint só muda quando o aviso de tamanho
+    // novo passa pelo laço de eventos. Com o do Slint, o primeiro quadro no tamanho novo
+    // saía com os vídeos ainda no lugar velho.
+    let size = hwnd_of(ui).and_then(client_size).unwrap_or_else(|| {
+        let s = ui.window().size();
+        (s.width, s.height)
+    });
+    let (w, h) = (size.0 as f32 / scale, size.1 as f32 / scale);
     let fs = c.fullscreen;
     let top = if fs { 0.0 } else { TOPBAR + ADDBAR };
     let pad = if fs { 0.0 } else { PAD };
@@ -563,6 +577,12 @@ fn relayout_inner(c: &Ctl, ui: &AppWindow) {
     let tile_h = (area_h - gap * (rows as f32 - 1.0)) / rows as f32;
     let players_visible = c.view == "watch" && c.picker.is_empty() && !c.updating && c.password_for.is_none();
 
+    // As janelas de vídeo mudam todas juntas no fim (ver `player::apply`).
+    crate::player::begin_batch();
+    // Streams escondidas (outra está ampliada): player fora da tela.
+    for v in c.viewers.iter().filter(|v| !shown.iter().any(|x| x.id == v.id)) {
+        session::player_rect(v.id.clone(), 0, 0, 1, 1, false, 0, false);
+    }
     let (controls_on, controls_alive) = controls_state(c, Instant::now());
     let ov = c.overlay.as_ref().map(|o| o.global::<Ov>());
     let px = |v: f32| (v * scale).round() as i32;
@@ -648,10 +668,7 @@ fn relayout_inner(c: &Ctl, ui: &AppWindow) {
             h: tile_h,
         });
     }
-    // Streams escondidas (outra está ampliada): player fora da tela.
-    for v in c.viewers.iter().filter(|v| !shown.iter().any(|x| x.id == v.id)) {
-        session::player_rect(v.id.clone(), 0, 0, 1, 1, false, 0, false);
-    }
+    crate::player::end_batch();
     let menu_id = s(if menu_tile { c.menu.clone().unwrap_or_default() } else { String::new() });
     set_if_changed!(a, get_menu_tile, set_menu_tile, menu_id.clone());
     if let Some(ov) = &ov {
@@ -805,8 +822,18 @@ fn set_fullscreen(c: &mut Ctl, ui: &AppWindow, on: bool) {
     if let Some((_, until)) = &mut c.hover {
         *until = Instant::now() + CONTROLS_TIME;
     }
-    ui.window().set_fullscreen(on);
+    // A interface já no modo novo (sem a barra de cima, por exemplo) antes de a janela
+    // mudar de tamanho, para o primeiro quadro no tamanho novo já sair certo.
     render_general(c, ui);
+    match hwnd_of(ui) {
+        Some(h) => {
+            crate::fullscreen::set(h, on);
+            if !on {
+                paint_titlebar(h, ui.global::<Theme>().get_dark());
+            }
+        }
+        None => ui.window().set_fullscreen(on),
+    }
     relayout(c, ui);
 }
 
@@ -1968,7 +1995,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
 /// da lista "Ao vivo") e grava o código em `AJ_CODE_FILE`. `AJ_AUTOTEST=watch`: assiste o
 /// código desse arquivo a `AJ_VIEW_FPS`; com `AJ_MENU_AFTER` (s), abre o menu de engrenagem;
 /// com `AJ_SHOW_CONTROLS`, deixa os controles por cima do vídeo à mostra; com
-/// `AJ_FULLSCREEN`, põe a stream em tela cheia; com `AJ_MENU_CLOSE_AFTER` (s), fecha o
+/// `AJ_FULLSCREEN`, põe a stream em tela cheia; com `AJ_WATCH_N`, assiste em vários tiles;
+/// com `AJ_FOCUS_TOGGLE`, amplia e reduz a primeira stream a cada 2 s (`fs`: tela cheia;
+/// `menu`: abre e fecha o menu de engrenagem); com `AJ_MENU_CLOSE_AFTER` (s), fecha o
 /// menu de novo.
 #[cfg(debug_assertions)]
 fn autotest() {
@@ -1992,7 +2021,13 @@ fn autotest() {
                     // Sem áudio: com várias instâncias na mesma máquina, o host captaria o som
                     // dos espectadores de teste (eco).
                     c.s.audio_mode = "none".into();
-                    let Some(src) = capture::list_sources().into_iter().find(|s| s.primary) else { return };
+                    // AJ_HOST_WINDOW: transmite a janela cujo título contém esse texto (em vez da
+                    // tela, que mostraria o próprio espectador em espelho infinito).
+                    let want = std::env::var("AJ_HOST_WINDOW").ok();
+                    let Some(src) = capture::list_sources().into_iter().find(|s| match &want {
+                        Some(w) => s.kind == "window" && s.name.contains(w.as_str()),
+                        None => s.primary,
+                    }) else { return };
                     start_sharing(c, ui, src, None);
                 } else if !c.code.is_empty() && std::fs::read_to_string(&code_file).ok().as_deref() != Some(c.code.as_str()) {
                     let _ = std::fs::write(&code_file, &c.code);
@@ -2005,7 +2040,38 @@ fn autotest() {
                     done = true;
                     c.s.view_fps = std::env::var("AJ_VIEW_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
                     eprintln!("[autotest] assistindo a {} fps (monitor {} Hz)", view_fps(c, ui), monitor_hz(ui));
-                    start_watching(c, ui, code.trim().to_string(), None);
+                    // AJ_WATCH_N: a mesma transmissão em vários tiles (grade).
+                    let n = std::env::var("AJ_WATCH_N").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 4);
+                    for _ in 0..n {
+                        start_watching(c, ui, code.trim().to_string(), None);
+                    }
+                }
+                // Amplia e reduz a primeira stream a cada 2 s, pelo mesmo caminho do botão.
+                // AJ_TOGGLE_AFTER (s): só começa depois desse tempo.
+                let after = std::env::var("AJ_TOGGLE_AFTER").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                if std::env::var_os("AJ_FOCUS_TOGGLE").is_some() && started.elapsed() >= Duration::from_secs(after) && c.viewers.iter().all(|v| v.watching) && !c.viewers.is_empty() {
+                    let tick = (started.elapsed().as_millis() / 2000) as u64;
+                    if tick != last_toggle {
+                        last_toggle = tick;
+                        let id = c.viewers[0].id.clone();
+                        match std::env::var("AJ_FOCUS_TOGGLE").as_deref() {
+                            // Tela cheia (botão de tela cheia), em vez de ampliar.
+                            Ok("fs") => {
+                                toggle_stream_fullscreen(c, ui, &id);
+                                eprintln!("[autotest] {:.0} ms: {}", tms(), if c.fullscreen { "ampliada (tela cheia)" } else { "grade" });
+                            }
+                            // Abre e fecha o menu de engrenagem.
+                            Ok("menu") => {
+                                toggle_menu(c, ui, &id);
+                                eprintln!("[autotest] {:.0} ms: {}", tms(), if c.menu.is_some() { "ampliada (menu)" } else { "grade" });
+                            }
+                            _ => {
+                                c.focus = if c.focus.is_some() { None } else { Some(id) };
+                                eprintln!("[autotest] {:.0} ms: {}", tms(), if c.focus.is_some() { "ampliada" } else { "grade" });
+                                relayout(c, ui);
+                            }
+                        }
+                    }
                 }
                 // Qualidade fixa (AJ_QUALITY=1080, por exemplo), sem a automática.
                 if let (Ok(q), false) = (std::env::var("AJ_QUALITY"), quality_set) {

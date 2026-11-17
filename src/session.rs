@@ -1399,8 +1399,7 @@ pub async fn viewer_leave(app: AppHandle, id: String) {
 pub fn player_rect(id: String, x: i32, y: i32, width: i32, height: i32, visible: bool, corners: i32, no_cursor: bool) {
     with_viewers(|m| {
         if let Some(p) = m.get(&id).and_then(|v| v.player.as_ref()) {
-            p.set_rect(x, y, width, height, visible);
-            p.set_corners(corners);
+            p.place(x, y, width, height, visible, corners);
             p.hide_cursor(no_cursor && visible);
         }
     });

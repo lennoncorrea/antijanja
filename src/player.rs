@@ -44,8 +44,122 @@ enum Msg {
     /// Geração de quadros: entre o quadro atual e `next`, mostra o quadro gerado na fração
     /// `t` em cada horário de `steps`; depois `next` em `next_at`.
     Interp { next: Nv12Frame, mid: Midpoint, steps: Vec<(Instant, f32)>, next_at: Instant },
-    Resize(u32, u32),
+    /// Novo tamanho; com `Handoff`, redesenha o quadro atual nesse tamanho e combina com
+    /// a thread principal o momento de mostrar (ver `apply`).
+    Resize(u32, u32, Option<Handoff>),
     Stop,
+}
+
+/// Quanto a thread principal e o player esperam um pelo outro numa troca de tamanho.
+const RESIZE_WAIT: Duration = Duration::from_millis(50);
+
+/// Mudança de uma janela de vídeo (posição, tamanho, visível e cantos).
+struct Change {
+    hwnd: isize,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    flags: SET_WINDOW_POS_FLAGS,
+    /// Raio novo dos cantos (a região é refeita no tamanho novo).
+    corners: Option<i32>,
+    /// (pronto, pode apresentar) da troca de tamanho combinada com o player.
+    handoff: Option<(std::sync::mpsc::Receiver<()>, SyncSender<()>)>,
+}
+
+thread_local! {
+    /// Mudanças guardadas entre `begin_batch` e `end_batch`.
+    static BATCH: std::cell::RefCell<Option<Vec<Change>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A partir daqui, `Player::place` guarda as mudanças em vez de aplicar; `end_batch`
+/// aplica todas de uma vez. Thread principal.
+pub fn begin_batch() {
+    BATCH.with(|b| *b.borrow_mut() = Some(Vec::new()));
+}
+
+/// Aplica de uma vez as mudanças guardadas desde `begin_batch`.
+pub fn end_batch() {
+    let list = BATCH.with(|b| b.borrow_mut().take()).unwrap_or_default();
+    apply(list);
+}
+
+fn queue(c: Change) {
+    let now = BATCH.with(|b| match b.borrow_mut().as_mut() {
+        Some(list) => {
+            list.push(c);
+            None
+        }
+        None => Some(c),
+    });
+    if let Some(c) = now {
+        apply(vec![c]);
+    }
+}
+
+/// Aplica as mudanças das janelas de vídeo todas juntas, para a tela não mostrar etapas
+/// intermediárias (uma janela já no lugar novo e outra ainda no velho):
+/// 1. cada player que muda de tamanho desenha o quadro atual no tamanho novo;
+/// 2. logo depois de uma atualização da tela, as janelas mudam de uma vez
+///    (`DeferWindowPos`) e os cantos são refeitos no tamanho novo;
+/// 3. os players apresentam os quadros novos.
+/// Mudando a janela antes de o quadro estar pronto, o Windows mostrava por um ou dois
+/// quadros a imagem antiga esticada; apresentando antes de mudar a janela (o present
+/// espera a atualização da tela), a nova achatada.
+fn apply(list: Vec<Change>) {
+    use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
+    if list.is_empty() {
+        return;
+    }
+    let mut waited = false;
+    for c in &list {
+        if let Some((ready, _)) = &c.handoff {
+            let _ = ready.recv_timeout(RESIZE_WAIT);
+            waited = true;
+        }
+    }
+    unsafe {
+        if waited {
+            let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+        }
+        let flags = |c: &Change| c.flags | SWP_NOACTIVATE;
+        let deferred = BeginDeferWindowPos(list.len() as i32).ok().and_then(|mut dwp| {
+            for c in &list {
+                dwp = DeferWindowPos(dwp, HWND(c.hwnd as *mut _), Some(HWND_TOP), c.x, c.y, c.w, c.h, flags(c)).ok()?;
+            }
+            EndDeferWindowPos(dwp).ok()
+        });
+        if deferred.is_none() {
+            for c in &list {
+                let _ = SetWindowPos(HWND(c.hwnd as *mut _), Some(HWND_TOP), c.x, c.y, c.w, c.h, flags(c));
+            }
+        }
+        for c in &list {
+            match c.corners {
+                Some(r) if r > 0 => {
+                    // A janela passa a ser dona da região (não apagar).
+                    let region = CreateRoundRectRgn(0, 0, c.w + 1, c.h + 1, r * 2, r * 2);
+                    SetWindowRgn(HWND(c.hwnd as *mut _), Some(region), true);
+                }
+                Some(_) => {
+                    SetWindowRgn(HWND(c.hwnd as *mut _), None, true);
+                }
+                None => {}
+            }
+        }
+    }
+    for c in list {
+        if let Some((_, go)) = c.handoff {
+            let _ = go.try_send(());
+        }
+    }
+}
+
+/// Troca de tamanho combinada: o player desenha no tamanho novo e avisa (`ready`); a
+/// thread principal muda a janela e avisa (`go`); só então o player apresenta o quadro.
+struct Handoff {
+    ready: SyncSender<()>,
+    go: std::sync::mpsc::Receiver<()>,
 }
 
 /// Player ativo. `push` pode ser chamado de qualquer thread.
@@ -139,6 +253,19 @@ impl Player {
 
     fn create_in(parent: isize) -> Res<Player> {
         let class = register_class();
+        // A janela principal desenha com OpenGL e, com WS_CLIPCHILDREN, não pinta a área
+        // coberta pelas janelas de vídeo: ali ficava o que havia antes de o vídeo aparecer
+        // (a tela de "Conectando...", por exemplo). Quando um vídeo mudava de tamanho ou
+        // sumia, esses pixels velhos (claros) apareciam por um ou dois quadros, também nos
+        // cantos arredondados. Sem o estilo, embaixo do vídeo fica sempre a tela atual (o
+        // fundo preto do tile); o vídeo continua por cima, composto à parte.
+        unsafe {
+            let parent = HWND(parent as *mut _);
+            let style = GetWindowLongPtrW(parent, GWL_STYLE);
+            if style & WS_CLIPCHILDREN.0 as isize != 0 {
+                SetWindowLongPtrW(parent, GWL_STYLE, style & !(WS_CLIPCHILDREN.0 as isize));
+            }
+        }
         let hwnd = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -164,29 +291,6 @@ impl Player {
         Ok(Player { hwnd: raw, tx, corners: std::cell::Cell::new(None), rect: std::cell::Cell::new(None) })
     }
 
-    /// Arredonda os cantos da janela do vídeo (raio em pixels físicos; 0 = cantos retos),
-    /// para acompanhar a borda arredondada do tile.
-    pub fn set_corners(&self, radius: i32) {
-        use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
-        unsafe {
-            let hwnd = HWND(self.hwnd as *mut _);
-            let mut r = windows::Win32::Foundation::RECT::default();
-            let _ = GetClientRect(hwnd, &mut r);
-            let key = Some((radius, (r.right, r.bottom)));
-            if self.corners.get() == key {
-                return;
-            }
-            self.corners.set(key);
-            if radius <= 0 {
-                SetWindowRgn(hwnd, None, true);
-            } else {
-                let region = CreateRoundRectRgn(0, 0, r.right + 1, r.bottom + 1, radius * 2, radius * 2);
-                // A janela passa a ser dona da região (não apagar).
-                SetWindowRgn(hwnd, Some(region), true);
-            }
-        }
-    }
-
     /// Esconde o cursor sobre o vídeo (controles sumiram com o mouse parado). Thread
     /// principal (a mesma da janela, para o `SetCursor` valer na hora).
     pub fn hide_cursor(&self, hide: bool) {
@@ -209,22 +313,48 @@ impl Player {
         }
     }
 
-    /// Posiciona a área de vídeo (pixels físicos, relativos à janela). Thread principal.
-    pub fn set_rect(&self, x: i32, y: i32, w: i32, h: i32, visible: bool) {
-        if self.rect.get() == Some((x, y, w, h, visible)) {
+    /// Posiciona a área de vídeo (pixels físicos, relativos à janela) e arredonda os
+    /// cantos (`corners`: raio em pixels físicos; 0 = retos). Thread principal.
+    ///
+    /// Dentro de `begin_batch`/`end_batch`, a mudança é aplicada junto com a dos outros
+    /// players. Visível e com tamanho novo, o player desenha o quadro atual no tamanho novo
+    /// antes de a janela mudar (ver `apply`).
+    pub fn place(&self, x: i32, y: i32, w: i32, h: i32, visible: bool, corners: i32) {
+        let (w, h) = (w.max(1), h.max(1));
+        let old = self.rect.get();
+        let moved = old != Some((x, y, w, h, visible));
+        let corners_key = Some((corners, (w, h)));
+        let reshaped = self.corners.get() != corners_key;
+        if !moved && !reshaped {
             return;
         }
         self.rect.set(Some((x, y, w, h, visible)));
-        unsafe {
-            let hwnd = HWND(self.hwnd as *mut _);
-            let _ = SetWindowPos(
-                hwnd,
-                Some(HWND_TOP),
-                x, y, w.max(1), h.max(1),
-                if visible { SWP_SHOWWINDOW | SWP_NOACTIVATE } else { SWP_HIDEWINDOW | SWP_NOACTIVATE },
-            );
+        self.corners.set(corners_key);
+        let resized = old.is_none_or(|(_, _, ow, oh, _)| ow != w || oh != h);
+        let was_visible = old.is_some_and(|o| o.4);
+        let mut handoff = None;
+        if moved {
+            if visible && was_visible && resized {
+                let (ready_tx, ready_rx) = sync_channel::<()>(1);
+                let (go_tx, go_rx) = sync_channel::<()>(1);
+                // `send` (e não `try_send`): o redimensionamento não pode se perder.
+                if self.tx.send(Msg::Resize(w as u32, h as u32, Some(Handoff { ready: ready_tx, go: go_rx }))).is_ok() {
+                    handoff = Some((ready_rx, go_tx));
+                }
+            } else {
+                // Aparecendo ou escondendo: não dá para desenhar antes (numa janela escondida
+                // o desenho trava); desenha logo depois de aparecer.
+                let _ = self.tx.try_send(Msg::Resize(w as u32, h as u32, None));
+            }
         }
-        let _ = self.tx.try_send(Msg::Resize(w.max(1) as u32, h.max(1) as u32));
+        let flags = if !moved {
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+        } else if visible {
+            SWP_SHOWWINDOW
+        } else {
+            SWP_HIDEWINDOW
+        };
+        queue(Change { hwnd: self.hwnd, x, y, w, h, flags, corners: reshaped.then_some(corners), handoff });
     }
 
     /// Entrega um quadro novo (se o player estiver atrasado, o quadro anterior é descartado).
@@ -503,6 +633,11 @@ impl Gpu {
 
     /// Desenha o quadro atual, ou (`t`) o gerado na fração `t` entre o atual e o outro.
     fn render(&mut self, t: Option<f32>) {
+        self.render_then(t, || {});
+    }
+
+    /// `render`, chamando `before_present` com o quadro pronto, logo antes de apresentar.
+    fn render_then(&mut self, t: Option<f32>, before_present: impl FnOnce()) {
         #[cfg(test)]
         let waited = Instant::now();
         let frame = match self.surface.get_current_texture() {
@@ -555,6 +690,7 @@ impl Gpu {
         #[cfg(test)]
         let waited = waited.elapsed();
         self.queue.submit([enc.finish()]);
+        before_present();
         self.queue.present(frame);
         #[cfg(test)]
         TRACE.lock().unwrap().push((Instant::now(), t.is_some(), waited));
@@ -599,9 +735,17 @@ fn render_thread(hwnd: isize, rx: Receiver<Msg>, ready: SyncSender<Res<()>>) {
         for m in msg.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             match m {
                 Msg::Stop => return,
-                Msg::Resize(w, h) => {
+                Msg::Resize(w, h, handoff) => {
                     gpu.resize(w, h);
-                    redraw = true;
+                    match handoff {
+                        // Redesenha já o quadro atual no tamanho novo; apresenta depois de a
+                        // janela mudar.
+                        Some(hf) => gpu.render_then(None, || {
+                            let _ = hf.ready.try_send(());
+                            let _ = hf.go.recv_timeout(RESIZE_WAIT);
+                        }),
+                        None => redraw = true,
+                    }
                 }
                 Msg::Frame(f) => agenda.push(Entry::Frame(f)),
                 Msg::Interp { next, mid, steps, next_at } => agenda.push(Entry::Pair { next, mid, steps, next_at }),
@@ -674,7 +818,7 @@ mod tests {
         };
         pump(100);
         let player = Player::create_in(parent.0 as isize).expect("player");
-        player.set_rect(0, 0, 960, 540, true);
+        player.place(0, 0, 960, 540, true, 0);
         let feed = player.feed();
         let view_fps = Arc::new(AtomicU32::new(0));
         let stop = Arc::new(AtomicBool::new(false));
@@ -767,7 +911,7 @@ mod tests {
         };
         pump(100);
         let player = Player::create_in(parent.0 as isize).expect("player");
-        player.set_rect(0, 0, 640, 360, true);
+        player.place(0, 0, 640, 360, true, 0);
         // Quadro NV12 vermelho puro (BT.709 limitado: Y=63, U=102, V=240).
         let (w, h) = (320u32, 180u32);
         let mut data = vec![63u8; (w * h) as usize];
@@ -785,14 +929,14 @@ mod tests {
         assert!(p.0[0] > 180 && p.0[1] < 80 && p.0[2] < 80, "esperava vermelho, veio {:?}", p.0);
 
         // Cantos arredondados: no canto aparece a janela de trás, no meio continua o vídeo.
-        player.set_corners(24);
+        player.place(0, 0, 640, 360, true, 24);
         pump(200);
         let corner = mon.capture_region((100 + 1 - mx) as u32, (100 + 1 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
         let middle = mon.capture_region((420 - mx) as u32, (280 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
         println!("com cantos: canto {corner:?}, meio {middle:?}");
         assert!(!(corner[0] > 180 && corner[1] < 80), "o canto devia mostrar a janela de trás: {corner:?}");
         assert!(middle[0] > 180 && middle[1] < 80, "o meio continua o vídeo: {middle:?}");
-        player.set_corners(0);
+        player.place(0, 0, 640, 360, true, 0);
         pump(200);
         let back = mon.capture_region((100 + 1 - mx) as u32, (100 + 1 - my) as u32, 1, 1).unwrap().get_pixel(0, 0).0;
         assert!(back[0] > 180 && back[1] < 80, "sem cantos, o vídeo volta até a ponta: {back:?}");

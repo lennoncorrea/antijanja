@@ -18,6 +18,7 @@ mod audio;
 mod avsync;
 mod capture;
 mod framegen;
+mod fullscreen;
 mod congestion;
 mod connlog;
 mod gpu;
