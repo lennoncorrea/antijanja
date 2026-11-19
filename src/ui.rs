@@ -5,7 +5,7 @@
 //! próprias e posiciona os players nativos sobre os tiles da tela "Assistindo".
 
 use crate::app::AppHandle;
-use crate::{audio, capture, overlay, rendezvous, session, settings, transport, updater};
+use crate::{audio, capture, friends, identity, overlay, rendezvous, session, settings, transport, updater};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::Value;
 use slint::{ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
@@ -49,6 +49,8 @@ struct Viewer {
     id: String,
     code: String,
     host_name: String,
+    /// Código de amigo do host (veio na resposta dele).
+    host_friend: String,
     step: i32,
     /// O host respondeu que está ocupado com outras entradas (o pedido é repetido sozinho).
     busy: bool,
@@ -151,6 +153,24 @@ struct Ctl {
     push_pending: bool,
     /// Altura de cada painel do menu de engrenagem, medida pelo Slint.
     menu_heights: HashMap<String, f32>,
+    /// Amizades (docs/amizades.md): o que o motor mostrou por último.
+    friends: friends::View,
+    show_offline: bool,
+    account_open: bool,
+    account_restore: bool,
+    account_error: String,
+    phrase: Vec<String>,
+    /// Convite recebido: (nome do amigo, código, título).
+    invite: Option<(String, String, String)>,
+    /// Quando a transmissão atual começou (para os amigos).
+    live_since: Option<i64>,
+    /// Vincular aparelhos: "" | "join" (este esperando) | "add" (principal digitando).
+    link_mode: String,
+    link_offer: Option<friends::LinkOffer>,
+    link_busy: bool,
+    link_error: String,
+    /// Última lista de quem assiste (do motor), para redesenhar os botões "Adicionar".
+    host_peers: Vec<Value>,
 }
 
 thread_local! {
@@ -397,7 +417,7 @@ fn render_public(c: &Ctl, ui: &AppWindow) {
             Some(n) => format!("há {n} s"),
         }
     }));
-    let list = c.public.as_deref().unwrap_or(&[]);
+    let (list, friend_codes) = with_friend_lives(c);
     let others: Vec<&rendezvous::PublicStream> = list.iter().filter(|p| !p.own).collect();
     set_if_changed!(a, get_public_mine, set_public_mine, list.iter().any(|p| p.own));
     set_if_changed!(a, get_public_count, set_public_count, others.len() as i32);
@@ -416,6 +436,8 @@ fn render_public(c: &Ctl, ui: &AppWindow) {
             watching: c.viewers.iter().any(|v| v.code == e.code),
             blank: false,
             locked: e.locked,
+            friend: friend_codes.contains_key(&e.code),
+            friends_only: friend_codes.get(&e.code).copied().unwrap_or(false),
         }
     };
     set_if_changed!(a, get_has_featured, set_has_featured, !others.is_empty());
@@ -437,6 +459,217 @@ fn render_public(c: &Ctl, ui: &AppWindow) {
     sync_rows(a.get_rows(), rows, |r| r.items.clone(), |items| StreamRow { items }, |m| a.set_rows(m));
 }
 
+/// A lista do "Ao vivo agora" com as transmissões dos amigos (as só para amigos também),
+/// amigos primeiro. Devolve também os códigos dos amigos (`true` = só para amigos).
+fn with_friend_lives(c: &Ctl) -> (Vec<rendezvous::PublicStream>, HashMap<String, bool>) {
+    let mut list = c.public.clone().unwrap_or_default();
+    let mut codes = HashMap::new();
+    for f in &c.friends.friends {
+        let Some(l) = &f.live else { continue };
+        if l.code.is_empty() || rendezvous::check_code(&l.code).is_err() {
+            continue;
+        }
+        codes.insert(l.code.clone(), !l.public);
+        if !list.iter().any(|p| p.entry.code == l.code) {
+            list.push(rendezvous::PublicStream {
+                entry: rendezvous::PublicEntry {
+                    id: String::new(),
+                    name: f.name.clone(),
+                    title: l.title.clone(),
+                    code: l.code.clone(),
+                    viewers: 0,
+                    quality: String::new(),
+                    since: l.since,
+                    ts: rendezvous::now_ms(),
+                    gone: false,
+                    locked: l.locked,
+                },
+                own: false,
+            });
+        }
+    }
+    list.sort_by_key(|p| !codes.contains_key(&p.entry.code));
+    (list, codes)
+}
+
+fn ago(ms: i64) -> String {
+    if ms <= 0 {
+        return "offline".into();
+    }
+    let min = ((rendezvous::now_ms() - ms) / 60_000).max(0);
+    match min {
+        0..=1 => "visto agora há pouco".into(),
+        2..=59 => format!("visto há {min} min"),
+        60..=1439 => format!("visto há {} h", min / 60),
+        1440..=2879 => "visto ontem".into(),
+        _ => format!("visto há {} dias", min / 1440),
+    }
+}
+
+fn render_friends(c: &Ctl, ui: &AppWindow) {
+    let a = ui.global::<App>();
+    let v = &c.friends;
+    set_if_changed!(a, get_my_friend_code, set_my_friend_code, s(&v.code));
+    set_if_changed!(a, get_my_fingerprint, set_my_fingerprint, s(&v.fingerprint));
+    set_if_changed!(a, get_my_initials, set_my_initials, s(initials(&my_name(c))));
+    set_if_changed!(a, get_account_primary, set_account_primary, v.primary);
+    set_if_changed!(a, get_account_device, set_account_device, s(&v.device_name));
+    set_if_changed!(a, get_account_open, set_account_open, c.account_open);
+    set_if_changed!(a, get_account_restore, set_account_restore, c.account_restore);
+    set_if_changed!(a, get_account_error, set_account_error, s(&c.account_error));
+    sync(a.get_my_glyphs(), v.shapes.iter().map(|(sh, co)| Glyph { shape: *sh as i32, color: *co as i32 }).collect(), |m| a.set_my_glyphs(m));
+    sync(a.get_account_phrase(), c.phrase.iter().map(s).collect(), |m| a.set_account_phrase(m));
+
+    let req = |r: &friends::RequestView, detail: String| RequestItem {
+        key: s(&r.key),
+        name: s(if r.name.is_empty() { "Procurando…" } else { &r.name }),
+        initials: s(initials(if r.name.is_empty() { "?" } else { &r.name })),
+        cover: cover_index(&r.key),
+        detail: s(detail),
+    };
+    sync(a.get_friend_requests(), v.incoming.iter().map(|r| req(r, format!("pediu amizade · {}", r.fingerprint))).collect(), |m| a.set_friend_requests(m));
+    sync(a.get_friend_sent(), v.outgoing.iter().map(|r| req(r, "aguardando resposta".into())).collect(), |m| a.set_friend_sent(m));
+
+    let watching = |code: &str| c.viewers.iter().any(|x| x.code == code);
+    let item = |f: &friends::FriendView| {
+        let (detail, action, code) = if let Some(l) = &f.live {
+            let title = if l.title.is_empty() { "Tela".to_string() } else { l.title.clone() };
+            (format!("ao vivo · {title}"), if watching(&l.code) { "" } else { "Assistir" }, l.code.clone())
+        } else if let Some(w) = f.watch.as_ref().filter(|_| f.online) {
+            let go = !w.code.is_empty() && !watching(&w.code);
+            (format!("vendo {}", w.name), if go { "Ir junto" } else { "" }, w.code.clone())
+        } else if f.online {
+            ("online".to_string(), if c.live { "Convidar" } else { "" }, String::new())
+        } else {
+            (ago(f.seen), "", String::new())
+        };
+        FriendItem {
+            key: s(&f.key),
+            name: s(&f.name),
+            initials: s(initials(&f.name)),
+            cover: cover_index(&f.key),
+            detail: s(detail),
+            online: f.online,
+            live: f.live.is_some(),
+            action: s(action),
+            code: s(code),
+        }
+    };
+    let online: Vec<FriendItem> = v.friends.iter().filter(|f| f.online).map(item).collect();
+    let offline: Vec<FriendItem> = v.friends.iter().filter(|f| !f.online).map(item).collect();
+    set_if_changed!(a, get_friends_count, set_friends_count, v.friends.len() as i32);
+    set_if_changed!(a, get_friends_offline_count, set_friends_offline_count, offline.len() as i32);
+    set_if_changed!(a, get_friends_show_offline, set_friends_show_offline, c.show_offline);
+    sync(a.get_friends_online(), online, |m| a.set_friends_online(m));
+    sync(a.get_friends_offline(), if c.show_offline { offline } else { Vec::new() }, |m| a.set_friends_offline(m));
+
+    let glyphs = |f: &[(u8, u8)]| f.iter().map(|(sh, co)| Glyph { shape: *sh as i32, color: *co as i32 }).collect::<Vec<_>>();
+    sync(a.get_account_devices(), v.devices.iter().map(|d| DeviceItem { dev: s(&d.dev), name: s(&d.name), current: d.current }).collect(), |m| a.set_account_devices(m));
+    set_if_changed!(a, get_link_mode, set_link_mode, s(&c.link_mode));
+    set_if_changed!(a, get_link_busy, set_link_busy, c.link_busy);
+    let wait = v.link.as_ref();
+    set_if_changed!(a, get_link_code, set_link_code, s(wait.map(|l| format!("{} {}", &l.code[..3], &l.code[3..])).unwrap_or_default()));
+    sync(a.get_link_glyphs(), wait.map(|l| glyphs(&l.figure)).unwrap_or_default(), |m| a.set_link_glyphs(m));
+    let error = if c.link_mode == "join" { wait.map(|l| l.error.clone()).unwrap_or_default() } else { c.link_error.clone() };
+    set_if_changed!(a, get_link_error, set_link_error, s(error));
+    set_if_changed!(a, get_link_offer_name, set_link_offer_name, s(c.link_offer.as_ref().map(|o| o.name.clone()).unwrap_or_default()));
+    sync(a.get_link_offer_glyphs(), c.link_offer.as_ref().map(|o| glyphs(&o.figure)).unwrap_or_default(), |m| a.set_link_offer_glyphs(m));
+
+    let (name, code, title) = c.invite.clone().unwrap_or_default();
+    set_if_changed!(a, get_invite_name, set_invite_name, s(name));
+    set_if_changed!(a, get_invite_title, set_invite_title, s(title));
+    set_if_changed!(a, get_invite_code, set_invite_code, s(code));
+}
+
+/// Lê de novo o estado das amizades e redesenha.
+fn refresh_friends(c: &mut Ctl, ui: &AppWindow) {
+    let Some(f) = friends::get() else { return };
+    let v = f.view();
+    if v != c.friends {
+        render_watching_list(c, ui);
+        render_host_peers(c, ui);
+        if c.link_mode == "join" && v.link.is_none() && v.code != c.friends.code {
+            c.link_mode.clear();
+            c.account_open = false;
+            toast(c, ui, "ok", "Pronto: este PC foi vinculado à sua conta.");
+        }
+        c.friends = v;
+        render_friends(c, ui);
+        render_public(c, ui);
+    }
+}
+
+/// Conta aos amigos a minha live e o que estou assistindo (o motor só publica mudanças).
+fn sync_presence(c: &mut Ctl) {
+    let Some(f) = friends::get() else { return };
+    if c.live && !c.code.is_empty() {
+        let since = *c.live_since.get_or_insert_with(rendezvous::now_ms);
+        f.set_live(Some(friends::Live {
+            code: c.code.clone(),
+            title: c.source.as_ref().map(|s| s.name.clone()).unwrap_or_default(),
+            since,
+            public: c.s.public,
+            locked: rendezvous::check_code(&c.code).unwrap_or(false),
+        }));
+    } else {
+        c.live_since = None;
+        f.set_live(None);
+    }
+    // O código só vai quando a transmissão é pública (quem transmite escolheu mostrar).
+    let public: Vec<&str> = c.public.as_deref().unwrap_or(&[]).iter().filter(|p| !p.own).map(|p| p.entry.code.as_str()).collect();
+    let watch = c.viewers.iter().find(|v| v.watching && !v.host_name.is_empty()).map(|v| friends::Watch {
+        name: v.host_name.clone(),
+        code: if public.contains(&v.code.as_str()) { v.code.clone() } else { String::new() },
+    });
+    f.set_watch(watch);
+}
+
+/// Quem assiste a minha transmissão (com o botão "Adicionar" de cada um).
+fn render_host_peers(c: &Ctl, ui: &AppWindow) {
+    let a = ui.global::<App>();
+    let peers: Vec<Peer> = c
+        .host_peers
+        .iter()
+        .map(|p| {
+            let name = p["name"].as_str().unwrap_or("Espectador");
+            let state = p["state"].as_str().unwrap_or("");
+            let friend = p["friend"].as_str().unwrap_or_default();
+            Peer {
+                id: p["id"].as_i64().unwrap_or(0) as i32,
+                name: s(name),
+                initials: s(initials(name)),
+                state_text: s(match state {
+                    "connected" => "Assistindo agora",
+                    "unstable" => "Conexão instável",
+                    _ => "Entrando",
+                }),
+                connected: state == "connected",
+                friend: s(friend),
+                friend_action: s(friend_action(friend)),
+            }
+        })
+        .collect();
+    sync(a.get_peers(), peers, |m| a.set_peers(m));
+}
+
+/// Botão para quem está na mesma live: "Adicionar" se ainda não há nada entre nós.
+fn friend_action(code: &str) -> &'static str {
+    match friends::get().map(|f| f.relation(code)) {
+        Some("") if !code.is_empty() => "Adicionar",
+        Some("incoming") => "Aceitar",
+        _ => "",
+    }
+}
+
+fn add_friend(c: &mut Ctl, ui: &AppWindow, code: &str) {
+    let Some(f) = friends::get() else { return };
+    match f.add(code) {
+        Ok(()) => toast(c, ui, "ok", "Pedido de amizade enviado. Ele aparece para a pessoa em até 2 minutos."),
+        Err(e) => toast(c, ui, "err", e),
+    }
+    refresh_friends(c, ui);
+}
+
 fn render_watching_list(c: &Ctl, ui: &AppWindow) {
     const STEP_TEXT: [&str; 4] = ["Preparando", "Procurando o host", "Esperando o host", "Conectando"];
     let items: Vec<WatchingItem> = c
@@ -455,6 +688,8 @@ fn render_watching_list(c: &Ctl, ui: &AppWindow) {
                 initials: s(initials(if v.host_name.is_empty() { "?" } else { &v.host_name })),
                 cover: cover_index(who),
                 detail: s(detail),
+                friend: s(&v.host_friend),
+                friend_action: s(friend_action(&v.host_friend)),
             }
         })
         .collect();
@@ -807,6 +1042,7 @@ fn render_all(c: &mut Ctl, ui: &AppWindow) {
     render_picker(c, ui);
     render_host_code(c, ui);
     render_toasts(c, ui);
+    render_friends(c, ui);
     relayout(c, ui);
 }
 
@@ -1217,6 +1453,9 @@ fn join_with_code(c: &mut Ctl, ui: &AppWindow, raw: &str) {
     if code.is_empty() {
         return toast(c, ui, "err", "Cole o código da transmissão primeiro.");
     }
+    if code.starts_with(identity::FRIEND_PREFIX) {
+        return add_friend(c, ui, &code);
+    }
     let locked = match rendezvous::check_code(&code) {
         Ok(l) => l,
         Err(e) => return toast(c, ui, "err", e),
@@ -1258,6 +1497,7 @@ fn start_watching(c: &mut Ctl, ui: &AppWindow, code: String, password: Option<St
         id: id.clone(),
         code: code.clone(),
         host_name: String::new(),
+        host_friend: String::new(),
         step: 0,
         busy: false,
         watching: false,
@@ -1283,9 +1523,10 @@ fn start_watching(c: &mut Ctl, ui: &AppWindow, code: String, password: Option<St
         let r = session::viewer_join(app, id.clone(), code, password, name, volume, view_fps).await;
         let _ = slint::invoke_from_event_loop(move || {
             with(|c, ui| match r {
-                Ok(host) => {
+                Ok((host, friend)) => {
                     if let Some(v) = c.viewers.iter_mut().find(|v| v.id == id) {
                         v.host_name = host;
+                        v.host_friend = friend;
                     }
                     render_watching_list(c, ui);
                     relayout(c, ui);
@@ -1389,6 +1630,16 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
     let a = ui.global::<App>();
     let id_of = |v: &Value| v["id"].as_str().unwrap_or_default().to_string();
     match name {
+        "friends-changed" => refresh_friends(c, ui),
+        "friend-invite" => {
+            let code = v["code"].as_str().unwrap_or_default().to_string();
+            if code.is_empty() || c.viewers.iter().any(|x| x.code == code) {
+                return;
+            }
+            let name = v["name"].as_str().unwrap_or("Um amigo").to_string();
+            c.invite = Some((name, code, v["title"].as_str().unwrap_or_default().to_string()));
+            render_friends(c, ui);
+        }
         // Anúncio do "Ao vivo agora" pela fofoca: entra na lista na hora.
         "public-entry" => {
             let Ok(e) = serde_json::from_value::<rendezvous::PublicEntry>(v) else { return };
@@ -1408,27 +1659,9 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
             refresh_public(c, ui);
         }
         "host-peers" => {
-            let list = v.as_array().cloned().unwrap_or_default();
-            c.host_viewers = list.iter().filter(|p| p["state"] != "connecting").count() as u32;
-            let peers: Vec<Peer> = list
-                .iter()
-                .map(|p| {
-                    let name = p["name"].as_str().unwrap_or("Espectador");
-                    let state = p["state"].as_str().unwrap_or("");
-                    Peer {
-                        id: p["id"].as_i64().unwrap_or(0) as i32,
-                        name: s(name),
-                        initials: s(initials(name)),
-                        state_text: s(match state {
-                            "connected" => "Assistindo agora",
-                            "unstable" => "Conexão instável",
-                            _ => "Entrando",
-                        }),
-                        connected: state == "connected",
-                    }
-                })
-                .collect();
-            sync(a.get_peers(), peers, |m| a.set_peers(m));
+            c.host_peers = v.as_array().cloned().unwrap_or_default();
+            c.host_viewers = c.host_peers.iter().filter(|p| p["state"] != "connecting").count() as u32;
+            render_host_peers(c, ui);
             render_general(c, ui);
         }
         "host-mesh" => {
@@ -1609,11 +1842,17 @@ fn wire(ui: &AppWindow) {
         })
     });
     a.on_name_edited(|name| {
-        later(move |c, _| {
+        later(move |c, ui| {
             c.s.name = name.to_string();
             settings::save(&c.s);
+            if let Some(f) = friends::get() {
+                f.set_name(&my_name(c));
+            }
+            render_friends(c, ui);
         })
     });
+    wire_friends(ui);
+    wire_link(ui);
     a.on_layout_changed(|| later(|c, ui| relayout(c, ui)));
     a.on_key_f11(|| later(|c, ui| set_fullscreen(c, ui, !c.fullscreen)));
     a.on_key_escape(|| {
@@ -1707,6 +1946,237 @@ fn wire(ui: &AppWindow) {
 }
 
 /// Botões dos controles por cima do vídeo (janela própria, global `Ov`).
+fn wire_friends(ui: &AppWindow) {
+    let a = ui.global::<App>();
+    a.on_friend_accept(|key| {
+        later(move |c, ui| {
+            if let Some(f) = friends::get() {
+                match f.accept(&key) {
+                    Ok(()) => toast(c, ui, "ok", "Agora vocês são amigos."),
+                    Err(e) => toast(c, ui, "err", e),
+                }
+            }
+            refresh_friends(c, ui);
+        })
+    });
+    a.on_friend_decline(|key| {
+        later(move |c, ui| {
+            if let Some(f) = friends::get() {
+                f.decline(&key);
+            }
+            refresh_friends(c, ui);
+        })
+    });
+    a.on_friend_remove(|key| {
+        later(move |c, ui| {
+            if let Some(f) = friends::get() {
+                f.remove(&key);
+            }
+            refresh_friends(c, ui);
+        })
+    });
+    a.on_friend_action(|key, action| {
+        later(move |c, ui| {
+            let Some(fv) = c.friends.friends.iter().find(|f| f.key == key.as_str()).cloned() else { return };
+            match action.as_str() {
+                "Convidar" => {
+                    if let Some(f) = friends::get() {
+                        match f.invite(&key) {
+                            Ok(()) => toast(c, ui, "ok", format!("Convite enviado para {}.", fv.name)),
+                            Err(e) => toast(c, ui, "err", e),
+                        }
+                    }
+                }
+                _ => {
+                    let code = fv.live.map(|l| l.code).or(fv.watch.map(|w| w.code)).unwrap_or_default();
+                    if !code.is_empty() {
+                        join_with_code(c, ui, &code);
+                    }
+                }
+            }
+        })
+    });
+    a.on_add_friend_code(|code| {
+        later(move |c, ui| {
+            add_friend(c, ui, &code);
+            render_watching_list(c, ui);
+            render_host_peers(c, ui);
+        })
+    });
+    a.on_toggle_offline(|| {
+        later(|c, ui| {
+            c.show_offline = !c.show_offline;
+            render_friends(c, ui);
+        })
+    });
+    a.on_invite_accept(|| {
+        later(|c, ui| {
+            if let Some((_, code, _)) = c.invite.take() {
+                render_friends(c, ui);
+                join_with_code(c, ui, &code);
+            }
+        })
+    });
+    a.on_invite_dismiss(|| {
+        later(|c, ui| {
+            c.invite = None;
+            render_friends(c, ui);
+        })
+    });
+    a.on_open_account(|| {
+        later(|c, ui| {
+            c.account_open = true;
+            refresh_friends(c, ui);
+            render_friends(c, ui);
+        })
+    });
+    a.on_close_account(|| {
+        later(|c, ui| {
+            reset_link(c);
+            c.account_open = false;
+            c.account_restore = false;
+            c.account_error.clear();
+            c.phrase.clear();
+            render_friends(c, ui);
+        })
+    });
+    a.on_copy_friend_code(|| {
+        later(|c, ui| {
+            if clipboard_set(&c.friends.code) {
+                toast(c, ui, "ok", "Código de amigo copiado. Mande para quem você quer adicionar.");
+            } else {
+                toast(c, ui, "err", "Não deu para copiar o código.");
+            }
+        })
+    });
+    a.on_show_phrase(|show| {
+        later(move |c, ui| {
+            c.phrase = if show { friends::get().and_then(|f| f.phrase()).map(|p| p.split_whitespace().map(String::from).collect()).unwrap_or_default() } else { Vec::new() };
+            render_friends(c, ui);
+        })
+    });
+    a.on_restore_mode(|on| {
+        later(move |c, ui| {
+            reset_link(c);
+            c.account_restore = on;
+            c.account_error.clear();
+            render_friends(c, ui);
+        })
+    });
+    a.on_restore_account(|phrase| {
+        later(move |c, ui| match identity::Identity::restore(&phrase, &identity::default_device_name()) {
+            Ok(id) => {
+                if let Some(f) = friends::get() {
+                    if let Err(e) = f.switch_account(id) {
+                        c.account_error = e;
+                        return render_friends(c, ui);
+                    }
+                }
+                c.account_restore = false;
+                c.account_open = false;
+                c.account_error.clear();
+                c.phrase.clear();
+                refresh_friends(c, ui);
+                render_friends(c, ui);
+                toast(c, ui, "ok", "Pronto: este PC agora usa a outra conta.");
+            }
+            Err(e) => {
+                c.account_error = e;
+                render_friends(c, ui);
+            }
+        })
+    });
+}
+
+fn reset_link(c: &mut Ctl) {
+    if c.link_mode == "join" {
+        if let Some(f) = friends::get() {
+            f.link_cancel();
+        }
+    }
+    c.link_mode.clear();
+    c.link_offer = None;
+    c.link_busy = false;
+    c.link_error.clear();
+}
+
+fn wire_link(ui: &AppWindow) {
+    let a = ui.global::<App>();
+    a.on_link_start(|| {
+        later(|c, ui| {
+            if let Some(f) = friends::get() {
+                c.account_restore = false;
+                c.link_mode = "join".into();
+                f.link_request(&identity::default_device_name());
+            }
+            refresh_friends(c, ui);
+            render_friends(c, ui);
+        })
+    });
+    a.on_link_add(|| {
+        later(|c, ui| {
+            reset_link(c);
+            c.link_mode = "add".into();
+            render_friends(c, ui);
+        })
+    });
+    a.on_link_cancel(|| {
+        later(|c, ui| {
+            reset_link(c);
+            refresh_friends(c, ui);
+            render_friends(c, ui);
+        })
+    });
+    a.on_link_lookup(|code| {
+        later(move |c, ui| {
+            let Some(f) = friends::get().cloned() else { return };
+            c.link_busy = true;
+            c.link_error.clear();
+            render_friends(c, ui);
+            bg(move || f.link_lookup(&code), |c, ui, r| {
+                c.link_busy = false;
+                match r {
+                    Ok(o) => c.link_offer = Some(o),
+                    Err(e) => c.link_error = e,
+                }
+                render_friends(c, ui);
+            });
+        })
+    });
+    a.on_link_confirm(|| {
+        later(|c, ui| {
+            let (Some(f), Some(offer)) = (friends::get().cloned(), c.link_offer.clone()) else { return };
+            c.link_busy = true;
+            render_friends(c, ui);
+            bg(move || f.link_confirm(&offer, ""), move |c, ui, r| match r {
+                Ok(()) => {
+                    let name = c.link_offer.as_ref().map(|o| o.name.clone()).unwrap_or_default();
+                    reset_link(c);
+                    refresh_friends(c, ui);
+                    render_friends(c, ui);
+                    toast(c, ui, "ok", format!("“{name}” vinculado. Ele recebe a conta e a lista de amigos em alguns segundos."));
+                }
+                Err(e) => {
+                    c.link_busy = false;
+                    c.link_error = e;
+                    render_friends(c, ui);
+                }
+            });
+        })
+    });
+    a.on_link_revoke(|dev| {
+        later(move |c, ui| {
+            if let Some(f) = friends::get() {
+                match f.revoke(&dev) {
+                    Ok(()) => toast(c, ui, "ok", "Aparelho desvinculado. Seus amigos deixam de aceitar a chave dele."),
+                    Err(e) => toast(c, ui, "err", e),
+                }
+            }
+            refresh_friends(c, ui);
+        })
+    });
+}
+
 fn wire_overlay(o: &VideoOverlay) {
     let a = o.global::<Ov>();
     a.on_activity(|id| later(move |c, ui| wake_controls(c, ui, &id)));
@@ -1881,11 +2351,40 @@ pub fn run() -> Result<(), slint::PlatformError> {
             save_pending: false,
             push_pending: false,
             menu_heights: HashMap::new(),
+            friends: friends::View::default(),
+            show_offline: false,
+            account_open: false,
+            account_restore: false,
+            account_error: String::new(),
+            phrase: Vec::new(),
+            invite: None,
+            live_since: None,
+            link_mode: String::new(),
+            link_offer: None,
+            link_busy: false,
+            link_error: String::new(),
+            host_peers: Vec::new(),
         });
     });
 
     wire(&ui);
-    with(|c, ui| render_all(c, ui));
+    {
+        let (changed, invited) = (app.clone(), app.clone());
+        let name = with(|c, _| my_name(c)).unwrap_or_default();
+        friends::start(
+            &name,
+            Box::new(move || {
+                let _ = changed.emit("friends-changed", ());
+            }),
+            Box::new(move |name, code, title| {
+                let _ = invited.emit("friend-invite", serde_json::json!({ "name": name, "code": code, "title": title }));
+            }),
+        );
+    }
+    with(|c, ui| {
+        refresh_friends(c, ui);
+        render_all(c, ui);
+    });
 
     rendezvous::init(&app);
     if rendezvous::rdv_ready(app.rdv()) {
@@ -1897,6 +2396,18 @@ pub fn run() -> Result<(), slint::PlatformError> {
 
     #[cfg(debug_assertions)]
     autotest();
+    // Abre uma tela ao iniciar (só desenvolvimento), para conferir sem clicar.
+    #[cfg(debug_assertions)]
+    if let Ok(what) = std::env::var("AJ_OPEN") {
+        with(|c, ui| {
+            c.account_open = what.starts_with("account");
+            c.show_offline = what.contains("offline");
+            if what.contains("link") {
+                c.link_mode = "add".into();
+            }
+            render_friends(c, ui);
+        });
+    }
 
     // Ao fechar: encerra a transmissão e as conexões antes de sair.
     ui.window().on_close_requested(|| {
@@ -1913,8 +2424,13 @@ pub fn run() -> Result<(), slint::PlatformError> {
                 transport::tokio_rt().spawn(async move { session::viewer_leave(app, id).await });
             }
         });
+        // Avisa os amigos que saiu (até ~1,5 s; a presença some sozinha depois de minutos).
         std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_millis(400));
+            let t = Instant::now();
+            if let Some(f) = friends::get() {
+                f.shutdown_within(Duration::from_millis(1400));
+            }
+            std::thread::sleep(Duration::from_millis(400).saturating_sub(t.elapsed()));
             std::process::exit(0);
         });
         slint::CloseRequestResponse::HideWindow
@@ -2012,7 +2528,12 @@ pub fn run() -> Result<(), slint::PlatformError> {
     });
     let clock = slint::Timer::default();
     clock.start(slint::TimerMode::Repeated, Duration::from_secs(5), || {
-        with(|c, ui| render_public(c, ui));
+        with(|c, ui| {
+            sync_presence(c);
+            refresh_friends(c, ui);
+            render_friends(c, ui);
+            render_public(c, ui);
+        });
     });
 
     with(|c, ui| refresh_apps(c, ui));
@@ -2217,6 +2738,7 @@ mod tests {
         assert_eq!(snap_fps(0.0), 0);
         let mut v = Viewer {
             id: String::new(), code: String::new(), host_name: String::new(), step: 0, busy: false, watching: true,
+            host_friend: String::new(),
             stats: None, ping: None, volume: 100, muted: false, quality: "auto".into(), renditions: vec![],
             nominal_fps: 0, fps_candidate: (0, 0),
         };

@@ -15,6 +15,45 @@ export struct Stream {
     blank: bool,
     // Pede senha.
     locked: bool,
+    // Transmissão de um amigo (e só para amigos: fora do mural público).
+    friend: bool,
+    friends-only: bool,
+}
+
+// Figura da impressão da chave (docs/amizades.md): forma 0–3, cor 0–5.
+export struct Glyph {
+    shape: int,
+    color: int,
+}
+
+// Um amigo no bloco "Amigos" do Início. `action`: texto do botão ("Assistir",
+// "Ir junto", "Convidar" ou vazio); `code`: o código que o botão abre.
+export struct FriendItem {
+    key: string,
+    name: string,
+    initials: string,
+    cover: int,
+    detail: string,
+    online: bool,
+    live: bool,
+    action: string,
+    code: string,
+}
+
+// Um aparelho da conta.
+export struct DeviceItem {
+    dev: string,
+    name: string,
+    current: bool,
+}
+
+// Pedido de amizade recebido ou enviado.
+export struct RequestItem {
+    key: string,
+    name: string,
+    initials: string,
+    cover: int,
+    detail: string,
 }
 
 export struct StreamRow {
@@ -27,6 +66,9 @@ export struct WatchingItem {
     initials: string,
     cover: int,
     detail: string,
+    // Código de amigo do host e o botão ("Adicionar", ou vazio).
+    friend: string,
+    friend-action: string,
 }
 
 export struct Source {
@@ -51,6 +93,9 @@ export struct Peer {
     initials: string,
     state-text: string,
     connected: bool,
+    // Código de amigo de quem assiste e o botão ("Adicionar", ou vazio).
+    friend: string,
+    friend-action: string,
 }
 
 export struct AudioApp {
@@ -223,6 +268,63 @@ export global App {
     // ficam em outra janela (ui/overlay.slint, global Ov); aqui só o clique fora fecha.
     in property <string> menu-tile;
     callback close-menu();
+
+    // ---------------------------------------------------------------- Amigos
+    in property <[RequestItem]> friend-requests;
+    in property <[RequestItem]> friend-sent;
+    in property <[FriendItem]> friends-online;
+    in property <[FriendItem]> friends-offline;
+    in property <int> friends-count;
+    in property <bool> friends-show-offline;
+    in property <int> friends-offline-count;
+    callback toggle-offline();
+    callback friend-accept(string);
+    callback friend-decline(string);
+    callback friend-action(string, string);
+    callback friend-remove(string);
+    // Adicionar quem está na mesma live (pelo código de amigo que veio na conexão).
+    callback add-friend-code(string);
+    // Convite recebido para assistir (vazio = nenhum).
+    in property <string> invite-name;
+    in property <string> invite-title;
+    in property <string> invite-code;
+    callback invite-accept();
+    callback invite-dismiss();
+
+    // ----------------------------------------------------------------- Conta
+    in property <string> my-fingerprint;
+    in property <string> my-initials;
+    in property <[Glyph]> my-glyphs;
+    in property <string> my-friend-code;
+    in property <bool> account-open;
+    in property <bool> account-primary;
+    in property <string> account-device;
+    // As 24 palavras, só enquanto estão à mostra.
+    in property <[string]> account-phrase;
+    in property <bool> account-restore;
+    in property <string> account-error;
+    callback open-account();
+    callback close-account();
+    callback copy-friend-code();
+    callback show-phrase(bool);
+    callback restore-mode(bool);
+    callback restore-account(string);
+    in property <[DeviceItem]> account-devices;
+    // Vincular aparelhos: "" (nada), "join" (este PC esperando ser vinculado) ou
+    // "add" (o principal digitando o código do aparelho novo).
+    in property <string> link-mode;
+    in property <string> link-code;
+    in property <[Glyph]> link-glyphs;
+    in property <string> link-error;
+    in property <bool> link-busy;
+    in property <string> link-offer-name;
+    in property <[Glyph]> link-offer-glyphs;
+    callback link-start();
+    callback link-add();
+    callback link-cancel();
+    callback link-lookup(string);
+    callback link-confirm();
+    callback link-revoke(string);
 
     // ------------------------------------------------- Avisos e atualização
     in property <[Toast]> toasts;

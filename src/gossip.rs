@@ -105,6 +105,9 @@ enum Msg {
         #[serde(default)]
         n: String,
     },
+    /// Mensagem direta entre amigos (docs/amizades.md): de quem diz ser (`f`, chave da
+    /// conta) e o conteúdo cifrado (`d`, base64). Quem confere é `friends`.
+    Dm { f: String, d: String },
 }
 
 fn encode(m: &Msg) -> Option<Vec<u8>> {
@@ -163,6 +166,33 @@ pub fn broadcast(bytes: &[u8]) {
     if let Some(g) = GLOBAL.get() {
         g.announce(bytes);
     }
+}
+
+/// Mensagem direta recebida: (endereço de onde veio, `f`, `d`).
+pub type DirectFn = Box<dyn Fn(SocketAddr, &str, &str) + Send + Sync>;
+static DIRECT: OnceLock<DirectFn> = OnceLock::new();
+
+/// Quem recebe as mensagens diretas (as amizades).
+pub fn on_direct(f: DirectFn) {
+    let _ = DIRECT.set(f);
+}
+
+/// Manda uma mensagem direta pelo socket da fofoca (o mesmo endereço que os amigos veem).
+/// `false` se a fofoca não está rodando ou a mensagem não cabe num pacote.
+pub fn send_direct(to: SocketAddr, f: &str, d: &str) -> bool {
+    let Some(g) = GLOBAL.get() else { return false };
+    let Some(b) = encode(&Msg::Dm { f: f.to_string(), d: d.to_string() }) else { return false };
+    g.sock.send_to(&b, to).is_ok()
+}
+
+/// Endereço público do app (STUN ou o que os vizinhos dizem ver).
+pub fn public_addr() -> Option<SocketAddrV4> {
+    GLOBAL.get().and_then(|g| g.st.lock().unwrap().public)
+}
+
+/// Porta local do socket da fofoca (para amigos na mesma rede).
+pub fn local_port() -> Option<u16> {
+    GLOBAL.get().map(|g| g.local_addr().port())
 }
 
 /// Vizinhos confirmados na fofoca do app.
@@ -406,6 +436,13 @@ impl Gossip {
                     return self.flush(out, deliver);
                 }
                 Msg::Sync if verified => out.extend(Self::snapshot(&st, from)),
+                Msg::Dm { f, d } => {
+                    drop(st);
+                    if let Some(h) = DIRECT.get() {
+                        h(from, &f, &d);
+                    }
+                    return self.flush(out, deliver);
+                }
                 Msg::Bye => {
                     if st.peers.remove(&from).is_some() {
                         log(format!("vizinho saiu {from}"));

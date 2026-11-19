@@ -1,6 +1,6 @@
 # AntiJanja
 
-Compartilhamento de tela **100% P2P**, sem servidor central e sem conta.
+Compartilhamento de tela **100% P2P**, sem servidor central e sem cadastro.
 
 **Quem transmite envia um código. Quem assiste cola o código. Pronto.**
 
@@ -31,6 +31,11 @@ shader desenha o quadro do meio. Uma stream de 30 fps aparece a 60, com ~16 ms a
 anuncia, encerra ou renomeia a transmissão de outra pessoa) e as vagas mudam de endereço a cada
 10 min (quem travar uma vaga só a trava até a próxima troca). Sem servidor, não dá para impedir
 que alguém sobrescreva vagas sem parar.
+
+**Amigos:** cada PC tem uma conta que é só um par de chaves (com frase de recuperação de 24
+palavras). O código de amigo `AJF.…` é colado no mesmo campo do código de transmissão. Pedidos,
+presença ("online", "ao vivo") e convites passam cifrados pela DHT e, com os dois abertos, direto
+entre os apps. Detalhes em `docs/amizades.md`.
 
 1. O host gera o código e fica consultando a DHT.
 2. O espectador cola o código, cria uma oferta WebRTC e a publica na DHT.

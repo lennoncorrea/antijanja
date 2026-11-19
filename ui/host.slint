@@ -419,6 +419,17 @@ component ViewersCard inherits Card {
                     Text { text: p.name; font-size: 13px; font-weight: 500; color: Theme.fg; overflow: elide; }
                     Text { text: p.state-text; font-size: 12px; color: p.connected ? Theme.live-text : Theme.warn; }
                 }
+                if p.friend-action != "" : VerticalLayout {
+                    alignment: center;
+                    Btn {
+                        height: 28px;
+                        font-size: 11px;
+                        pad: 10px;
+                        kind: "outline";
+                        text: p.friend-action;
+                        clicked => { App.add-friend-code(p.friend); }
+                    }
+                }
                 VerticalLayout {
                     alignment: center;
                     Btn {

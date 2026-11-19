@@ -71,10 +71,13 @@ struct PeerInfo {
     id: u64,
     name: String,
     state: &'static str,
+    /// Código de amigo de quem assiste (vazio se não mandou): para "Adicionar".
+    friend: String,
 }
 
 struct PeerEntry {
     name: String,
+    friend: String,
     state: &'static str,
     peer: Arc<HostPeer>,
     /// Tentativa (da oferta) que criou esta conexão.
@@ -449,7 +452,7 @@ fn emit_peers(app: &AppHandle, peers: &Mutex<HashMap<u64, PeerEntry>>) {
         .lock()
         .unwrap()
         .iter()
-        .map(|(id, p)| PeerInfo { id: *id, name: p.name.clone(), state: p.state })
+        .map(|(id, p)| PeerInfo { id: *id, name: p.name.clone(), state: p.state, friend: p.friend.clone() })
         .collect();
     list.sort_by_key(|p| p.id);
     let watching = list.iter().filter(|p| p.state != "connecting").count() as u32;
@@ -734,9 +737,10 @@ pub fn host_start(app: AppHandle, config: HostConfig) -> Res<String> {
                     map.insert(sid.to_string(), None);
                     drop(map);
                     let name: String = msg["name"].as_str().unwrap_or("Espectador").chars().take(40).collect();
+                    let friend = valid_friend_code(&msg["friend"]);
                     let (app, peers, shared, offers) = (app.clone(), peers.clone(), shared.clone(), offers.clone());
                     let (sdp, sid, code) = (sdp.to_string(), sid.to_string(), code.to_string());
-                    transport::spawn(async move { accept_viewer(app, peers, shared, offers, code, slot, sid, sdp, name).await });
+                    transport::spawn(async move { accept_viewer(app, peers, shared, offers, code, slot, sid, sdp, name, friend).await });
                 }
             }
         })
@@ -787,6 +791,7 @@ async fn accept_viewer(
     sid: String,
     sdp: String,
     name: String,
+    friend: String,
 ) {
     let id = PEER_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
     let on_state: Arc<dyn Fn(PeerEvent) + Send + Sync> = {
@@ -896,6 +901,7 @@ async fn accept_viewer(
         id,
         PeerEntry {
             name: name.clone(),
+            friend,
             state: "connecting",
             peer: peer.clone(),
             sid: sid.clone(),
@@ -910,7 +916,7 @@ async fn accept_viewer(
     emit_peers(&app, &peers);
 
     let host_name = HOST.lock().unwrap().as_ref().map(|h| h.config.name.clone()).unwrap_or_default();
-    let payload = serde_json::json!({ "t": "answer", "sid": sid, "sdp": answer, "name": host_name }).to_string();
+    let payload = serde_json::json!({ "t": "answer", "sid": sid, "sdp": answer, "name": host_name, "friend": my_friend_code() }).to_string();
     crate::connlog::log(format!("{tag}: resposta montada em {} ms", t.elapsed().as_millis()));
     offers.lock().unwrap().insert(sid.clone(), Some((slot, payload.clone())));
     let app2 = app.clone();
@@ -1079,7 +1085,8 @@ fn emit_viewer(app: &AppHandle, event: &str, id: &str, value: serde_json::Value)
 
 /// Entra numa transmissão pelo código. `id` identifica o tile na interface.
 /// Volta com o nome do host quando a conexão é montada.
-pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Option<String>, name: String, volume: u32, view_fps: u32) -> Res<String> {
+/// Devolve (nome do host, código de amigo do host).
+pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Option<String>, name: String, volume: u32, view_fps: u32) -> Res<(String, String)> {
     leave_viewer(&app, &id).await;
     let gen = VIEWER_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let stop = Arc::new(AtomicBool::new(false));
@@ -1309,7 +1316,7 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
     let mut sid_bytes = [0u8; 12];
     getrandom::fill(&mut sid_bytes).map_err(|e| e.to_string())?;
     let sid: String = sid_bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let payload = serde_json::json!({ "t": "offer", "sid": sid, "sdp": offer, "name": name }).to_string();
+    let payload = serde_json::json!({ "t": "offer", "sid": sid, "sdp": offer, "name": name, "friend": my_friend_code() }).to_string();
     let (app2, id_wait, stop2) = (app.clone(), id.clone(), stop.clone());
     let sid_tag = crate::connlog::short(&sid);
     let prep = prep.await.map_err(|e| e.to_string())??;
@@ -1342,6 +1349,7 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
     let answer: serde_json::Value = serde_json::from_str(&answer).map_err(|_| "O host mandou uma resposta inválida.")?;
     let sdp = answer["sdp"].as_str().ok_or("O host mandou uma resposta inválida.")?.to_string();
     let host_name: String = answer["name"].as_str().unwrap_or("Host").chars().take(40).collect();
+    let host_friend = valid_friend_code(&answer["friend"]);
     step("connect");
     crate::connlog::log(format!("espectador {sid_tag}: conectando direto ao host"));
     let s = session.clone();
@@ -1368,7 +1376,17 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
             }
         }
     });
-    Ok(host_name)
+    Ok((host_name, host_friend))
+}
+
+/// Meu código de amigo, que vai junto no pedido para assistir e na resposta do host (o
+/// outro lado ganha um botão "Adicionar"; docs/amizades.md).
+fn my_friend_code() -> String {
+    crate::friends::get().map(|f| f.my_code()).unwrap_or_default()
+}
+
+fn valid_friend_code(v: &serde_json::Value) -> String {
+    v.as_str().filter(|c| c.len() < 80 && crate::identity::parse_friend_code(c).is_ok()).unwrap_or_default().to_string()
 }
 
 async fn leave_viewer(app: &AppHandle, id: &str) {

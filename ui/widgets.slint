@@ -1,6 +1,6 @@
 // Componentes reutilizáveis da interface.
 import { Theme } from "theme.slint";
-import { SelectOption } from "state.slint";
+import { SelectOption, Glyph } from "state.slint";
 
 export component Eyebrow inherits Text {
     color: Theme.muted-fg;
@@ -430,4 +430,21 @@ export component EmptyState inherits Rectangle {
 export component Divider inherits Rectangle {
     height: 1px;
     background: Theme.border;
+}
+
+// Impressão da chave de uma conta (docs/amizades.md): 4 figuras coloridas.
+export component KeyGlyphs inherits HorizontalLayout {
+    in property <[Glyph]> glyphs;
+    in property <length> size: 9px;
+    spacing: root.size * 0.35;
+    alignment: start;
+    for g in root.glyphs : VerticalLayout {
+        alignment: center;
+        Rectangle {
+            width: g.shape == 3 ? root.size * 0.6 : root.size;
+            height: root.size;
+            border-radius: g.shape == 1 ? root.size / 2 : g.shape == 2 ? root.size * 0.32 : 1.5px;
+            background: g.color == 0 ? #00d4ff : g.color == 1 ? #f2c14e : g.color == 2 ? #f0604f : g.color == 3 ? #3ddc97 : g.color == 4 ? #b38cff : #ff8fc7;
+        }
+    }
 }

@@ -32,6 +32,10 @@ bytes = "1.12.1"
 chacha20poly1305 = "0.11.0"
 # Mesma versão que o mainline usa (assinatura das respostas do host e do mural)
 ed25519-dalek = { version = "3", default-features = false }
+# Conta (docs/amizades.md): frase de recuperação de 24 palavras e a chave que cifra
+# as mensagens entre amigos (Diffie-Hellman)
+bip39 = { version = "2", features = ["portuguese"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 # Pedaços codificados da malha (docs/malha-p2p.md): qualquer k pedaços refazem o quadro
 raptorq = "2"
 flate2 = "1.1.11"
