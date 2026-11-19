@@ -1,14 +1,14 @@
 // Janela principal do AntiJanja.
 import { Theme } from "theme.slint";
-import { App, Stream, StreamRow, WatchingItem, Source, SourceRow, Peer, AudioApp, SelectOption, MenuOption, Tile, Toast } from "state.slint";
-import { Btn, Icon, TextField } from "widgets.slint";
+import { App, Stream, StreamRow, WatchingItem, Source, SourceRow, Peer, AudioApp, SelectOption, MenuOption, Tile, Toast, Glyph, FriendItem, RequestItem, DeviceItem } from "state.slint";
+import { Btn, Cover, Eyebrow, Icon, KeyGlyphs, TextField } from "widgets.slint";
 import { HomeView } from "home.slint";
 import { HostView } from "host.slint";
 import { WatchView } from "watch.slint";
 import { SourcePicker } from "picker.slint";
 import { VideoOverlay, Ov } from "overlay.slint";
 
-export { Theme, App, Ov, VideoOverlay, Stream, StreamRow, WatchingItem, Source, SourceRow, Peer, AudioApp, SelectOption, MenuOption, Tile, Toast }
+export { Theme, App, Ov, VideoOverlay, Stream, StreamRow, WatchingItem, Source, SourceRow, Peer, AudioApp, SelectOption, MenuOption, Tile, Toast, Glyph, FriendItem, RequestItem, DeviceItem }
 
 component Logo inherits Rectangle {
     width: 22px;
@@ -298,6 +298,403 @@ component PasswordDialog inherits Rectangle {
     }
 }
 
+// Conta: código de amigo, este aparelho, frase de recuperação e entrar com outra conta.
+component AccountDialog inherits Rectangle {
+    background: Theme.overlay;
+    TouchArea { clicked => { App.close-account(); } }
+    Rectangle {
+        width: 500px;
+        height: Math.min(box.preferred-height, root.height - 48px);
+        background: Theme.card;
+        border-radius: 16px;
+        clip: true;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 28px;
+        drop-shadow-offset-y: 8px;
+        drop-shadow-color: #00000066;
+        TouchArea { }
+        Flickable {
+        viewport-height: box.preferred-height;
+        box := VerticalLayout {
+            width: parent.width;
+            padding: 24px;
+            spacing: 18px;
+            HorizontalLayout {
+                spacing: 14px;
+                Cover {
+                    width: 48px;
+                    height: 48px;
+                    border-radius: 12px;
+                    idx: 1;
+                    initials: App.my-initials;
+                    text-size: 17px;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 5px;
+                    horizontal-stretch: 1;
+                    Text { text: App.my-name; font-size: 18px; font-weight: 700; color: Theme.fg; overflow: elide; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        KeyGlyphs { glyphs: App.my-glyphs; size: 10px; }
+                        Text { text: App.my-fingerprint; font-size: 12px; color: Theme.soft-fg; font-family: Theme.mono; vertical-alignment: center; }
+                    }
+                }
+                VerticalLayout {
+                    alignment: start;
+                    Btn {
+                        width: 34px;
+                        height: 34px;
+                        kind: "ghost";
+                        icon-only: true;
+                        icon: @image-url("icons/x.svg");
+                        has-icon: true;
+                        icon-size: 13px;
+                        accessible-label: "Fechar";
+                        clicked => { App.close-account(); }
+                    }
+                }
+            }
+
+            VerticalLayout {
+                spacing: 8px;
+                Eyebrow { text: "MEU CÓDIGO DE AMIGO"; }
+                Rectangle {
+                    height: 40px;
+                    border-radius: 9px;
+                    background: Theme.muted;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 5px;
+                        spacing: 8px;
+                        Text {
+                            text: App.my-friend-code;
+                            font-size: 12px;
+                            font-family: Theme.mono;
+                            color: Theme.soft-fg;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Btn {
+                                kind: "primary";
+                                height: 30px;
+                                font-size: 12px;
+                                pad: 12px;
+                                text: "Copiar";
+                                clicked => { App.copy-friend-code(); }
+                            }
+                        }
+                    }
+                }
+                Text {
+                    text: "Mande para quem você quer adicionar. Quem colar em “Entrar com código” te manda um pedido de amizade.";
+                    font-size: 12px;
+                    color: Theme.muted-fg;
+                    wrap: word-wrap;
+                }
+            }
+
+            VerticalLayout {
+                spacing: 4px;
+                HorizontalLayout {
+                    Eyebrow { text: "MEUS APARELHOS"; vertical-alignment: center; horizontal-stretch: 1; }
+                    if App.account-primary && App.link-mode == "" : Btn {
+                        kind: "ghost";
+                        height: 28px;
+                        font-size: 12px;
+                        pad: 6px;
+                        text: "+ Vincular aparelho";
+                        clicked => { App.link-add(); }
+                    }
+                }
+                for d in App.account-devices : HorizontalLayout {
+                    height: 34px;
+                    spacing: 8px;
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle { width: 8px; height: 8px; border-radius: 4px; background: d.current ? Theme.live : Theme.input; }
+                    }
+                    Text { text: d.name; font-size: 13px; font-weight: d.current ? 600 : 400; color: Theme.fg; vertical-alignment: center; overflow: elide; }
+                    Text {
+                        text: d.current ? (App.account-primary ? "· este, principal" : "· este") : "";
+                        font-size: 13px;
+                        color: Theme.muted-fg;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    if App.account-primary && !d.current : VerticalLayout {
+                        alignment: center;
+                        Btn {
+                            kind: "ghost";
+                            height: 28px;
+                            font-size: 12px;
+                            pad: 8px;
+                            text: "Desvincular";
+                            clicked => { App.link-revoke(d.dev); }
+                        }
+                    }
+                }
+                if !App.account-primary : Text {
+                    text: "Para vincular ou desvincular aparelhos, use o aparelho principal.";
+                    font-size: 12px;
+                    color: Theme.muted-fg;
+                    wrap: word-wrap;
+                }
+            }
+
+            // Principal: digitar o código do aparelho novo e conferir a figura.
+            if App.link-mode == "add" : Rectangle {
+                height: add.preferred-height;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: Theme.bg;
+                add := VerticalLayout {
+                    padding: 14px;
+                    spacing: 10px;
+                    Text { text: "Vincular aparelho"; font-size: 14px; font-weight: 600; color: Theme.fg; }
+                    if App.link-offer-name == "" : Text {
+                        text: "No aparelho novo, abra “Meu código” › “Entrar com outra conta” › “Vincular a um aparelho”, e digite aqui o código que aparecer lá.";
+                        font-size: 12px;
+                        color: Theme.soft-fg;
+                        wrap: word-wrap;
+                    }
+                    if App.link-offer-name == "" : HorizontalLayout {
+                        spacing: 8px;
+                        code := TextField {
+                            mono: true;
+                            placeholder: "Código de 6 números";
+                            accepted(t) => { App.link-lookup(t); }
+                            init => { self.focus-input(); }
+                        }
+                        Btn {
+                            kind: "primary";
+                            text: App.link-busy ? "Procurando…" : "Procurar";
+                            enabled: !App.link-busy;
+                            clicked => { App.link-lookup(code.text); }
+                        }
+                    }
+                    if App.link-offer-name != "" : VerticalLayout {
+                        spacing: 10px;
+                        Text { text: "Encontrado: “" + App.link-offer-name + "” pedindo para entrar."; font-size: 13px; font-weight: 600; color: Theme.fg; wrap: word-wrap; }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            alignment: start;
+                            KeyGlyphs { glyphs: App.link-offer-glyphs; size: 18px; }
+                            Text { text: "A figura é a mesma nos dois aparelhos?"; font-size: 13px; color: Theme.soft-fg; vertical-alignment: center; }
+                        }
+                    }
+                    if App.link-error != "" : Text { text: App.link-error; font-size: 12px; color: Theme.destructive; wrap: word-wrap; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: end;
+                        Btn { kind: "ghost"; text: App.link-offer-name == "" ? "Cancelar" : "Não é a mesma"; clicked => { App.link-cancel(); } }
+                        if App.link-offer-name != "" : Btn {
+                            kind: "primary";
+                            text: App.link-busy ? "Vinculando…" : "É a mesma, vincular";
+                            enabled: !App.link-busy;
+                            clicked => { App.link-confirm(); }
+                        }
+                    }
+                }
+            }
+
+            if App.account-primary : Rectangle {
+                height: phrase.preferred-height;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: Theme.warn.with-alpha(0.35);
+                background: Theme.warn.with-alpha(0.08);
+                phrase := VerticalLayout {
+                    padding: 14px;
+                    spacing: 10px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        VerticalLayout {
+                            alignment: center;
+                            Icon { source: @image-url("icons/lock.svg"); tint: Theme.warn; width: 15px; height: 15px; }
+                        }
+                        Text { text: "Frase de recuperação"; font-size: 13px; font-weight: 600; color: Theme.fg; vertical-alignment: center; horizontal-stretch: 1; }
+                        Btn {
+                            kind: "outline";
+                            height: 30px;
+                            font-size: 12px;
+                            pad: 12px;
+                            text: App.account-phrase.length > 0 ? "Esconder" : "Mostrar";
+                            clicked => { App.show-phrase(App.account-phrase.length == 0); }
+                        }
+                    }
+                    Text {
+                        text: "24 palavras que recriam sua conta em outro PC. Anote em papel. Sem a frase e sem este PC, a conta não tem volta: não existe servidor para recuperar.";
+                        font-size: 12px;
+                        color: Theme.soft-fg;
+                        wrap: word-wrap;
+                    }
+                    if App.account-phrase.length > 0 : Rectangle {
+                        height: 6 * 24px;
+                        for w[i] in App.account-phrase : Text {
+                            x: Math.mod(i, 4) * (parent.width / 4);
+                            y: Math.floor(i / 4) * 24px;
+                            width: parent.width / 4;
+                            height: 24px;
+                            vertical-alignment: center;
+                            text: (i + 1) + ". " + w;
+                            font-size: 12px;
+                            font-family: Theme.mono;
+                            color: Theme.fg;
+                        }
+                    }
+                }
+            }
+            if !App.account-primary : Text {
+                text: "A frase de recuperação fica no aparelho onde a conta foi criada.";
+                font-size: 12px;
+                color: Theme.muted-fg;
+                wrap: word-wrap;
+            }
+
+            if !App.account-restore && App.link-mode != "join" : VerticalLayout {
+                spacing: 6px;
+                Eyebrow { text: "ENTRAR COM OUTRA CONTA"; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Btn {
+                        kind: "outline";
+                        horizontal-stretch: 1;
+                        height: 36px;
+                        font-size: 12px;
+                        text: "Vincular a um aparelho";
+                        clicked => { App.link-start(); }
+                    }
+                    Btn {
+                        kind: "outline";
+                        horizontal-stretch: 1;
+                        height: 36px;
+                        font-size: 12px;
+                        text: "Usar a frase de recuperação";
+                        clicked => { App.restore-mode(true); }
+                    }
+                }
+            }
+
+            // Este PC esperando o principal digitar o código.
+            if App.link-mode == "join" : Rectangle {
+                height: join.preferred-height;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: Theme.primary.with-alpha(0.4);
+                background: Theme.bg;
+                join := VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+                    Text {
+                        text: "No aparelho que já tem a conta (o principal), abra “Meu código” › “Vincular aparelho” e digite:";
+                        font-size: 13px;
+                        color: Theme.soft-fg;
+                        wrap: word-wrap;
+                    }
+                    Rectangle {
+                        height: 60px;
+                        border-radius: 10px;
+                        background: Theme.card;
+                        Text {
+                            text: App.link-code;
+                            font-size: 30px;
+                            font-family: Theme.mono;
+                            letter-spacing: 6px;
+                            color: Theme.primary;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        alignment: start;
+                        Text { text: "Figura deste pedido:"; font-size: 12px; color: Theme.muted-fg; vertical-alignment: center; }
+                        KeyGlyphs { glyphs: App.link-glyphs; size: 18px; }
+                    }
+                    if App.link-error == "" : Text {
+                        text: "Esperando o outro aparelho… O código vale por 5 minutos. A conta atual deste PC sai daqui quando vincular.";
+                        font-size: 12px;
+                        color: Theme.muted-fg;
+                        wrap: word-wrap;
+                    }
+                    if App.link-error != "" : Text { text: App.link-error; font-size: 12px; color: Theme.destructive; wrap: word-wrap; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: end;
+                        Btn { kind: "ghost"; text: "Cancelar"; clicked => { App.link-cancel(); } }
+                        if App.link-error != "" : Btn { kind: "primary"; text: "Gerar outro código"; clicked => { App.link-start(); } }
+                    }
+                }
+            }
+
+            if App.account-restore : VerticalLayout {
+                spacing: 8px;
+                Text {
+                    text: "Digite as 24 palavras da outra conta. A conta atual sai deste PC: se ela for sua, anote a frase dela antes.";
+                    font-size: 12px;
+                    color: Theme.warn;
+                    wrap: word-wrap;
+                }
+                field := TextField {
+                    placeholder: "24 palavras separadas por espaço";
+                    accepted(t) => { App.restore-account(t); }
+                    init => { self.focus-input(); }
+                }
+                if App.account-error != "" : Text { text: App.account-error; font-size: 12px; color: Theme.destructive; wrap: word-wrap; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    Btn { kind: "ghost"; text: "Cancelar"; clicked => { App.restore-mode(false); } }
+                    Btn { kind: "primary"; text: "Entrar"; clicked => { App.restore-account(field.text); } }
+                }
+            }
+        }
+        }
+    }
+}
+
+
+// Convite de um amigo para assistir a live dele.
+component InviteCard inherits Rectangle {
+    width: 360px;
+    height: box.preferred-height;
+    border-radius: 14px;
+    border-width: 1px;
+    border-color: Theme.primary.with-alpha(0.4);
+    background: Theme.card;
+    drop-shadow-blur: 24px;
+    drop-shadow-offset-y: 6px;
+    drop-shadow-color: #00000055;
+    box := VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+        HorizontalLayout {
+            spacing: 12px;
+            VerticalLayout {
+                alignment: start;
+                Icon { source: @image-url("icons/radio.svg"); tint: Theme.primary; width: 20px; height: 20px; }
+            }
+            VerticalLayout {
+                spacing: 2px;
+                Text { text: App.invite-name + " te convidou para assistir"; font-size: 14px; font-weight: 600; color: Theme.fg; wrap: word-wrap; }
+                if App.invite-title != "" : Text { text: App.invite-title; font-size: 12px; color: Theme.muted-fg; overflow: elide; }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            Btn { kind: "primary"; horizontal-stretch: 1; text: "Assistir"; clicked => { App.invite-accept(); } }
+            Btn { kind: "outline"; horizontal-stretch: 1; text: "Agora não"; clicked => { App.invite-dismiss(); } }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: App.title;
     icon: @image-url("../assets/icons/128x128.png");
@@ -344,6 +741,16 @@ export component AppWindow inherits Window {
         x: 0;
         y: 56px;
         width: root.width;
+    }
+
+    if App.invite-code != "" : InviteCard {
+        x: root.width - self.width - 20px;
+        y: 56px;
+    }
+
+    if App.account-open : AccountDialog {
+        width: 100%;
+        height: 100%;
     }
 
     if App.password-prompt : PasswordDialog {

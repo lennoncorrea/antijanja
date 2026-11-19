@@ -362,6 +362,7 @@ pub fn init(app: &AppHandle) {
         Ok(dht) => {
             let ok = dht.bootstrapped();
             start_gossip(&app, &dht);
+            crate::friends::dht_ready(&dht);
             let _ = app.rdv().dht.set(dht);
             let _ = app.emit("dht-status", ok);
         }

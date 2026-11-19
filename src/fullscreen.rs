@@ -73,7 +73,9 @@ pub fn set(hwnd: isize, on: bool) {
                 full.rcNormalPosition = windows::Win32::Foundation::RECT { left: m.left - dx, top: m.top - dy, right: m.right - dx, bottom: m.bottom - dy };
                 let _ = SetWindowPlacement(h, &full);
             }
-            let _ = SetWindowPos(h, Some(HWND_TOP), m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            // Sem SWP_NOOWNERZORDER: a janela dos controles (dona = esta) precisa subir junto,
+            // senão fica atrás do vídeo durante toda a tela cheia.
+            let _ = SetWindowPos(h, Some(HWND_TOP), m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED);
         } else {
             let Some(place) = saved.take() else { return };
             ON.store(false, Ordering::SeqCst);
