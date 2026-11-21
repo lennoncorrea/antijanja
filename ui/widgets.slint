@@ -267,7 +267,9 @@ export component Slider inherits Rectangle {
         border-radius: 3px;
         background: root.track;
     }
+    // Preenchido a partir da esquerda (sem x, o Slint centraliza e ele cresceria do meio).
     Rectangle {
+        x: 0;
         y: (parent.height - 6px) / 2;
         height: 6px;
         width: parent.width * root.frac;
