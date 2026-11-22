@@ -484,18 +484,6 @@ fn render_public(c: &Ctl, ui: &AppWindow) {
     let a = ui.global::<App>();
     set_if_changed!(a, get_public_busy, set_public_busy, c.public_busy && c.public_manual);
     set_if_changed!(a, get_public_loading, set_public_loading, c.public.is_none());
-    a.set_public_updated(s(if c.public_busy && c.public_manual {
-        "atualizando…".to_string()
-    } else if crate::gossip::peer_count() > 0 {
-        // Conectado à fofoca: a lista atualiza sozinha, na hora.
-        "atualiza ao vivo".into()
-    } else {
-        match c.public_updated.map(|t| t.elapsed().as_secs()) {
-            None => String::new(),
-            Some(n) if n < 5 => "atualizado agora".into(),
-            Some(n) => format!("atualizado há {n} s"),
-        }
-    }));
     let (list, friend_codes) = with_friend_lives(c);
     let others: Vec<&rendezvous::PublicStream> = list.iter().filter(|p| !p.own).collect();
     set_if_changed!(a, get_public_mine, set_public_mine, list.iter().any(|p| p.own));
