@@ -3,15 +3,20 @@ import { ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { App, Source } from "state.slint";
 import { AudioSource } from "audio.slint";
-import { Badge, Btn, Divider, Icon, Segmented, Spinner, TextField, Toggle } from "widgets.slint";
+import { Btn, Divider, FocusRing, Icon, Segmented, Spinner, Tag, TextField, Toggle } from "widgets.slint";
 
 component SourceCard inherits Rectangle {
     in property <Source> s;
     property <bool> selected: App.picker-selected == s.id;
     opacity: s.blank ? 0 : 1;
-    border-radius: 12px;
+    border-radius: Theme.radius-lg;
     border-width: selected ? 2px : 1px;
-    border-color: selected ? Theme.primary : ta.has-hover ? Theme.input : Theme.border;
+    border-color: selected ? Theme.interactive : ta.has-hover ? Theme.field-border : Theme.border;
+    animate border-color { duration: Theme.fast; }
+    accessible-role: radio-button;
+    accessible-label: root.s.name;
+    accessible-checked: root.selected;
+    accessible-action-default => { App.picker-select(root.s.id); }
     background: Theme.card;
     VerticalLayout {
         padding: 8px;
@@ -19,7 +24,7 @@ component SourceCard inherits Rectangle {
         alignment: start;
         Rectangle {
             height: self.width * 9 / 16;
-            border-radius: 8px;
+            border-radius: Theme.radius-md;
             background: Theme.muted;
             clip: true;
             if root.s.has-thumb : Image {
@@ -39,18 +44,33 @@ component SourceCard inherits Rectangle {
             HorizontalLayout {
                 x: 8px;
                 y: 8px;
-                height: 22px;
+                height: 20px;
                 spacing: 4px;
-                if root.s.primary : Badge { mono: false; bg: Theme.bg.with-alpha(0.85); text: "Principal"; }
-                if root.s.current : Badge { mono: false; bg: Theme.live; ink: Theme.primary-fg; text: "No ar"; }
+                if root.s.primary : Tag { text: "PRINCIPAL"; }
+                if root.s.current : Tag { kind: "live"; text: "NO AR"; }
             }
         }
         VerticalLayout {
             padding-left: 4px;
             padding-right: 4px;
             spacing: 1px;
-            Text { text: root.s.name; font-size: 13px; font-weight: 600; color: Theme.fg; overflow: elide; }
-            Text { text: root.s.detail; font-size: 12px; color: Theme.muted-fg; overflow: elide; }
+            Text { text: root.s.name; font-size: Theme.text-base; font-weight: 600; color: Theme.fg; overflow: elide; }
+            Text { text: root.s.detail; font-size: Theme.text-sm; color: Theme.muted-fg; overflow: elide; }
+        }
+    }
+    fs := FocusScope {
+        enabled: !root.s.blank;
+        focus-on-click: false;
+        key-pressed(e) => {
+            if (e.text == " ") {
+                App.picker-select(root.s.id);
+                return accept;
+            }
+            if (e.text == Key.Return) {
+                App.picker-confirm(root.s.id);
+                return accept;
+            }
+            reject
         }
     }
     ta := TouchArea {
@@ -59,6 +79,7 @@ component SourceCard inherits Rectangle {
         clicked => { App.picker-select(root.s.id); }
         double-clicked => { App.picker-confirm(root.s.id); }
     }
+    if fs.has-focus : FocusRing { radius: root.border-radius; }
 }
 
 // Uma das duas opções de "Quem pode entrar" (pública ou só com código).
@@ -69,18 +90,30 @@ component VisibilityOption inherits Rectangle {
     in property <string> detail;
     callback picked();
     height: 60px;
-    border-radius: 10px;
+    border-radius: Theme.radius-md;
     border-width: root.on ? 2px : 1px;
-    border-color: root.on ? Theme.primary : ta.has-hover ? Theme.input : Theme.border;
-    background: root.on ? Theme.feature-bg : Theme.muted.with-alpha(0.5);
+    border-color: root.on ? Theme.interactive : ta.has-hover ? Theme.field-border : Theme.border;
+    background: root.on ? Theme.feature-bg : Theme.raised;
+    animate background, border-color { duration: Theme.fast; }
     accessible-role: radio-button;
     accessible-checked: root.on;
     accessible-label: root.title;
     accessible-action-default => { root.picked(); }
+    fs := FocusScope {
+        focus-on-click: false;
+        key-pressed(e) => {
+            if (e.text == " " || e.text == Key.Return) {
+                root.picked();
+                return accept;
+            }
+            reject
+        }
+    }
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.picked(); }
     }
+    if fs.has-focus : FocusRing { radius: root.border-radius; }
     HorizontalLayout {
         padding-left: 14px;
         padding-right: 14px;
@@ -92,8 +125,8 @@ component VisibilityOption inherits Rectangle {
         VerticalLayout {
             alignment: center;
             spacing: 2px;
-            Text { text: root.title; font-size: 14px; font-weight: 700; color: Theme.fg; }
-            Text { text: root.detail; font-size: 12px; color: root.on ? Theme.soft-fg : Theme.muted-fg; overflow: elide; }
+            Text { text: root.title; font-size: Theme.text-md; font-weight: 700; color: Theme.fg; }
+            Text { text: root.detail; font-size: Theme.text-sm; color: root.on ? Theme.soft-fg : Theme.muted-fg; overflow: elide; }
         }
     }
 }
@@ -104,18 +137,22 @@ export component SourcePicker inherits Rectangle {
     TouchArea {
         clicked => { App.close-picker(); }
     }
+    property <bool> shown: false;
+    init => { root.shown = true; }
     dialog := Rectangle {
         width: Math.min(parent.width - 48px, 900px);
         height: Math.min(parent.height - 48px, App.picker == "start" ? (App.picker-pw-on ? 960px : 910px) : 620px);
         x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-        border-radius: 14px;
+        y: (parent.height - self.height) / 2 + (root.shown ? 0px : 12px);
+        opacity: root.shown ? 1 : 0;
+        animate y, opacity { duration: Theme.normal; easing: ease-out; }
+        border-radius: Theme.radius-xl;
         border-width: 1px;
         border-color: Theme.border;
         background: Theme.card;
-        drop-shadow-blur: 30px;
-        drop-shadow-offset-y: 8px;
-        drop-shadow-color: #00000055;
+        drop-shadow-blur: Theme.shadow-lg-blur;
+        drop-shadow-offset-y: Theme.shadow-lg-y;
+        drop-shadow-color: Theme.shadow-lg;
         clip: true;
         // Engole os cliques dentro do diálogo (não fechar).
         TouchArea { }
@@ -129,13 +166,13 @@ export component SourcePicker inherits Rectangle {
                     spacing: 4px;
                     Text {
                         text: App.picker == "switch" ? "Trocar o que está sendo transmitido" : "O que você quer transmitir?";
-                        font-size: 17px;
+                        font-size: Theme.text-xl;
                         font-weight: 600;
                         color: Theme.fg;
                     }
                     Text {
                         text: App.picker == "switch" ? "Quem está assistindo continua conectado, com o mesmo código." : "Escolha uma tela inteira ou só uma janela.";
-                        font-size: 13px;
+                        font-size: Theme.text-base;
                         color: Theme.muted-fg;
                     }
                 }
@@ -143,8 +180,7 @@ export component SourcePicker inherits Rectangle {
                 VerticalLayout {
                     alignment: start;
                     Btn {
-                        width: 32px;
-                        height: 32px;
+                        size: "md";
                         kind: "ghost";
                         icon-only: true;
                         icon: @image-url("icons/x.svg");
@@ -165,13 +201,12 @@ export component SourcePicker inherits Rectangle {
                 }
                 Rectangle { }
                 Btn {
-                    height: 34px;
+                    size: "md";
                     kind: "ghost";
-                    font-size: 13px;
                     text: "Atualizar";
                     icon: @image-url("icons/refresh.svg");
                     has-icon: true;
-                    icon-size: 14px;
+                    busy: App.sources-loading;
                     enabled: !App.sources-loading;
                     clicked => { App.picker-refresh(); }
                 }
@@ -197,7 +232,7 @@ export component SourcePicker inherits Rectangle {
                             alignment: center;
                             Spinner { }
                         }
-                        Text { text: "Procurando telas e janelas…"; font-size: 13px; color: Theme.muted-fg; vertical-alignment: center; }
+                        Text { text: "Procurando telas e janelas…"; font-size: Theme.text-base; color: Theme.muted-fg; vertical-alignment: center; }
                     }
                     if !App.sources-loading && App.source-rows.length == 0 : Text {
                         height: 120px;
@@ -205,7 +240,7 @@ export component SourcePicker inherits Rectangle {
                         vertical-alignment: center;
                         wrap: word-wrap;
                         text: App.picker-tab == "window" ? "Nenhuma janela aberta para transmitir. Janelas minimizadas não aparecem." : "Nenhuma tela encontrada.";
-                        font-size: 13px;
+                        font-size: Theme.text-base;
                         color: Theme.muted-fg;
                     }
                     if !App.sources-loading : VerticalLayout {
@@ -221,11 +256,11 @@ export component SourcePicker inherits Rectangle {
                     if App.picker == "start" : VerticalLayout {
                         spacing: 12px;
                         Divider { }
-                        Text { text: "Áudio que vai junto"; font-size: 13px; font-weight: 500; color: Theme.fg; }
+                        Text { text: "Áudio que vai junto"; font-size: Theme.text-base; font-weight: 500; color: Theme.fg; }
                         AudioSource {
                             columns: 4;
                         }
-                        Text { text: "Quem pode entrar"; font-size: 13px; font-weight: 500; color: Theme.fg; }
+                        Text { text: "Quem pode entrar"; font-size: Theme.text-base; font-weight: 500; color: Theme.fg; }
                         HorizontalLayout {
                             spacing: 10px;
                             VisibilityOption {
@@ -247,9 +282,8 @@ export component SourcePicker inherits Rectangle {
                         }
                         // Senha: quem assiste precisa do código e dela (na lista aparece um cadeado).
                         Rectangle {
-                            border-radius: 10px;
-                            border-width: 1px;
-                            border-color: Theme.border;
+                            border-radius: Theme.radius-md;
+                            background: Theme.raised;
                             VerticalLayout {
                                 padding: 12px;
                                 padding-left: 16px;
@@ -265,11 +299,11 @@ export component SourcePicker inherits Rectangle {
                                                 alignment: center;
                                                 Icon { source: @image-url("icons/lock.svg"); tint: App.picker-pw-on ? Theme.live-text : Theme.muted-fg; width: 13px; height: 13px; }
                                             }
-                                            Text { text: "Pedir senha"; font-size: 13px; font-weight: 500; color: Theme.fg; }
+                                            Text { text: "Pedir senha"; font-size: Theme.text-base; font-weight: 500; color: Theme.fg; }
                                         }
                                         Text {
                                             text: "Só entra quem tiver o código e a senha.";
-                                            font-size: 12px;
+                                            font-size: Theme.text-sm;
                                             color: Theme.muted-fg;
                                             wrap: word-wrap;
                                         }
@@ -277,6 +311,7 @@ export component SourcePicker inherits Rectangle {
                                     VerticalLayout {
                                         alignment: center;
                                         Toggle {
+                                            label: "Pedir senha";
                                             checked: App.picker-pw-on;
                                             toggled(v) => { App.picker-pw-toggled(v); }
                                         }
@@ -294,9 +329,8 @@ export component SourcePicker inherits Rectangle {
                         // Malha P2P: a mesma opção das configurações da transmissão, aqui para
                         // escolher antes de começar (ligada durante a transmissão, só vale na próxima).
                         Rectangle {
-                            border-radius: 10px;
-                            border-width: 1px;
-                            border-color: Theme.border;
+                            border-radius: Theme.radius-md;
+                            background: Theme.raised;
                             HorizontalLayout {
                                 padding: 12px;
                                 padding-left: 16px;
@@ -306,12 +340,12 @@ export component SourcePicker inherits Rectangle {
                                     HorizontalLayout {
                                         spacing: 8px;
                                         alignment: start;
-                                        Text { text: "Malha P2P"; font-size: 13px; font-weight: 500; color: Theme.fg; vertical-alignment: center; }
-                                        Badge { mono: false; bg: Theme.warn.with-alpha(0.2); ink: Theme.fg; text: "Experimental"; }
+                                        Text { text: "Malha P2P"; font-size: Theme.text-base; font-weight: 500; color: Theme.fg; vertical-alignment: center; }
+                                        Tag { kind: "warn-soft"; mono: false; text: "Experimental"; }
                                     }
                                     Text {
                                         text: "Quem assiste repassa o vídeo para os outros: sua internet manda menos.";
-                                        font-size: 12px;
+                                        font-size: Theme.text-sm;
                                         color: Theme.muted-fg;
                                         wrap: word-wrap;
                                     }
@@ -319,6 +353,7 @@ export component SourcePicker inherits Rectangle {
                                 VerticalLayout {
                                     alignment: center;
                                     Toggle {
+                                        label: "Malha P2P";
                                         checked: App.s-mesh;
                                         toggled(v) => { App.set-setting("mesh", v ? "1" : "0"); }
                                     }

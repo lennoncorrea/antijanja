@@ -2426,8 +2426,14 @@ pub fn run() -> Result<(), slint::PlatformError> {
         st.name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Meu PC".into());
         settings::save(&st);
     }
-    // Sempre abre no tema do Windows (o botão de tema vale para a sessão).
-    let dark = settings::windows_prefers_dark();
+    // Sempre abre no tema do Windows (o botão de tema vale para a sessão). Na versão de
+    // desenvolvimento, AJ_THEME=light|dark força um tema (para conferir as telas).
+    let forced = if cfg!(debug_assertions) { std::env::var("AJ_THEME").ok() } else { None };
+    let dark = match forced.as_deref() {
+        Some("light") => false,
+        Some("dark") => true,
+        _ => settings::windows_prefers_dark(),
+    };
     ui.global::<Theme>().set_dark(dark);
     ui.global::<App>().set_my_name(s(&st.name));
 
@@ -2527,6 +2533,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
                 c.link_mode = "add".into();
             }
             render_friends(c, ui);
+            if what.starts_with("picker") {
+                open_picker(c, ui, "start");
+            }
         });
     }
 

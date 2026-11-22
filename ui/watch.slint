@@ -5,7 +5,7 @@
 // em ui/overlay.slint.
 import { Theme } from "theme.slint";
 import { App, Tile } from "state.slint";
-import { Badge, Btn, Cover, EmptyState, Icon, Spinner } from "widgets.slint";
+import { Btn, Cover, EmptyState, Icon, Spinner, Tag } from "widgets.slint";
 
 // Cabeçalho do Assistindo: título, quantas e "Ver todas". Outro código entra pelo campo
 // da barra do topo (ou Ctrl+V).
@@ -15,22 +15,19 @@ component AddBar inherits Rectangle {
         padding-left: 12px;
         padding-right: 12px;
         spacing: 12px;
-        Text { text: "Assistindo"; font-size: 16px; font-weight: 600; color: Theme.fg; vertical-alignment: center; }
+        Text { text: "Assistindo"; font-size: Theme.text-lg; font-weight: 600; color: Theme.fg; vertical-alignment: center; }
         if App.watch-count > 0 : VerticalLayout {
             alignment: center;
-            Badge { text: App.watch-count; }
+            Tag { kind: "neutral"; text: App.watch-count; }
         }
         if App.has-focus : VerticalLayout {
             alignment: center;
             Btn {
-                height: 32px;
+                size: "md";
                 kind: "outline";
-                font-size: 13px;
-                pad: 12px;
                 text: "Ver todas";
                 icon: @image-url("icons/grid.svg");
                 has-icon: true;
-                icon-size: 14px;
                 clicked => { App.unfocus(); }
             }
         }
@@ -66,7 +63,7 @@ component Step inherits HorizontalLayout {
     }
     Text {
         text: root.label;
-        font-size: 13px;
+        font-size: Theme.text-base;
         color: root.phase == 1 ? Theme.fg : Theme.muted-fg;
         vertical-alignment: center;
     }
@@ -76,7 +73,7 @@ component TileView inherits Rectangle {
     in property <Tile> t;
     property <bool> bare: App.fullscreen;
     background: Theme.card;
-    border-radius: bare ? 0px : 12px;
+    border-radius: bare ? 0px : Theme.radius-lg;
     border-width: bare ? 0px : 1px;
     border-color: Theme.border;
     clip: true;
@@ -106,15 +103,14 @@ component TileView inherits Rectangle {
                 }
                 VerticalLayout {
                     alignment: center;
-                    Text { text: root.t.name; font-size: 13px; font-weight: 600; color: Theme.fg; overflow: elide; }
-                    Text { text: "Entrando"; font-size: 12px; color: Theme.muted-fg; }
+                    Text { text: root.t.name; font-size: Theme.text-base; font-weight: 600; color: Theme.fg; overflow: elide; }
+                    Text { text: "Entrando"; font-size: Theme.text-sm; color: Theme.muted-fg; }
                 }
                 Rectangle { }
                 VerticalLayout {
                     alignment: center;
                     Btn {
-                        width: 32px;
-                        height: 32px;
+                        size: "md";
                         kind: "ghost";
                         icon-only: true;
                         icon: @image-url("icons/x.svg");

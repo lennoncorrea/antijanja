@@ -3,7 +3,7 @@ import { ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { App, SelectOption } from "state.slint";
 import { AudioSource } from "audio.slint";
-import { Badge, Btn, Card, Cover, Divider, Icon, Segmented, Select, Slider, Toggle, TextField } from "widgets.slint";
+import { Btn, Card, CardTitle, Cover, Divider, Icon, LiveDot, Segmented, Select, Slider, Tag, Toggle, TextField } from "widgets.slint";
 
 component Field inherits VerticalLayout {
     in property <string> label;
@@ -11,8 +11,9 @@ component Field inherits VerticalLayout {
     in property <string> value;
     callback selected(string);
     spacing: 8px;
-    Text { text: root.label; font-size: 13px; font-weight: 500; color: Theme.fg; }
+    Text { text: root.label; font-size: Theme.text-base; font-weight: 500; color: Theme.fg; }
     Select {
+        label: root.label;
         options: root.options;
         value: root.value;
         selected(v) => { root.selected(v); }
@@ -26,9 +27,8 @@ component ToggleRow inherits Rectangle {
     /// Selo ao lado do título (ex.: "Experimental").
     in property <string> badge;
     callback toggled(bool);
-    border-radius: 10px;
-    border-width: 1px;
-    border-color: Theme.border;
+    border-radius: Theme.radius-md;
+    background: Theme.raised;
     HorizontalLayout {
         padding: 12px;
         padding-left: 16px;
@@ -38,14 +38,15 @@ component ToggleRow inherits Rectangle {
             HorizontalLayout {
                 spacing: 8px;
                 alignment: start;
-                Text { text: root.title; font-size: 13px; font-weight: 500; color: Theme.fg; vertical-alignment: center; }
-                if root.badge != "" : Badge { mono: false; bg: Theme.warn.with-alpha(0.2); ink: Theme.fg; text: root.badge; }
+                Text { text: root.title; font-size: Theme.text-base; font-weight: 500; color: Theme.fg; vertical-alignment: center; }
+                if root.badge != "" : Tag { kind: "warn-soft"; mono: false; text: root.badge; }
             }
-            Text { text: root.body; font-size: 12px; color: Theme.muted-fg; wrap: word-wrap; }
+            Text { text: root.body; font-size: Theme.text-sm; color: Theme.muted-fg; wrap: word-wrap; }
         }
         VerticalLayout {
             alignment: center;
             Toggle {
+                label: root.title;
                 checked: root.checked;
                 toggled(v) => { root.toggled(v); }
             }
@@ -76,10 +77,9 @@ component SettingsCard inherits Card {
     VerticalLayout {
         padding: 20px;
         spacing: 14px;
-        VerticalLayout {
-            spacing: 4px;
-            Text { text: "Configurações da transmissão"; font-size: 16px; font-weight: 600; color: Theme.fg; }
-            Text { text: "As mudanças valem na hora, para todo mundo que está assistindo."; font-size: 13px; color: Theme.muted-fg; wrap: word-wrap; }
+        CardTitle {
+            title: "Configurações da transmissão";
+            body: "As mudanças valem na hora, para todo mundo que está assistindo.";
         }
         HorizontalLayout {
             alignment: start;
@@ -115,7 +115,7 @@ component SettingsCard inherits Card {
             }
             Text {
                 text: "O bitrate é atingido com movimento na tela. Com a imagem parada, o encoder gasta menos, porque não há o que mandar.";
-                font-size: 12px;
+                font-size: Theme.text-sm;
                 color: Theme.muted-fg;
                 wrap: word-wrap;
             }
@@ -146,7 +146,7 @@ component SettingsCard inherits Card {
                     }
                     Text {
                         text: App.s-password-set ? "Senha da transmissão: definida" : "Senha da transmissão";
-                        font-size: 13px;
+                        font-size: Theme.text-base;
                         font-weight: 500;
                         color: Theme.fg;
                     }
@@ -179,14 +179,14 @@ component SettingsCard inherits Card {
                 }
                 Text {
                     text: "Trocar a senha gera um código novo. Quem já está assistindo continua.";
-                    font-size: 12px;
+                    font-size: Theme.text-sm;
                     color: Theme.muted-fg;
                     wrap: word-wrap;
                 }
             }
             if App.has-info : Rectangle {
-                border-radius: 10px;
-                background: Theme.muted.with-alpha(0.6);
+                border-radius: Theme.radius-md;
+                background: Theme.raised;
                 VerticalLayout {
                     padding: 12px;
                     padding-left: 16px;
@@ -198,12 +198,12 @@ component SettingsCard inherits Card {
                             alignment: center;
                             Icon {
                                 source: App.hardware ? @image-url("icons/gauge.svg") : @image-url("icons/cpu.svg");
-                                tint: App.hardware ? Theme.live-text : Theme.warn;
+                                tint: App.hardware ? Theme.live-text : Theme.warn-text;
                             }
                         }
-                        Text { text: App.encoder-line; font-size: 13px; color: Theme.fg; }
+                        Text { text: App.encoder-line; font-size: Theme.text-base; color: Theme.fg; }
                     }
-                    Text { text: App.encoder-detail; font-size: 12px; color: Theme.muted-fg; wrap: word-wrap; }
+                    Text { text: App.encoder-detail; font-size: Theme.text-sm; color: Theme.muted-fg; wrap: word-wrap; }
                 }
             }
         }
@@ -214,23 +214,21 @@ component SettingsCard inherits Card {
                 columns: 2;
             }
             if App.watch-count > 0 && (App.s-audio-mode == "exclude" || App.s-audio-mode == "include") : Rectangle {
-                border-radius: 10px;
-                border-width: 1px;
-                border-color: Theme.warn.with-alpha(0.4);
-                background: Theme.warn.with-alpha(0.1);
+                border-radius: Theme.radius-md;
+                background: Theme.warn.with-alpha(0.12);
                 HorizontalLayout {
                     padding: 10px;
                     padding-left: 12px;
                     spacing: 8px;
                     Icon {
                         source: @image-url("icons/alert.svg");
-                        tint: Theme.warn;
+                        tint: Theme.warn-text;
                     }
                     Text {
                         text: App.s-audio-mode == "exclude"
                             ? "O áudio das transmissões que você está assistindo também vai junto neste modo. Use “Todo o PC”, que deixa o AntiJanja de fora."
                             : "Neste modo só o app escolhido vai na transmissão, então o áudio do que você assiste não vaza.";
-                        font-size: 12px;
+                        font-size: Theme.text-sm;
                         color: Theme.fg;
                         wrap: word-wrap;
                     }
@@ -247,14 +245,15 @@ component SettingsCard inherits Card {
                 VerticalLayout {
                     spacing: 8px;
                     HorizontalLayout {
-                        Text { text: "Volume"; font-size: 13px; font-weight: 500; color: Theme.fg; }
+                        Text { text: "Volume"; font-size: Theme.text-base; font-weight: 500; color: Theme.fg; }
                         Rectangle { }
-                        Text { text: App.s-volume + "%"; font-size: 13px; color: Theme.muted-fg; font-family: Theme.mono; }
+                        Text { text: App.s-volume + "%"; font-size: Theme.text-base; color: Theme.muted-fg; font-family: Theme.mono; }
                     }
                     VerticalLayout {
                         alignment: center;
                         min-height: 40px;
                         Slider {
+                            label: "Volume da transmissão";
                             minimum: 0;
                             maximum: 200;
                             step: 5;
@@ -286,7 +285,7 @@ component SettingsCard inherits Card {
                 }
                 Text {
                     text: App.audio-status;
-                    font-size: 13px;
+                    font-size: Theme.text-base;
                     color: App.audio-status-kind == "err" ? Theme.destructive : App.audio-status-kind == "ok" ? Theme.fg : Theme.muted-fg;
                     overflow: elide;
                 }
@@ -301,16 +300,14 @@ component CodeCard inherits Card {
         spacing: 14px;
         HorizontalLayout {
             spacing: 8px;
-            VerticalLayout {
-                spacing: 4px;
-                Text { text: "Código da transmissão"; font-size: 16px; font-weight: 600; color: Theme.fg; }
-                Text { text: "Quem tiver o código entra sozinho. Você não precisa aprovar."; font-size: 13px; color: Theme.muted-fg; wrap: word-wrap; }
+            CardTitle {
+                title: "Código da transmissão";
+                body: "Quem tiver o código entra sozinho. Você não precisa aprovar.";
             }
             VerticalLayout {
                 alignment: start;
                 Btn {
-                    width: 32px;
-                    height: 32px;
+                    size: "md";
                     kind: "ghost";
                     icon-only: true;
                     icon: @image-url("icons/refresh.svg");
@@ -323,19 +320,17 @@ component CodeCard inherits Card {
         }
         Rectangle {
             min-height: 96px;
-            border-radius: 10px;
-            border-width: 1px;
-            border-color: Theme.border;
-            background: Theme.muted.with-alpha(0.5);
+            border-radius: Theme.radius-md;
+            background: Theme.raised;
             VerticalLayout {
                 padding: 16px;
                 spacing: 4px;
-                if App.code == "" : Text { text: "Gerando código…"; font-size: 14px; color: Theme.muted-fg; }
-                if App.code != "" : Text { text: App.code-prefix; font-family: Theme.mono; font-size: 15px; color: Theme.live-text; }
+                if App.code == "" : Text { text: "Gerando código…"; font-size: Theme.text-md; color: Theme.muted-fg; }
+                if App.code != "" : Text { text: App.code-prefix; font-family: Theme.mono; font-size: Theme.text-md; color: Theme.live-text; }
                 if App.code != "" : Text {
                     text: App.code-body;
                     font-family: Theme.mono;
-                    font-size: 15px;
+                    font-size: Theme.text-md;
                     color: Theme.fg;
                     wrap: word-wrap;
                 }
@@ -350,9 +345,8 @@ component CodeCard inherits Card {
             clicked => { App.copy-my-code(); }
         }
         Rectangle {
-            border-radius: 10px;
-            border-width: 1px;
-            border-color: Theme.border;
+            border-radius: Theme.radius-md;
+            background: Theme.raised;
             HorizontalLayout {
                 padding: 10px;
                 padding-left: 12px;
@@ -366,13 +360,14 @@ component CodeCard inherits Card {
                 }
                 VerticalLayout {
                     spacing: 1px;
-                    Text { text: App.s-public ? "Pública" : "Só com o código"; font-size: 13px; font-weight: 500; color: Theme.fg; }
-                    Text { text: App.s-public ? "Aparece em “Ao vivo agora”" : "Não aparece na lista"; font-size: 12px; color: Theme.muted-fg; }
+                    Text { text: App.s-public ? "Pública" : "Só com o código"; font-size: Theme.text-base; font-weight: 500; color: Theme.fg; }
+                    Text { text: App.s-public ? "Aparece em “Ao vivo agora”" : "Não aparece na lista"; font-size: Theme.text-sm; color: Theme.muted-fg; }
                 }
                 Rectangle { }
                 VerticalLayout {
                     alignment: center;
                     Toggle {
+                        label: "Pública";
                         checked: App.s-public;
                         toggled(v) => { App.set-setting("public", v ? "1" : "0"); }
                     }
@@ -386,16 +381,16 @@ component ViewersCard inherits Card {
     VerticalLayout {
         padding: 20px;
         spacing: 10px;
-        Text { text: "Assistindo"; font-size: 16px; font-weight: 600; color: Theme.fg; }
+        CardTitle { title: "Assistindo"; }
         if App.peers.length == 0 : Text {
             text: "Ninguém ainda. Quem entrar com o código aparece aqui.";
-            font-size: 13px;
+            font-size: Theme.text-base;
             color: Theme.muted-fg;
             wrap: word-wrap;
         }
         for p in App.peers : Rectangle {
             height: 48px;
-            border-radius: 8px;
+            border-radius: Theme.radius-md;
             background: row.has-hover ? Theme.muted.with-alpha(0.6) : transparent;
             row := TouchArea { }
             HorizontalLayout {
@@ -416,15 +411,13 @@ component ViewersCard inherits Card {
                 VerticalLayout {
                     alignment: center;
                     spacing: 1px;
-                    Text { text: p.name; font-size: 13px; font-weight: 500; color: Theme.fg; overflow: elide; }
-                    Text { text: p.state-text; font-size: 12px; color: p.connected ? Theme.live-text : Theme.warn; }
+                    Text { text: p.name; font-size: Theme.text-base; font-weight: 500; color: Theme.fg; overflow: elide; }
+                    Text { text: p.state-text; font-size: Theme.text-sm; color: p.connected ? Theme.live-text : Theme.warn-text; }
                 }
                 if p.friend-action != "" : VerticalLayout {
                     alignment: center;
                     Btn {
-                        height: 28px;
-                        font-size: 11px;
-                        pad: 10px;
+                        size: "sm";
                         kind: "outline";
                         text: p.friend-action;
                         clicked => { App.add-friend-code(p.friend); }
@@ -433,13 +426,11 @@ component ViewersCard inherits Card {
                 VerticalLayout {
                     alignment: center;
                     Btn {
-                        width: 32px;
-                        height: 32px;
+                        size: "sm";
                         kind: "ghost";
                         icon-only: true;
                         icon: @image-url("icons/user-x.svg");
                         has-icon: true;
-                        opacity: row.has-hover ? 1 : 0;
                         accessible-label: "Remover " + p.name;
                         clicked => { App.kick(p.id); }
                     }
@@ -468,16 +459,11 @@ export component HostView inherits ScrollView {
                         alignment: start;
                         VerticalLayout {
                             alignment: center;
-                            Rectangle {
-                                width: 8px;
-                                height: 8px;
-                                border-radius: 4px;
-                                background: Theme.live;
-                            }
+                            LiveDot { }
                         }
-                        Text { text: "Você está transmitindo"; font-size: 18px; font-weight: 600; color: Theme.fg; }
+                        Text { text: "Você está transmitindo"; font-size: Theme.text-xl; font-weight: 600; color: Theme.fg; }
                     }
-                    Text { text: App.source-name; font-size: 13px; color: Theme.muted-fg; overflow: elide; }
+                    Text { text: App.source-name; font-size: Theme.text-base; color: Theme.muted-fg; overflow: elide; }
                 }
                 Rectangle { }
                 VerticalLayout {
@@ -505,7 +491,7 @@ export component HostView inherits ScrollView {
 
             preview := Rectangle {
                 height: Math.min(self.width * 9 / 16, 460px);
-                border-radius: 12px;
+                border-radius: Theme.radius-lg;
                 border-width: 1px;
                 border-color: Theme.border;
                 background: #000000;
@@ -516,20 +502,20 @@ export component HostView inherits ScrollView {
                     source: App.preview;
                     image-fit: contain;
                 }
-                Badge {
+                Tag {
                     x: 12px;
                     y: 12px;
-                    mono: false;
-                    bg: Theme.bg.with-alpha(0.8);
-                    text: "Prévia, atualiza a cada segundo";
+                    text: "PRÉVIA · 1 s";
                 }
                 Rectangle {
                     x: parent.width - self.width - 12px;
                     y: 12px;
-                    height: 22px;
+                    height: 20px;
                     width: eyeRow.preferred-width + 14px;
-                    border-radius: 6px;
-                    background: Theme.bg.with-alpha(0.8);
+                    border-radius: Theme.radius-xs;
+                    background: Theme.tag-bg;
+                    accessible-role: text;
+                    accessible-label: App.host-viewers == 1 ? "1 pessoa assistindo" : App.host-viewers + " pessoas assistindo";
                     eyeRow := HorizontalLayout {
                         padding-left: 7px;
                         padding-right: 7px;
@@ -538,23 +524,24 @@ export component HostView inherits ScrollView {
                             alignment: center;
                             Icon {
                                 source: @image-url("icons/eye.svg");
-                                width: 13px;
-                                height: 13px;
+                                tint: Theme.tag-fg;
+                                width: 12px;
+                                height: 12px;
                             }
                         }
-                        Text { text: App.host-viewers; font-size: 11px; color: Theme.fg; font-family: Theme.mono; vertical-alignment: center; }
+                        Text { text: App.host-viewers; font-size: Theme.text-xs; color: Theme.tag-fg; font-family: Theme.mono; vertical-alignment: center; accessible-role: none; }
                     }
                 }
                 if App.has-info : HorizontalLayout {
                     x: 12px;
-                    y: parent.height - 22px - 12px;
-                    height: 22px;
+                    y: parent.height - 20px - 12px;
+                    height: 20px;
                     spacing: 6px;
-                    Badge { bg: Theme.bg.with-alpha(0.8); text: "Envio " + App.stat-res; }
-                    Badge { bg: Theme.bg.with-alpha(0.8); text: "FPS " + App.stat-fps; }
-                    Badge { bg: Theme.bg.with-alpha(0.8); text: "Taxa " + App.stat-rate; }
-                    if App.stat-net != "" : Badge { bg: Theme.warn; ink: #000000; text: App.stat-net; }
-                    if App.stat-mesh != "" : Badge { bg: Theme.bg.with-alpha(0.8); text: App.stat-mesh; }
+                    Tag { text: App.stat-res; }
+                    Tag { text: App.stat-fps + " FPS"; }
+                    Tag { text: App.stat-rate; }
+                    if App.stat-net != "" : Tag { kind: "warn"; text: App.stat-net; }
+                    if App.stat-mesh != "" : Tag { text: App.stat-mesh; }
                 }
             }
 

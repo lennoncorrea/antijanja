@@ -1,7 +1,7 @@
 // Escolha da fonte de áudio que vai junto com a transmissão.
 import { Theme } from "theme.slint";
 import { App } from "state.slint";
-import { Btn, Icon, Select } from "widgets.slint";
+import { Btn, FocusRing, Icon, Select } from "widgets.slint";
 
 component ModeTile inherits Rectangle {
     in property <string> value;
@@ -9,10 +9,26 @@ component ModeTile inherits Rectangle {
     in property <image> icon;
     property <bool> on: App.s-audio-mode == value;
     height: 40px;
-    border-radius: 9px;
-    border-width: 1px;
-    border-color: on ? Theme.primary : Theme.border;
-    background: on ? Theme.accent : ta.has-hover ? Theme.muted : transparent;
+    border-radius: Theme.radius-md;
+    border-width: on ? 2px : 1px;
+    border-color: on ? Theme.interactive : ta.has-hover ? Theme.field-border : Theme.border;
+    background: on ? Theme.selected-bg : ta.has-hover ? Theme.muted : transparent;
+    animate background, border-color { duration: Theme.fast; }
+    accessible-role: radio-button;
+    accessible-label: label;
+    accessible-checked: on;
+    accessible-action-default => { App.set-setting("audio-mode", root.value); }
+    fs := FocusScope {
+        focus-on-click: false;
+        key-pressed(e) => {
+            if (e.text == " " || e.text == Key.Return) {
+                App.set-setting("audio-mode", root.value);
+                return accept;
+            }
+            reject
+        }
+    }
+    if fs.has-focus : FocusRing { radius: root.border-radius; }
     HorizontalLayout {
         padding-left: 12px;
         padding-right: 10px;
@@ -27,7 +43,7 @@ component ModeTile inherits Rectangle {
         Text {
             text: root.label;
             color: Theme.fg;
-            font-size: 13px;
+            font-size: Theme.text-base;
             font-weight: root.on ? 600 : 500;
             vertical-alignment: center;
             overflow: elide;
@@ -67,6 +83,7 @@ export component AudioSource inherits VerticalLayout {
     if App.s-audio-mode == "exclude" || App.s-audio-mode == "include" : HorizontalLayout {
         spacing: 8px;
         Select {
+            label: "App do áudio";
             horizontal-stretch: 1;
             options: App.app-options;
             value: App.s-audio-app;
