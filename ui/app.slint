@@ -236,8 +236,8 @@ component TopBar inherits Rectangle {
                     accessible-label: App.net == "ok" ? "Rede P2P conectada" : App.net == "err" ? "Sem rede P2P" : "Entrando na rede P2P";
                 }
             }
-            if !root.compact : Text {
-                text: App.net == "ok" ? "Rede P2P conectada" : App.net == "err" ? "Sem rede P2P" : "Entrando na rede P2P";
+            if !root.compact && App.net != "ok" : Text {
+                text: App.net == "err" ? "Sem rede P2P" : "Entrando na rede P2P";
                 font-size: Theme.text-sm;
                 color: Theme.muted-fg;
                 vertical-alignment: center;
