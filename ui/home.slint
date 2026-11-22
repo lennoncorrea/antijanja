@@ -739,6 +739,8 @@ export component HomeView inherits Rectangle {
                     vertical-stretch: 1;
                     VerticalLayout {
                         alignment: start;
+                        // Espaço da barra de rolagem (não cobre os botões dos amigos).
+                        padding-right: 10px;
                         FriendsBlock { }
                     }
                 }

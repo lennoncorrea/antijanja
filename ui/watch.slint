@@ -5,10 +5,12 @@
 // em ui/overlay.slint.
 import { Theme } from "theme.slint";
 import { App, Tile } from "state.slint";
-import { Badge, Btn, Cover, EmptyState, Icon, Spinner, TextField } from "widgets.slint";
+import { Badge, Btn, Cover, EmptyState, Icon, Spinner } from "widgets.slint";
 
+// Cabeçalho do Assistindo: título, quantas e "Ver todas". Outro código entra pelo campo
+// da barra do topo (ou Ctrl+V).
 component AddBar inherits Rectangle {
-    height: 60px;
+    height: 52px;
     HorizontalLayout {
         padding-left: 12px;
         padding-right: 12px;
@@ -33,42 +35,6 @@ component AddBar inherits Rectangle {
             }
         }
         Rectangle { }
-        VerticalLayout {
-            alignment: center;
-            HorizontalLayout {
-                spacing: 8px;
-                code := TextField {
-                    width: 340px;
-                    mono: true;
-                    placeholder: "Cole outro código (AJ3.)";
-                    accepted(t) => {
-                        App.join(t);
-                        self.text = "";
-                    }
-                }
-                Btn {
-                    width: 40px;
-                    kind: "outline";
-                    icon-only: true;
-                    icon: @image-url("icons/paste.svg");
-                    has-icon: true;
-                    accessible-label: "Colar e entrar";
-                    clicked => { App.paste-join(); }
-                }
-                Btn {
-                    kind: "primary";
-                    text: "Adicionar";
-                    icon: @image-url("icons/plus.svg");
-                    has-icon: true;
-                    clicked => {
-                        if (code.text != "") {
-                            App.join(code.text);
-                            code.text = "";
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -195,7 +161,7 @@ export component WatchView inherits Rectangle {
                         width: 420px;
                         icon: @image-url("icons/tv.svg");
                         title: "Nenhuma transmissão aberta";
-                        body: "Cole um código acima para assistir. Dá para abrir várias ao mesmo tempo, e elas aparecem lado a lado.";
+                        body: "Cole um código no campo lá em cima (ou aperte Ctrl+V). Dá para abrir várias ao mesmo tempo, lado a lado.";
                     }
                 }
             }

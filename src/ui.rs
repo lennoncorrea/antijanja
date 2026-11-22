@@ -17,7 +17,7 @@ slint::include_modules!();
 
 // Medidas fixas da tela "Assistindo" (iguais às do watch.slint).
 const TOPBAR: f32 = 44.0;
-const ADDBAR: f32 = 60.0;
+const ADDBAR: f32 = 52.0;
 const PAD: f32 = 12.0;
 const GAP: f32 = 12.0;
 /// Cabeçalho do tile enquanto conecta.
@@ -1970,10 +1970,11 @@ fn wire(ui: &AppWindow) {
     a.on_watch(|code| later(move |c, ui| join_with_code(c, ui, &code)));
     a.on_join(|code| later(move |c, ui| join_with_code(c, ui, &code)));
     a.on_paste_join(|| later(paste_join));
-    // Ctrl+V fora de um campo: só no Início, sem janela aberta por cima.
+    // Ctrl+V fora de um campo: no Início e no Assistindo (fora da tela cheia), sem janela
+    // aberta por cima.
     a.on_key_paste(|| {
         later(|c, ui| {
-            if c.view == "home" && c.picker.is_empty() && !c.account_open && c.password_for.is_none() && !c.updating {
+            if (c.view == "home" || (c.view == "watch" && !c.fullscreen)) && c.picker.is_empty() && !c.account_open && c.password_for.is_none() && !c.updating {
                 paste_join(c, ui);
             }
         })

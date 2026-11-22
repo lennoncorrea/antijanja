@@ -187,6 +187,8 @@ export component SourcePicker inherits Rectangle {
                 VerticalLayout {
                     spacing: 14px;
                     padding-bottom: 4px;
+                    // Espaço da barra de rolagem: ela não fica por cima dos cartões.
+                    padding-right: 14px;
                     if App.sources-loading : HorizontalLayout {
                         height: 160px;
                         alignment: center;
