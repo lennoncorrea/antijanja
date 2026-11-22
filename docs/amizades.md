@@ -90,10 +90,14 @@ comum (pela caixa de entrada); se o outro já tinha pedido, vira "Aceitar".
 - **Início**: as transmissões de amigos entram em "Ao vivo agora", primeiro, com a etiqueta
   "AMIGO" (e "SÓ AMIGOS" quando não estão no mural público).
 - **Coluna da direita**: o bloco "Amigos" (pedidos recebidos com aceitar/recusar, quem está
-  online com "Assistir", "Ir junto" ou "Convidar", e os offline recolhidos).
-- **Entrar com código**: aceita `AJ3.…` (assistir) e `AJF.…` (pedido de amizade).
-- **Você**: nome, impressão e "Meu código", que abre a janela da conta (código de amigo,
-  este aparelho, frase de recuperação e entrar com outra conta pela frase).
+  online com "Assistir", "Ir junto" ou "Convidar", e os offline recolhidos). Sem amigos, um
+  convite com "Copiar meu código". Amigos aparecem em roxo (capa, etiqueta "AMIGO").
+- **Campo de código** (barra do topo): aceita `AJ3.…` (assistir) e `AJF.…` (pedido de
+  amizade). Ctrl+V fora de um campo de texto, no Início, entra com o código copiado. Um
+  código copiado em outro app vira o aviso "Código copiado · Entrar" (só no PC; fica de fora
+  o que o próprio app copiou, o seu código e o que já foi usado ou dispensado).
+- **Você**: nome (editável no lugar), impressão; o avatar e o botão de conta abrem a janela
+  da conta (código de amigo, este aparelho, frase de recuperação e entrar com outra conta).
 - **Convite**: um cartão no canto com "Assistir" e "Agora não".
 
 ## Limites (sem servidor)

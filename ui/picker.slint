@@ -61,6 +61,43 @@ component SourceCard inherits Rectangle {
     }
 }
 
+// Uma das duas opções de "Quem pode entrar" (pública ou só com código).
+component VisibilityOption inherits Rectangle {
+    in property <bool> on;
+    in property <image> icon;
+    in property <string> title;
+    in property <string> detail;
+    callback picked();
+    height: 60px;
+    border-radius: 10px;
+    border-width: root.on ? 2px : 1px;
+    border-color: root.on ? Theme.primary : ta.has-hover ? Theme.input : Theme.border;
+    background: root.on ? Theme.feature-bg : Theme.muted.with-alpha(0.5);
+    accessible-role: radio-button;
+    accessible-checked: root.on;
+    accessible-label: root.title;
+    accessible-action-default => { root.picked(); }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.picked(); }
+    }
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            Icon { source: root.icon; tint: root.on ? Theme.live-text : Theme.muted-fg; width: 18px; height: 18px; }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            Text { text: root.title; font-size: 14px; font-weight: 700; color: Theme.fg; }
+            Text { text: root.detail; font-size: 12px; color: root.on ? Theme.soft-fg : Theme.muted-fg; overflow: elide; }
+        }
+    }
+}
+
 export component SourcePicker inherits Rectangle {
     background: Theme.overlay;
     // Clique fora fecha.
@@ -150,6 +187,8 @@ export component SourcePicker inherits Rectangle {
                 VerticalLayout {
                     spacing: 14px;
                     padding-bottom: 4px;
+                    // Espaço da barra de rolagem: ela não fica por cima dos cartões.
+                    padding-right: 14px;
                     if App.sources-loading : HorizontalLayout {
                         height: 160px;
                         alignment: center;
@@ -186,31 +225,24 @@ export component SourcePicker inherits Rectangle {
                         AudioSource {
                             columns: 4;
                         }
-                        Rectangle {
-                            border-radius: 10px;
-                            border-width: 1px;
-                            border-color: Theme.border;
-                            HorizontalLayout {
-                                padding: 12px;
-                                padding-left: 16px;
-                                spacing: 16px;
-                                VerticalLayout {
-                                    spacing: 2px;
-                                    Text { text: "Aparecer em “Ao vivo agora”"; font-size: 13px; font-weight: 500; color: Theme.fg; }
-                                    Text {
-                                        text: "Qualquer pessoa com o AntiJanja vê sua transmissão na lista e pode entrar. Desligado, só entra quem receber o código.";
-                                        font-size: 12px;
-                                        color: Theme.muted-fg;
-                                        wrap: word-wrap;
-                                    }
-                                }
-                                VerticalLayout {
-                                    alignment: center;
-                                    Toggle {
-                                        checked: App.s-public;
-                                        toggled(v) => { App.set-setting("public", v ? "1" : "0"); }
-                                    }
-                                }
+                        Text { text: "Quem pode entrar"; font-size: 13px; font-weight: 500; color: Theme.fg; }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            VisibilityOption {
+                                horizontal-stretch: 1;
+                                on: App.s-public;
+                                icon: @image-url("icons/globe.svg");
+                                title: "Pública";
+                                detail: "Aparece em “Ao vivo agora”";
+                                picked => { App.set-setting("public", "1"); }
+                            }
+                            VisibilityOption {
+                                horizontal-stretch: 1;
+                                on: !App.s-public;
+                                icon: @image-url("icons/link.svg");
+                                title: "Só com código";
+                                detail: "Amigos e quem receber o código";
+                                picked => { App.set-setting("public", "0"); }
                             }
                         }
                         // Senha: quem assiste precisa do código e dela (na lista aparece um cadeado).
@@ -236,9 +268,7 @@ export component SourcePicker inherits Rectangle {
                                             Text { text: "Pedir senha"; font-size: 13px; font-weight: 500; color: Theme.fg; }
                                         }
                                         Text {
-                                            text: App.picker-pw-on
-                                                ? "Só entra quem tiver o código e a senha. Na lista “Ao vivo agora” aparece um cadeado."
-                                                : "Desligado, qualquer pessoa com o código entra.";
+                                            text: "Só entra quem tiver o código e a senha.";
                                             font-size: 12px;
                                             color: Theme.muted-fg;
                                             wrap: word-wrap;
@@ -280,7 +310,7 @@ export component SourcePicker inherits Rectangle {
                                         Badge { mono: false; bg: Theme.warn.with-alpha(0.2); ink: Theme.fg; text: "Experimental"; }
                                     }
                                     Text {
-                                        text: "Quem assiste repassa partes do vídeo para os outros e sua internet manda menos. Os espectadores se conectam entre si.";
+                                        text: "Quem assiste repassa o vídeo para os outros: sua internet manda menos.";
                                         font-size: 12px;
                                         color: Theme.muted-fg;
                                         wrap: word-wrap;
@@ -325,7 +355,7 @@ export component SourcePicker inherits Rectangle {
                         alignment: center;
                         Btn {
                             kind: "primary";
-                            text: App.picker == "switch" ? "Trocar para esta fonte" : "Começar transmissão";
+                            text: App.picker == "switch" ? "Trocar para esta fonte" : App.s-public ? "Começar transmissão pública" : "Começar só com código";
                             enabled: App.picker-selected != "";
                             clicked => { App.picker-confirm(App.picker-selected); }
                         }
