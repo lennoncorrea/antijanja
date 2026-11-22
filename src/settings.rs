@@ -42,7 +42,8 @@ impl Default for Settings {
             audio_app: String::new(),
             abitrate: 192,
             volume: 100,
-            public: true,
+            // Primeira vez: "Só com código" (depois vale a última escolha).
+            public: false,
             view_volume: 100,
             view_fps: 0,
             stream_password: String::new(),

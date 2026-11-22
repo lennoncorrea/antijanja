@@ -48,11 +48,11 @@ export global Ov {
 
 // Cores fixas: os controles ficam sobre o vídeo, em qualquer tema.
 global Ink {
-    out property <color> fg: #e8f1f3;
-    out property <color> soft: #c4d6da;
+    out property <color> fg: #e6f9f9;
+    out property <color> soft: #c0dddd;
     out property <color> hover: #ffffff24;
-    out property <color> cyan: #00d4ff;
-    out property <color> live: #1cc2e3;
+    out property <color> cyan: #31d5d8;
+    out property <color> live: #31d5d8;
 }
 
 component OvBtn inherits Rectangle {
@@ -87,7 +87,7 @@ component OvBadge inherits Rectangle {
     height: 20px;
     width: label.preferred-width + 14px;
     border-radius: 5px;
-    background: root.warn ? #f2c14e : #040a0b8c;
+    background: root.warn ? #f2c14e : #0410108c;
     label := Text {
         text: root.text;
         font-family: Theme.mono;
@@ -290,7 +290,7 @@ component TileControls inherits Rectangle {
                     width: 30px;
                     height: 30px;
                     border-radius: 15px;
-                    background: #06303b;
+                    background: #083233;
                     Text {
                         text: root.t.initials;
                         font-size: 11px;

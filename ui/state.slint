@@ -157,6 +157,9 @@ export global App {
     in property <string> view: "home";
     in property <string> net: "pending";
     in property <bool> fullscreen;
+    // Janela com menos de 1100 px de largura (calculado no Rust: na interface viraria um
+    // laço, a largura mínima da janela depende da barra do topo).
+    in property <bool> narrow;
     in property <bool> live;
     in property <int> host-viewers;
     in property <int> watch-count;
@@ -184,6 +187,13 @@ export global App {
     callback copy-code(string);
     callback join(string);
     callback paste-join();
+    // Ctrl+V fora de um campo de texto: entra com o código copiado (só no Início).
+    callback key-paste();
+    // Código de live ou de amigo que apareceu na área de transferência (vazio = nenhum).
+    in property <string> clip-code;
+    in property <bool> clip-friend;
+    callback clip-use();
+    callback clip-dismiss();
 
     // ------------------------------------------------- Configurações da transmissão
     in property <string> s-res: "1080";

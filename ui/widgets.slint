@@ -346,14 +346,16 @@ export component Cover inherits Rectangle {
     in property <string> initials;
     in property <int> idx: 1;
     in property <bool> big: false;
+    // Capa de um amigo (roxo).
+    in property <bool> friend: false;
     in property <length> text-size: 40px;
     clip: true;
-    background: big ? Theme.feature-bg : Theme.cover-bg(idx);
+    background: friend ? Theme.friend-bg : big ? Theme.feature-bg : Theme.cover-bg(idx);
     Text {
         width: 100%;
         height: 100%;
         text: root.initials;
-        color: root.big ? Theme.feature-ink : Theme.cover-ink(root.idx);
+        color: root.friend ? Theme.friend-ink : root.big ? Theme.feature-ink : Theme.cover-ink(root.idx);
         font-size: root.text-size;
         font-weight: 800;
         letter-spacing: -1px;
@@ -366,7 +368,9 @@ export component Cover inherits Rectangle {
 // Etiqueta escura sobre capas e vídeo (qualidade, contagem).
 export component Tag inherits Rectangle {
     in property <string> text;
-    background: Theme.tag-bg;
+    in property <color> bg: Theme.tag-bg;
+    in property <color> ink: Theme.tag-fg;
+    background: bg;
     border-radius: 4px;
     width: t.preferred-width + 12px;
     height: t.preferred-height + 6px;
@@ -374,7 +378,7 @@ export component Tag inherits Rectangle {
         x: 6px;
         y: 3px;
         text: root.text;
-        color: Theme.tag-fg;
+        color: root.ink;
         font-size: 11px;
         font-family: Theme.mono;
     }
@@ -446,7 +450,7 @@ export component KeyGlyphs inherits HorizontalLayout {
             width: g.shape == 3 ? root.size * 0.6 : root.size;
             height: root.size;
             border-radius: g.shape == 1 ? root.size / 2 : g.shape == 2 ? root.size * 0.32 : 1.5px;
-            background: g.color == 0 ? #00d4ff : g.color == 1 ? #f2c14e : g.color == 2 ? #f0604f : g.color == 3 ? #3ddc97 : g.color == 4 ? #b38cff : #ff8fc7;
+            background: g.color == 0 ? #31d5d8 : g.color == 1 ? #f2c14e : g.color == 2 ? #f0604f : g.color == 3 ? #3ddc97 : g.color == 4 ? #b38cff : #ff8fc7;
         }
     }
 }

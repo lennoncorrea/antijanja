@@ -2,38 +2,54 @@
 import { ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { App, Stream, FriendItem, RequestItem } from "state.slint";
-import { Btn, Card, Cover, Divider, EmptyState, Eyebrow, Icon, KeyGlyphs, Tag, TextField, Toggle } from "widgets.slint";
+import { Btn, Card, Cover, Divider, EmptyState, Eyebrow, Icon, KeyGlyphs, Tag } from "widgets.slint";
+
+// Quantos assistem (com o ícone de olho) e há quanto tempo.
+component Meta inherits HorizontalLayout {
+    in property <int> viewers;
+    in property <string> since;
+    in property <length> size: 11px;
+    spacing: 5px;
+    alignment: start;
+    VerticalLayout {
+        alignment: center;
+        Icon { source: @image-url("icons/eye.svg"); tint: Theme.muted-fg; width: root.size + 2px; height: root.size + 2px; }
+    }
+    Text { text: root.viewers + " · " + root.since; font-size: root.size; color: Theme.muted-fg; font-family: Theme.mono; overflow: elide; vertical-alignment: center; }
+}
+
+// Etiqueta "AO VIVO" (ciano).
+component LivePill inherits Rectangle {
+    width: live.preferred-width + 16px;
+    height: 22px;
+    border-radius: 4px;
+    background: Theme.live;
+    live := Text {
+        x: 8px;
+        height: 100%;
+        vertical-alignment: center;
+        text: "AO VIVO";
+        color: Theme.primary-fg;
+        font-family: Theme.mono;
+        font-size: 11px;
+        font-weight: 500;
+        letter-spacing: 0.9px;
+    }
+}
 
 component Featured inherits Card {
     in property <Stream> s;
-    height: 236px;
+    height: 216px;
     clip: true;
     HorizontalLayout {
         Cover {
-            max-width: 420px;
+            max-width: 380px;
             horizontal-stretch: 0.8;
             big: true;
+            friend: root.s.friend;
             initials: root.s.initials;
-            text-size: 96px;
-            Rectangle {
-                x: 12px;
-                y: 12px;
-                width: live.preferred-width + 16px;
-                height: 22px;
-                border-radius: 4px;
-                background: Theme.live;
-                live := Text {
-                    x: 8px;
-                    height: 100%;
-                    vertical-alignment: center;
-                    text: "AO VIVO";
-                    color: Theme.primary-fg;
-                    font-family: Theme.mono;
-                    font-size: 11px;
-                    font-weight: 500;
-                    letter-spacing: 0.9px;
-                }
-            }
+            text-size: 88px;
+            LivePill { x: 12px; y: 12px; }
             Tag {
                 x: 12px;
                 y: parent.height - self.height - 12px;
@@ -47,6 +63,7 @@ component Featured inherits Card {
             spacing: 10px;
             Eyebrow {
                 text: root.s.friend ? (root.s.friends-only ? "AMIGO · SÓ AMIGOS" : "AMIGO AO VIVO") : "MAIS ASSISTIDA";
+                color: root.s.friend ? Theme.friend-text : Theme.muted-fg;
             }
             HorizontalLayout {
                 spacing: 8px;
@@ -58,7 +75,7 @@ component Featured inherits Card {
                 }
             }
             Text { text: root.s.title; font-size: 15px; color: Theme.soft-fg; overflow: elide; }
-            Text { text: root.s.viewers + " assistindo   ·   " + root.s.since; font-size: 12px; color: Theme.muted-fg; font-family: Theme.mono; }
+            Meta { viewers: root.s.viewers; since: root.s.since; size: 12px; }
             Rectangle { }
             HorizontalLayout {
                 spacing: 8px;
@@ -86,17 +103,56 @@ component Featured inherits Card {
     }
 }
 
+// Uma transmissão na grade. O cartão inteiro abre a live (clique, Enter ou espaço);
+// `big`: com poucas lives, dois cartões grandes por linha.
 component StreamCard inherits Card {
     in property <Stream> s;
-    border-radius: 12px;
+    in property <bool> big;
+    property <bool> hot: !root.s.blank && (ta.has-hover || keys.has-focus);
+    border-radius: root.big ? 14px : 12px;
+    border-color: root.hot ? Theme.primary : Theme.border;
     clip: true;
-    opacity: s.blank ? 0 : 1;
+    opacity: root.s.blank ? 0 : 1;
+    accessible-role: button;
+    accessible-label: root.s.watching ? "Ver " + root.s.name : "Assistir " + root.s.name;
+    accessible-action-default => { root.open(); }
+
+    function open() {
+        if (root.s.blank) {
+            return;
+        }
+        if (root.s.watching) {
+            App.navigate("watch");
+        } else {
+            App.watch(root.s.code);
+        }
+    }
+
+    keys := FocusScope {
+        enabled: !root.s.blank;
+        focus-on-click: false;
+        key-pressed(e) => {
+            if (e.text == Key.Return || e.text == " ") {
+                root.open();
+                return accept;
+            }
+            reject
+        }
+    }
+    ta := TouchArea {
+        enabled: !root.s.blank;
+        mouse-cursor: pointer;
+        clicked => { root.open(); }
+    }
     VerticalLayout {
         Cover {
-            height: 104px;
+            height: root.big ? 190px : 104px;
             idx: root.s.cover;
+            friend: root.s.friend;
             initials: root.s.initials;
-            if !root.s.friend : Rectangle {
+            text-size: root.big ? 64px : 40px;
+            if root.big && !root.s.friend : LivePill { x: 12px; y: 12px; }
+            if !root.big && !root.s.friend : Rectangle {
                 x: 8px;
                 y: 8px;
                 width: 8px;
@@ -105,54 +161,57 @@ component StreamCard inherits Card {
                 background: Theme.live;
             }
             if root.s.friend : Tag {
-                x: 8px;
-                y: 8px;
+                x: root.big ? 12px : 8px;
+                y: root.big ? 12px : 8px;
+                bg: Theme.friend-solid;
+                ink: Theme.friend-solid-fg;
                 text: root.s.friends-only ? "AMIGO · SÓ AMIGOS" : "AMIGO";
             }
             Tag {
-                x: parent.width - self.width - 8px;
-                y: parent.height - self.height - 8px;
+                x: parent.width - self.width - (root.big ? 12px : 8px);
+                y: parent.height - self.height - (root.big ? 12px : 8px);
                 text: root.s.quality;
             }
+            if root.s.watching : Tag {
+                x: parent.width - self.width - (root.big ? 12px : 8px);
+                y: root.big ? 12px : 8px;
+                bg: Theme.live;
+                ink: Theme.primary-fg;
+                text: "ASSISTINDO";
+            }
+            // Ao passar o mouse (ou com o foco do teclado): o botão de play no meio.
+            if root.hot && !root.s.watching : Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 44px;
+                height: 44px;
+                border-radius: 22px;
+                background: Theme.primary;
+                Icon {
+                    x: 16px;
+                    y: 14px;
+                    source: @image-url("icons/play.svg");
+                    tint: Theme.primary-fg;
+                    width: 15px;
+                    height: 15px;
+                }
+            }
         }
-        HorizontalLayout {
-            padding: 12px;
-            padding-top: 10px;
-            spacing: 10px;
-            VerticalLayout {
-                spacing: 2px;
-                HorizontalLayout {
-                    spacing: 6px;
-                    alignment: start;
-                    Text { text: root.s.name; font-size: 14px; font-weight: 600; color: Theme.fg; overflow: elide; }
-                    if root.s.locked : VerticalLayout {
-                        alignment: center;
-                        Icon { source: @image-url("icons/lock.svg"); tint: Theme.muted-fg; width: 13px; height: 13px; }
-                    }
-                }
-                Text { text: root.s.title; font-size: 12px; color: Theme.muted-fg; overflow: elide; }
-                Text { text: root.s.viewers + " · " + root.s.since; font-size: 11px; color: Theme.muted-fg; font-family: Theme.mono; overflow: elide; }
-            }
-            VerticalLayout {
-                alignment: center;
-                if !root.s.watching : Btn {
-                    width: 36px;
-                    height: 36px;
-                    icon-only: true;
-                    icon: @image-url("icons/play.svg");
-                    has-icon: true;
-                    icon-size: 12px;
-                    accessible-label: "Assistir " + root.s.name;
-                    clicked => { App.watch(root.s.code); }
-                }
-                if root.s.watching : Btn {
-                    height: 32px;
-                    font-size: 12px;
-                    pad: 10px;
-                    text: "Assistindo";
-                    clicked => { App.navigate("watch"); }
+        VerticalLayout {
+            padding: root.big ? 16px : 12px;
+            padding-top: root.big ? 14px : 10px;
+            spacing: root.big ? 4px : 2px;
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: start;
+                Text { text: root.s.name; font-size: root.big ? 17px : 14px; font-weight: root.big ? 700 : 600; color: Theme.fg; overflow: elide; }
+                if root.s.locked : VerticalLayout {
+                    alignment: center;
+                    Icon { source: @image-url("icons/lock.svg"); tint: Theme.muted-fg; width: 13px; height: 13px; accessible-role: image; accessible-label: "Com senha"; }
                 }
             }
+            Text { text: root.s.title; font-size: root.big ? 13px : 12px; color: root.big ? Theme.soft-fg : Theme.muted-fg; overflow: elide; }
+            Meta { viewers: root.s.viewers; since: root.s.since; size: root.big ? 12px : 11px; }
         }
     }
 }
@@ -186,7 +245,7 @@ component LiveNow inherits ScrollView {
             }
             VerticalLayout {
                 alignment: end;
-                padding-bottom: 4px;
+                padding-bottom: 6px;
                 Text {
                     text: App.net == "ok" && !App.public-loading ? App.public-count + (App.public-count == 1 ? " transmissão" : " transmissões") + " · " + App.public-watching + " assistindo" : "";
                     font-size: 13px;
@@ -195,19 +254,28 @@ component LiveNow inherits ScrollView {
                 }
             }
             Rectangle { }
-            VerticalLayout {
+            HorizontalLayout {
+                spacing: 6px;
                 alignment: end;
-                Btn {
-                    kind: "outline";
-                    height: 32px;
-                    font-size: 12px;
-                    pad: 12px;
-                    text: App.public-updated;
-                    icon: @image-url("icons/refresh.svg");
-                    has-icon: true;
-                    icon-size: 14px;
-                    enabled: App.net == "ok" && !App.public-busy;
-                    clicked => { App.refresh-public(); }
+                VerticalLayout {
+                    alignment: end;
+                    padding-bottom: 8px;
+                    Text { text: App.public-updated; font-size: 12px; color: Theme.muted-fg; }
+                }
+                VerticalLayout {
+                    alignment: end;
+                    Btn {
+                        kind: "outline";
+                        width: 32px;
+                        height: 32px;
+                        icon-only: true;
+                        icon: @image-url("icons/refresh.svg");
+                        has-icon: true;
+                        icon-size: 14px;
+                        accessible-label: "Atualizar agora";
+                        enabled: App.net == "ok" && !App.public-busy;
+                        clicked => { App.refresh-public(); }
+                    }
                 }
             }
         }
@@ -220,7 +288,7 @@ component LiveNow inherits ScrollView {
             title: "Lendo quem está ao vivo…";
             body: "Consultando o mural público na rede P2P.";
         }
-        if App.net == "ok" && !App.public-loading && !App.has-featured : EmptyState {
+        if App.net == "ok" && !App.public-loading && App.public-count == 0 : EmptyState {
             title: "Ninguém transmitindo publicamente agora";
             body: App.public-mine ? "A sua transmissão está na lista para os outros." : "Quando alguém começar uma transmissão pública, ela aparece aqui.";
             if !App.public-mine && !App.live : HorizontalLayout {
@@ -241,90 +309,60 @@ component LiveNow inherits ScrollView {
             spacing: 12px;
             for s in row.items : StreamCard {
                 horizontal-stretch: 1;
+                big: row.items.length == 2;
                 s: s;
             }
         }
     }
 }
 
-component TransmitCard inherits Card {
-    VerticalLayout {
-        padding: 18px;
-        spacing: 12px;
-        Eyebrow { text: "TRANSMITIR"; }
-        if App.live : HorizontalLayout {
-            spacing: 8px;
-            alignment: start;
-            VerticalLayout {
-                alignment: center;
-                Rectangle {
-                    width: 8px;
-                    height: 8px;
-                    border-radius: 4px;
-                    background: Theme.live;
-                }
-            }
-            Text { text: "Você está no ar"; font-size: 19px; font-weight: 700; color: Theme.fg; }
-        }
-        if App.live : Text {
-            text: App.host-viewers == 0 ? "Ninguém assistindo ainda." : App.host-viewers == 1 ? "1 pessoa assistindo." : App.host-viewers + " pessoas assistindo.";
-            font-size: 14px;
-            color: Theme.muted-fg;
-        }
-        if App.live : Btn {
-            kind: "strong";
-            height: 44px;
-            text: "Ver minha transmissão";
-            clicked => { App.navigate("host"); }
-        }
-        if !App.live : Text { text: "Sua tela no ar em 2 cliques"; font-size: 19px; font-weight: 700; color: Theme.fg; wrap: word-wrap; }
-        if !App.live : Btn {
-            kind: "strong";
-            height: 44px;
-            text: "Começar transmissão";
-            clicked => { App.open-picker("start"); }
-        }
-        HorizontalLayout {
-            Text { text: "Aparecer em “Ao vivo”"; font-size: 13px; color: Theme.soft-fg; vertical-alignment: center; }
-            Rectangle { }
-            VerticalLayout {
-                alignment: center;
-                Toggle {
-                    checked: App.s-public;
-                    toggled(v) => { App.set-setting("public", v ? "1" : "0"); }
-                }
-            }
-        }
-    }
-}
-
-component CodeEntry inherits VerticalLayout {
+// Transmitir: o botão de começar, ou "Você está no ar" quando está transmitindo.
+// (Pública ou só com código se escolhe ao começar, e na tela "Transmitindo".)
+component StartBlock inherits VerticalLayout {
     vertical-stretch: 0;
-    spacing: 8px;
-    Eyebrow { text: "ENTRAR COM CÓDIGO"; }
-    HorizontalLayout {
-        spacing: 6px;
-        field := TextField {
-            mono: true;
-            placeholder: "AJ3.… ou AJF.…";
-            accepted(t) => {
-                App.join(t);
-                self.text = "";
-            }
-        }
-        Btn {
-            width: 40px;
-            icon-only: true;
-            icon: @image-url("icons/paste.svg");
-            has-icon: true;
-            accessible-label: "Colar e entrar";
-            clicked => {
-                if (field.text != "") {
-                    App.join(field.text);
-                    field.text = "";
-                } else {
-                    App.paste-join();
+    if !App.live : Btn {
+        kind: "strong";
+        height: 44px;
+        bold: true;
+        text: "Começar transmissão";
+        icon: @image-url("icons/radio.svg");
+        has-icon: true;
+        clicked => { App.open-picker("start"); }
+    }
+    if App.live : Card {
+        border-radius: 12px;
+        VerticalLayout {
+            padding: 14px;
+            spacing: 12px;
+            HorizontalLayout {
+                spacing: 8px;
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        background: Theme.live;
+                    }
                 }
+                Text { text: "Você está no ar"; font-size: 15px; font-weight: 700; color: Theme.fg; vertical-alignment: center; horizontal-stretch: 1; }
+                VerticalLayout {
+                    alignment: center;
+                    Icon { source: @image-url("icons/eye.svg"); tint: Theme.muted-fg; width: 14px; height: 14px; }
+                }
+                Text {
+                    text: App.host-viewers;
+                    font-size: 12px;
+                    color: Theme.muted-fg;
+                    font-family: Theme.mono;
+                    vertical-alignment: center;
+                    accessible-label: App.host-viewers == 1 ? "1 pessoa assistindo" : App.host-viewers + " pessoas assistindo";
+                }
+            }
+            Btn {
+                kind: "strong";
+                text: "Ver minha transmissão";
+                clicked => { App.navigate("host"); }
             }
         }
     }
@@ -414,7 +452,7 @@ component RequestRow inherits Rectangle {
     height: 50px;
     border-radius: 10px;
     border-width: 1px;
-    border-color: Theme.border;
+    border-color: Theme.friend-solid;
     background: Theme.card;
     HorizontalLayout {
         padding: 9px;
@@ -566,15 +604,34 @@ component FriendsBlock inherits VerticalLayout {
             clicked => { App.friend-decline(r.key); }
         }
     }
-    if App.friends-count == 0 && App.friend-requests.length == 0 && App.friend-sent.length == 0 : Text {
-        text: "Cole o código de amigo de alguém em “Entrar com código”. O seu fica em “Meu código”, aqui embaixo.";
-        font-size: 12px;
-        color: Theme.muted-fg;
-        wrap: word-wrap;
+    // Sem amigos: um convite com o atalho para copiar o próprio código.
+    if App.friends-count == 0 && App.friend-requests.length == 0 && App.friend-sent.length == 0 : Rectangle {
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: Theme.input;
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+            Text { text: "Chame seus amigos"; font-size: 14px; font-weight: 600; color: Theme.fg; horizontal-alignment: center; }
+            HorizontalLayout {
+                alignment: center;
+                Btn {
+                    kind: "primary";
+                    height: 36px;
+                    font-size: 13px;
+                    bold: true;
+                    text: "Copiar meu código";
+                    icon: @image-url("icons/copy.svg");
+                    has-icon: true;
+                    icon-size: 14px;
+                    clicked => { App.copy-friend-code(); }
+                }
+            }
+        }
     }
 }
 
-// Você: nome (editável), impressão da chave e o botão da conta (código de amigo).
+// Você: o avatar e o botão de conta abrem a janela da conta; o nome se edita no lugar.
 component YouCard inherits VerticalLayout {
     vertical-stretch: 0;
     spacing: 14px;
@@ -590,6 +647,13 @@ component YouCard inherits VerticalLayout {
                 idx: 1;
                 initials: App.my-initials;
                 text-size: 12px;
+                accessible-role: button;
+                accessible-label: "Abrir minha conta";
+                accessible-action-default => { App.open-account(); }
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { App.open-account(); }
+                }
             }
         }
         VerticalLayout {
@@ -600,19 +664,31 @@ component YouCard inherits VerticalLayout {
                 height: 22px;
                 border-radius: 5px;
                 background: name.has-focus || nameHover.has-hover ? Theme.muted : transparent;
-                nameHover := TouchArea { }
-                name := TextInput {
-                    x: 4px;
-                    width: parent.width - 8px;
-                    height: 100%;
-                    vertical-alignment: center;
-                    single-line: true;
-                    text <=> App.my-name;
-                    font-size: 13px;
-                    font-weight: 600;
-                    color: Theme.fg;
-                    selection-background-color: Theme.primary.with-alpha(0.35);
-                    edited => { App.name-edited(self.text); }
+                nameHover := TouchArea {
+                    mouse-cursor: text;
+                    clicked => { name.focus(); }
+                }
+                HorizontalLayout {
+                    padding-left: 4px;
+                    padding-right: 4px;
+                    spacing: 6px;
+                    name := TextInput {
+                        horizontal-stretch: name.has-focus ? 1 : 0;
+                        vertical-alignment: center;
+                        single-line: true;
+                        text <=> App.my-name;
+                        font-size: 13px;
+                        font-weight: 600;
+                        color: Theme.fg;
+                        selection-background-color: Theme.primary.with-alpha(0.35);
+                        accessible-label: "Seu nome";
+                        edited => { App.name-edited(self.text); }
+                    }
+                    if !name.has-focus : VerticalLayout {
+                        alignment: center;
+                        Icon { source: @image-url("icons/pencil.svg"); tint: Theme.muted-fg; width: 12px; height: 12px; }
+                    }
+                    if !name.has-focus : Rectangle { horizontal-stretch: 1; }
                 }
             }
             HorizontalLayout {
@@ -626,11 +702,14 @@ component YouCard inherits VerticalLayout {
         VerticalLayout {
             alignment: center;
             Btn {
-                kind: "ghost";
-                height: 30px;
-                font-size: 12px;
-                pad: 8px;
-                text: "Meu código";
+                kind: "outline";
+                width: 32px;
+                height: 32px;
+                icon-only: true;
+                icon: @image-url("icons/user.svg");
+                has-icon: true;
+                icon-size: 15px;
+                accessible-label: "Conta e código de amigo";
                 clicked => { App.open-account(); }
             }
         }
@@ -654,8 +733,7 @@ export component HomeView inherits Rectangle {
                 padding: 20px;
                 padding-top: 24px;
                 spacing: 18px;
-                TransmitCard { }
-                CodeEntry { }
+                StartBlock { }
                 WatchingList { }
                 ScrollView {
                     vertical-stretch: 1;

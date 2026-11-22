@@ -171,6 +171,11 @@ struct Ctl {
     link_error: String,
     /// Última lista de quem assiste (do motor), para redesenhar os botões "Adicionar".
     host_peers: Vec<Value>,
+    /// Aviso de código copiado: número da última cópia vista, o código à mostra e os
+    /// códigos já usados ou dispensados (não aparecem de novo).
+    clip_seq: u32,
+    clip_code: String,
+    clip_skip: Vec<String>,
 }
 
 thread_local! {
@@ -314,7 +319,78 @@ fn clipboard_get() -> Option<String> {
 }
 
 fn clipboard_set(text: &str) -> bool {
-    arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string())).is_ok()
+    let ok = arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string())).is_ok();
+    if ok {
+        OWN_CLIP.with(|o| *o.borrow_mut() = text.trim().to_string());
+    }
+    ok
+}
+
+thread_local! {
+    /// Último texto que o próprio app copiou (o "Copiar código" não vira aviso de código copiado).
+    static OWN_CLIP: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Muda a cada cópia no Windows: ler esse número é barato, o texto só é lido quando muda.
+fn clipboard_seq() -> u32 {
+    unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() }
+}
+
+/// Código de live ou de amigo que apareceu na área de transferência: vira o aviso
+/// "Código copiado · Entrar". Fica de fora o que o próprio app copiou, o seu código, o que
+/// você já está assistindo e o que já usou ou dispensou. O texto só é lido aqui, no PC.
+fn check_clipboard(c: &mut Ctl, ui: &AppWindow) {
+    let seq = clipboard_seq();
+    if seq == c.clip_seq {
+        return;
+    }
+    c.clip_seq = seq;
+    let text: String = clipboard_get().unwrap_or_default().chars().filter(|ch| !ch.is_whitespace()).collect();
+    let own = OWN_CLIP.with(|o| o.borrow().clone());
+    let friend = text.starts_with(identity::FRIEND_PREFIX);
+    let valid = !text.is_empty()
+        && text.len() <= 512
+        && text != own
+        && !c.clip_skip.contains(&text)
+        && if friend {
+            text != c.friends.code
+        } else {
+            rendezvous::check_code(&text).is_ok() && !(c.live && c.code == text) && !c.viewers.iter().any(|v| v.code == text)
+        };
+    let code = if valid { text } else { String::new() };
+    if code != c.clip_code {
+        c.clip_code = code;
+        render_clip(c, ui);
+    }
+}
+
+/// Some com o aviso de um código (usado ou dispensado) e não mostra mais esse código.
+fn forget_clip(c: &mut Ctl, ui: &AppWindow, code: &str) {
+    if !code.is_empty() && !c.clip_skip.iter().any(|x| x == code) {
+        c.clip_skip.push(code.to_string());
+    }
+    if c.clip_code == code {
+        c.clip_code.clear();
+        render_clip(c, ui);
+    }
+}
+
+fn render_clip(c: &Ctl, ui: &AppWindow) {
+    let a = ui.global::<App>();
+    let short = short_code(&c.clip_code);
+    set_if_changed!(a, get_clip_code, set_clip_code, s(short));
+    set_if_changed!(a, get_clip_friend, set_clip_friend, c.clip_code.starts_with(identity::FRIEND_PREFIX));
+}
+
+/// "AJ3.K9pQ…2x": o começo e o fim do código, para reconhecer sem ocupar a tela.
+fn short_code(code: &str) -> String {
+    let chars: Vec<char> = code.chars().collect();
+    if chars.len() <= 12 {
+        return code.to_string();
+    }
+    let head: String = chars[..8].iter().collect();
+    let tail: String = chars[chars.len() - 2..].iter().collect();
+    format!("{head}…{tail}")
 }
 
 fn app_name(c: &Ctl, exe: &str) -> String {
@@ -351,7 +427,7 @@ fn paint_titlebar(hwnd: isize, dark: bool) {
     use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE};
     let h = HWND(hwnd as *mut _);
     let rgb = |r: u32, g: u32, b: u32| r | (g << 8) | (b << 16);
-    let (caption, text, border) = if dark { (rgb(0x04, 0x0a, 0x0b), rgb(0xe8, 0xf1, 0xf3), rgb(0x17, 0x29, 0x2d)) } else { (rgb(0xf4, 0xfa, 0xfb), rgb(0x0c, 0x15, 0x17), rgb(0xd5, 0xe5, 0xe8)) };
+    let (caption, text, border) = if dark { (rgb(0x04, 0x10, 0x10), rgb(0xe6, 0xf9, 0xf9), rgb(0x18, 0x32, 0x32)) } else { (rgb(0xef, 0xfb, 0xfb), rgb(0x06, 0x19, 0x19), rgb(0xcd, 0xe5, 0xe5)) };
     unsafe {
         let d = BOOL::from(dark);
         let _ = DwmSetWindowAttribute(h, DWMWA_USE_IMMERSIVE_DARK_MODE, &d as *const _ as *const _, 4);
@@ -406,15 +482,15 @@ fn render_public(c: &Ctl, ui: &AppWindow) {
     set_if_changed!(a, get_public_busy, set_public_busy, c.public_busy);
     set_if_changed!(a, get_public_loading, set_public_loading, c.public.is_none());
     a.set_public_updated(s(if c.public_busy {
-        "Atualizando".to_string()
+        "atualizando…".to_string()
     } else if crate::gossip::peer_count() > 0 {
         // Conectado à fofoca: a lista atualiza sozinha, na hora.
-        "ao vivo".into()
+        "atualiza ao vivo".into()
     } else {
         match c.public_updated.map(|t| t.elapsed().as_secs()) {
-            None => "Atualizar".into(),
-            Some(n) if n < 5 => "agora".into(),
-            Some(n) => format!("há {n} s"),
+            None => String::new(),
+            Some(n) if n < 5 => "atualizado agora".into(),
+            Some(n) => format!("atualizado há {n} s"),
         }
     }));
     let (list, friend_codes) = with_friend_lives(c);
@@ -440,23 +516,37 @@ fn render_public(c: &Ctl, ui: &AppWindow) {
             friends_only: friend_codes.get(&e.code).copied().unwrap_or(false),
         }
     };
-    set_if_changed!(a, get_has_featured, set_has_featured, !others.is_empty());
-    if let Some(first) = others.first() {
-        set_if_changed!(a, get_featured, set_featured, to_stream(first));
+    let featured = featured_on(a.get_has_featured(), others.len());
+    set_if_changed!(a, get_has_featured, set_has_featured, featured);
+    if featured {
+        if let Some(first) = others.first() {
+            set_if_changed!(a, get_featured, set_featured, to_stream(first));
+        }
     }
+    let per_row = if featured { 3 } else { 2 };
     let rows: Vec<Vec<Stream>> = others
         .iter()
-        .skip(1)
+        .skip(usize::from(featured))
         .copied()
         .collect::<Vec<_>>()
-        .chunks(3)
+        .chunks(per_row)
         .map(|chunk| {
             let mut items: Vec<Stream> = chunk.iter().map(|p| to_stream(p)).collect();
-            items.resize_with(3, || Stream { blank: true, ..Default::default() });
+            items.resize_with(per_row, || Stream { blank: true, ..Default::default() });
             items
         })
         .collect();
     sync_rows(a.get_rows(), rows, |r| r.items.clone(), |items| StreamRow { items }, |m| a.set_rows(m));
+}
+
+/// O destaque grande aparece a partir de 4 lives e só some com 2 ou menos: na fronteira,
+/// uma live a mais ou a menos não fica trocando o layout a cada atualização.
+fn featured_on(was: bool, count: usize) -> bool {
+    if was {
+        count > 2
+    } else {
+        count >= 4
+    }
 }
 
 /// A lista do "Ao vivo agora" com as transmissões dos amigos (as só para amigos também),
@@ -804,6 +894,8 @@ fn relayout_inner(c: &Ctl, ui: &AppWindow) {
         (s.width, s.height)
     });
     let (w, h) = (size.0 as f32 / scale, size.1 as f32 / scale);
+    // Janela estreita: o status da rede na barra do topo vira só a bolinha.
+    set_if_changed!(a, get_narrow, set_narrow, w < 1100.0);
     let fs = c.fullscreen;
     let top = if fs { 0.0 } else { TOPBAR + ADDBAR };
     let pad = if fs { 0.0 } else { PAD };
@@ -1448,11 +1540,19 @@ fn stop_sharing(c: &mut Ctl, ui: &AppWindow, reason: Option<&str>) {
     }
 }
 
+fn paste_join(c: &mut Ctl, ui: &AppWindow) {
+    match clipboard_get() {
+        Some(t) if !t.is_empty() => join_with_code(c, ui, &t),
+        _ => toast(c, ui, "err", "A área de transferência está vazia. Copie o código primeiro."),
+    }
+}
+
 fn join_with_code(c: &mut Ctl, ui: &AppWindow, raw: &str) {
     let code: String = raw.chars().filter(|ch| !ch.is_whitespace()).collect();
     if code.is_empty() {
         return toast(c, ui, "err", "Cole o código da transmissão primeiro.");
     }
+    forget_clip(c, ui, &code);
     if code.starts_with(identity::FRIEND_PREFIX) {
         return add_friend(c, ui, &code);
     }
@@ -1869,10 +1969,27 @@ fn wire(ui: &AppWindow) {
     a.on_refresh_public(|| later(|c, ui| refresh_public(c, ui)));
     a.on_watch(|code| later(move |c, ui| join_with_code(c, ui, &code)));
     a.on_join(|code| later(move |c, ui| join_with_code(c, ui, &code)));
-    a.on_paste_join(|| {
-        later(|c, ui| match clipboard_get() {
-            Some(t) if !t.is_empty() => join_with_code(c, ui, &t),
-            _ => toast(c, ui, "err", "A área de transferência está vazia. Copie o código primeiro."),
+    a.on_paste_join(|| later(paste_join));
+    // Ctrl+V fora de um campo: só no Início, sem janela aberta por cima.
+    a.on_key_paste(|| {
+        later(|c, ui| {
+            if c.view == "home" && c.picker.is_empty() && !c.account_open && c.password_for.is_none() && !c.updating {
+                paste_join(c, ui);
+            }
+        })
+    });
+    a.on_clip_use(|| {
+        later(|c, ui| {
+            let code = c.clip_code.clone();
+            if !code.is_empty() {
+                join_with_code(c, ui, &code);
+            }
+        })
+    });
+    a.on_clip_dismiss(|| {
+        later(|c, ui| {
+            let code = c.clip_code.clone();
+            forget_clip(c, ui, &code);
         })
     });
     a.on_copy_code(|code| {
@@ -2364,6 +2481,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
             link_busy: false,
             link_error: String::new(),
             host_peers: Vec::new(),
+            clip_seq: 0,
+            clip_code: String::new(),
+            clip_skip: Vec::new(),
         });
     });
 
@@ -2510,6 +2630,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
     let tick = slint::Timer::default();
     tick.start(slint::TimerMode::Repeated, Duration::from_millis(250), || {
         with(|c, ui| {
+            check_clipboard(c, ui);
             let now = Instant::now();
             let before = c.toasts.len();
             c.toasts.retain(|t| t.3 > now);
@@ -2710,6 +2831,25 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    #[test]
+    fn destaque_com_folga_na_fronteira() {
+        // Sem destaque: só aparece com 4 ou mais.
+        assert!(!featured_on(false, 3));
+        assert!(featured_on(false, 4));
+        // Com destaque: só some com 2 ou menos (3 continua).
+        assert!(featured_on(true, 3));
+        assert!(!featured_on(true, 2));
+        assert!(!featured_on(false, 0));
+    }
+
+    #[test]
+    fn codigo_curto_mostra_comeco_e_fim() {
+        assert_eq!(short_code("AJ3.abc"), "AJ3.abc");
+        assert_eq!(short_code("AJ3.K9pQxxxxxxxxxxxxxx2x"), "AJ3.K9pQ…2x");
+        // Não quebra no meio de um caractere de mais de um byte.
+        assert_eq!(short_code("AJF.ççççççççççççç"), "AJF.çççç…çç");
+    }
 
     #[test]
     fn sync_updates_in_place() {

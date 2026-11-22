@@ -1,6 +1,6 @@
-// Identidade do AntiJanja. Paleta base (Realtime Colors):
-// texto #e8f1f3 · fundo #040a0b · primária #00d4ff · secundária #1e8194 · destaque #1cc2e3.
-// A paleta original é escura; o tema claro é a mesma paleta com a claridade invertida.
+// Identidade do AntiJanja. Paleta base (Realtime Colors), escura · clara:
+// texto #e6f9f9 · #061919, fundo #041010 · #effbfb, primária #31d5d8 · #27cbce,
+// secundária #2e1a6b · #a894e5, destaque #6b269c · #a863d9.
 // O app abre no tema do Windows.
 import "../assets/fonts/Inter-Regular.ttf";
 import "../assets/fonts/Inter-Medium.ttf";
@@ -15,42 +15,50 @@ export global Theme {
     out property <string> sans: "Inter";
     out property <string> mono: "JetBrains Mono";
 
-    out property <color> bg: dark ? #040a0b : #f4fafb;
-    out property <color> fg: dark ? #e8f1f3 : #0c1517;
-    out property <color> card: dark ? #0b1517 : #ffffff;
-    out property <color> muted: dark ? #122124 : #e8f2f4;
-    out property <color> muted-fg: dark ? #93aab0 : #4a6168;
-    out property <color> soft-fg: dark ? #c4d6da : #2a3f44;
-    out property <color> accent: dark ? #162a2e : #dcecef;
-    out property <color> border: dark ? #17292d : #d5e5e8;
-    out property <color> input: dark ? #21383d : #c6dbdf;
-    out property <color> rail: dark ? #071012 : #eef6f7;
-    out property <color> primary: #00d4ff;
-    out property <color> primary-fg: #04191f;
-    out property <color> live: #00d4ff;
-    out property <color> live-text: dark ? #1cc2e3 : #00788f;
-    out property <color> strong: dark ? #e8f1f3 : #0c1517;
-    out property <color> strong-fg: dark ? #040a0b : #f4fafb;
+    out property <color> bg: dark ? #041010 : #effbfb;
+    out property <color> fg: dark ? #e6f9f9 : #061919;
+    out property <color> card: dark ? #0a1b1b : #ffffff;
+    out property <color> muted: dark ? #112727 : #dcefef;
+    out property <color> muted-fg: dark ? #8db1b1 : #466565;
+    out property <color> soft-fg: dark ? #c0dddd : #1f3d3d;
+    out property <color> accent: dark ? #163232 : #d2e9e9;
+    out property <color> border: dark ? #183232 : #cde5e5;
+    out property <color> input: dark ? #234242 : #b6d6d6;
+    out property <color> rail: dark ? #061414 : #e5f5f5;
+    out property <color> primary: dark ? #31d5d8 : #27cbce;
+    out property <color> primary-fg: dark ? #041010 : #061919;
+    out property <color> live: dark ? #31d5d8 : #27cbce;
+    // Ciano para texto: no tema claro o ciano da marca não tem contraste para texto.
+    out property <color> live-text: dark ? #31d5d8 : #00787a;
+    out property <color> strong: dark ? #e6f9f9 : #061919;
+    out property <color> strong-fg: dark ? #041010 : #effbfb;
     out property <color> destructive: dark ? #f0604f : #d93a2b;
     out property <color> warn: dark ? #f2c14e : #b7791f;
-    out property <color> overlay: dark ? #000000b3 : #0c151766;
+    out property <color> overlay: dark ? #000000b3 : #06191966;
     // Capa grande (transmissão em destaque) e etiquetas escuras sobre imagem.
-    out property <color> feature-bg: #062a33;
-    out property <color> feature-ink: #00d4ff;
-    out property <color> tag-bg: #040a0bd9;
-    out property <color> tag-fg: #e8f1f3;
+    out property <color> feature-bg: dark ? #0a2a2b : #d3f3f3;
+    out property <color> feature-ink: dark ? #31d5d8 : #00787a;
+    out property <color> tag-bg: #041010d9;
+    out property <color> tag-fg: #e6f9f9;
+    // Amigos em roxo (ciano = ao vivo e ações): fundo e texto da capa de um amigo,
+    // a etiqueta "AMIGO" (cheia) e o roxo para texto.
+    out property <color> friend-bg: dark ? #2e1a6b : #a894e5;
+    out property <color> friend-ink: dark ? #d8cdfa : #140a33;
+    out property <color> friend-solid: dark ? #6b269c : #a863d9;
+    out property <color> friend-solid-fg: dark ? #ffffff : #140a33;
+    out property <color> friend-text: dark ? #c99cf0 : #7a2fb0;
 
     // Capas das transmissões (sem miniatura): fundo e iniciais, 3 variações.
     pure public function cover-bg(i: int) -> color {
         if (dark) {
-            return i == 1 ? #06303b : i == 2 ? #0f2a30 : #0b2236;
+            return i == 1 ? #083233 : i == 2 ? #0f2b2b : #1d1840;
         }
-        return i == 1 ? #d6f5fc : i == 2 ? #d9eef2 : #dcebf7;
+        return i == 1 ? #d3f3f3 : i == 2 ? #dcefef : #e6defa;
     }
     pure public function cover-ink(i: int) -> color {
         if (dark) {
-            return i == 1 ? #00d4ff : i == 2 ? #4fc3d6 : #6cc7e8;
+            return i == 1 ? #31d5d8 : i == 2 ? #5cc8c9 : #b9a6f0;
         }
-        return i == 1 ? #00788f : i == 2 ? #1e8194 : #2a6aa3;
+        return i == 1 ? #00787a : i == 2 ? #1f6b6c : #5a3a9e;
     }
 }
