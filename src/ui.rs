@@ -126,6 +126,9 @@ struct Ctl {
     apps: Vec<audio::AudioApp>,
     public: Option<Vec<rendezvous::PublicStream>>,
     public_busy: bool,
+    /// A leitura em andamento foi pedida pelo botão: só aí o botão gira. As automáticas
+    /// (timer, voltar ao Início, rede conectando) acontecem em silêncio.
+    public_manual: bool,
     public_updated: Option<Instant>,
     /// Anúncio mais novo de cada transmissão que chegou pela fofoca (docs/gossip-ao-vivo.md),
     /// para continuar valendo quando a lista é relida pela DHT (que pode estar atrasada).
@@ -479,9 +482,9 @@ fn render_settings(c: &Ctl, ui: &AppWindow) {
 
 fn render_public(c: &Ctl, ui: &AppWindow) {
     let a = ui.global::<App>();
-    set_if_changed!(a, get_public_busy, set_public_busy, c.public_busy);
+    set_if_changed!(a, get_public_busy, set_public_busy, c.public_busy && c.public_manual);
     set_if_changed!(a, get_public_loading, set_public_loading, c.public.is_none());
-    a.set_public_updated(s(if c.public_busy {
+    a.set_public_updated(s(if c.public_busy && c.public_manual {
         "atualizando…".to_string()
     } else if crate::gossip::peer_count() > 0 {
         // Conectado à fofoca: a lista atualiza sozinha, na hora.
@@ -799,13 +802,16 @@ fn render_picker(c: &mut Ctl, ui: &AppWindow) {
     let shown: Vec<&capture::Source> = list.iter().filter(|x| x.kind == c.picker_tab).collect();
     let cols = if c.picker_tab == "monitor" && shown.len() <= 2 { 2 } else { 3 };
     let current = if c.picker == "switch" { c.source.as_ref().map(|x| x.id.clone()) } else { None };
+    // Versão de desenvolvimento: AJ_NO_THUMBS esconde as miniaturas (capturas de tela do
+    // picker sem mostrar o que está nas telas de quem testa).
+    let hide_thumbs = cfg!(debug_assertions) && std::env::var_os("AJ_NO_THUMBS").is_some();
     let rows: Vec<Vec<Source>> = shown
         .chunks(cols)
         .map(|chunk| {
             let mut items: Vec<Source> = chunk
                 .iter()
                 .map(|x| {
-                    let thumb = c.thumbs.get(&x.id).cloned();
+                    let thumb = if hide_thumbs { None } else { c.thumbs.get(&x.id).cloned() };
                     Source {
                         id: s(&x.id),
                         name: s(&x.name),
@@ -1244,6 +1250,7 @@ fn refresh_public(c: &mut Ctl, ui: &AppWindow) {
     let app = c.app.clone();
     bg(move || rendezvous::public_list(app.rdv()), |c, ui, r| {
         c.public_busy = false;
+        c.public_manual = false;
         match r {
             Ok(mut list) => {
                 // O que chegou pela fofoca vale sobre o mural (mais novo, ou já encerrado).
@@ -1262,6 +1269,20 @@ fn refresh_public(c: &mut Ctl, ui: &AppWindow) {
         }
         render_public(c, ui);
     });
+}
+
+/// Botão "Atualizar agora": se uma leitura automática já está em andamento, o botão passa
+/// a girar até ela terminar, em vez de começar outra.
+fn refresh_public_manual(c: &mut Ctl, ui: &AppWindow) {
+    if c.net != "ok" {
+        return;
+    }
+    c.public_manual = true;
+    if c.public_busy {
+        render_public(c, ui);
+    } else {
+        refresh_public(c, ui);
+    }
 }
 
 fn refresh_apps(_c: &mut Ctl, _ui: &AppWindow) {
@@ -1966,7 +1987,7 @@ fn wire(ui: &AppWindow) {
             }
         })
     });
-    a.on_refresh_public(|| later(|c, ui| refresh_public(c, ui)));
+    a.on_refresh_public(|| later(|c, ui| refresh_public_manual(c, ui)));
     a.on_watch(|code| later(move |c, ui| join_with_code(c, ui, &code)));
     a.on_join(|code| later(move |c, ui| join_with_code(c, ui, &code)));
     a.on_paste_join(|| later(paste_join));
@@ -2426,8 +2447,14 @@ pub fn run() -> Result<(), slint::PlatformError> {
         st.name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Meu PC".into());
         settings::save(&st);
     }
-    // Sempre abre no tema do Windows (o botão de tema vale para a sessão).
-    let dark = settings::windows_prefers_dark();
+    // Sempre abre no tema do Windows (o botão de tema vale para a sessão). Na versão de
+    // desenvolvimento, AJ_THEME=light|dark força um tema (para conferir as telas).
+    let forced = if cfg!(debug_assertions) { std::env::var("AJ_THEME").ok() } else { None };
+    let dark = match forced.as_deref() {
+        Some("light") => false,
+        Some("dark") => true,
+        _ => settings::windows_prefers_dark(),
+    };
     ui.global::<Theme>().set_dark(dark);
     ui.global::<App>().set_my_name(s(&st.name));
 
@@ -2445,6 +2472,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
             apps: Vec::new(),
             public: None,
             public_busy: false,
+            public_manual: false,
             public_updated: None,
             gossip: HashMap::new(),
             sources: None,
@@ -2526,7 +2554,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
             if what.contains("link") {
                 c.link_mode = "add".into();
             }
+            c.account_restore = what.contains("restore");
             render_friends(c, ui);
+            if what.starts_with("picker") {
+                open_picker(c, ui, "start");
+            }
         });
     }
 

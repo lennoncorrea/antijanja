@@ -97,7 +97,8 @@ comum (pela caixa de entrada); se o outro já tinha pedido, vira "Aceitar".
   código copiado em outro app vira o aviso "Código copiado · Entrar" (só no PC; fica de fora
   o que o próprio app copiou, o seu código e o que já foi usado ou dispensado).
 - **Você**: nome (editável no lugar), impressão; o avatar e o botão de conta abrem a janela
-  da conta (código de amigo, este aparelho, frase de recuperação e entrar com outra conta).
+  da conta, em três abas: código de amigo; aparelhos (vincular, desvincular e entrar por
+  outro aparelho); recuperação (a frase, e entrar com a frase de outra conta).
 - **Convite**: um cartão no canto com "Assistir" e "Agora não".
 
 ## Limites (sem servidor)

@@ -8,9 +8,9 @@
 //
 // Medidas usadas também pelo Rust (src/ui.rs): faixa de cima 76, de baixo 84, menu 300
 // de largura, base do menu 52 acima do fim do vídeo.
-import { Theme } from "theme.slint";
+import { Theme, Ink } from "theme.slint";
 import { Tile, MenuOption } from "state.slint";
-import { Icon, Slider } from "widgets.slint";
+import { Icon, Slider, Tag } from "widgets.slint";
 
 export global Ov {
     in property <[Tile]> tiles;
@@ -46,14 +46,7 @@ export global Ov {
     callback pick-quality(string);
 }
 
-// Cores fixas: os controles ficam sobre o vídeo, em qualquer tema.
-global Ink {
-    out property <color> fg: #e6f9f9;
-    out property <color> soft: #c0dddd;
-    out property <color> hover: #ffffff24;
-    out property <color> cyan: #31d5d8;
-    out property <color> live: #31d5d8;
-}
+// Cores fixas (Ink, em theme.slint): os controles ficam sobre o vídeo, em qualquer tema.
 
 component OvBtn inherits Rectangle {
     in property <image> icon;
@@ -62,7 +55,7 @@ component OvBtn inherits Rectangle {
     callback clicked();
     width: 36px;
     height: 36px;
-    border-radius: 8px;
+    border-radius: Theme.radius-md;
     background: root.on || ta.has-hover ? Ink.hover : transparent;
     Icon {
         x: (parent.width - self.width) / 2;
@@ -81,43 +74,6 @@ component OvBtn inherits Rectangle {
     accessible-action-default => { root.clicked(); }
 }
 
-component OvBadge inherits Rectangle {
-    in property <string> text;
-    in property <bool> warn;
-    height: 20px;
-    width: label.preferred-width + 14px;
-    border-radius: 5px;
-    background: root.warn ? #f2c14e : #0410108c;
-    label := Text {
-        text: root.text;
-        font-family: Theme.mono;
-        font-size: 11px;
-        color: root.warn ? #000000 : Ink.fg;
-        vertical-alignment: center;
-        horizontal-alignment: center;
-    }
-}
-
-// Selo da geração de quadros ("FG 2x").
-component GenTag inherits Rectangle {
-    in property <string> text;
-    height: 18px;
-    width: label.preferred-width + 12px;
-    border-radius: 4px;
-    background: Theme.feature-bg;
-    border-width: 1px;
-    border-color: Theme.primary.with-alpha(0.35);
-    label := Text {
-        text: root.text;
-        font-family: Theme.mono;
-        font-size: 10px;
-        font-weight: 600;
-        color: Theme.feature-ink;
-        vertical-alignment: center;
-        horizontal-alignment: center;
-    }
-}
-
 // Linha do menu principal: nome, valor atual e seta.
 component MenuRow inherits Rectangle {
     in property <string> label;
@@ -125,15 +81,15 @@ component MenuRow inherits Rectangle {
     in property <string> tag;
     callback clicked();
     height: 44px;
-    border-radius: 8px;
+    border-radius: Theme.radius-md;
     background: ta.has-hover ? Theme.muted : transparent;
     HorizontalLayout {
         padding-left: 10px;
         padding-right: 8px;
         spacing: 8px;
-        Text { text: root.label; font-size: 13px; font-weight: 500; color: Theme.fg; vertical-alignment: center; horizontal-stretch: 1; }
-        Text { text: root.value; font-size: 12px; color: Theme.muted-fg; vertical-alignment: center; }
-        if root.tag != "" : VerticalLayout { alignment: center; GenTag { text: root.tag; } }
+        Text { text: root.label; font-size: Theme.text-base; font-weight: 500; color: Theme.fg; vertical-alignment: center; horizontal-stretch: 1; }
+        Text { text: root.value; font-size: Theme.text-sm; color: Theme.muted-fg; vertical-alignment: center; }
+        if root.tag != "" : VerticalLayout { alignment: center; Tag { kind: "feature"; text: root.tag; } }
         VerticalLayout {
             alignment: center;
             Icon { source: @image-url("icons/chevron-right.svg"); tint: Theme.muted-fg; width: 14px; height: 14px; }
@@ -147,8 +103,8 @@ component OptionRow inherits Rectangle {
     in property <MenuOption> o;
     callback clicked();
     height: 40px;
-    border-radius: 8px;
-    background: o.selected ? Theme.accent : ta.has-hover ? Theme.muted : transparent;
+    border-radius: Theme.radius-md;
+    background: o.selected ? Theme.selected-bg : ta.has-hover ? Theme.muted : transparent;
     HorizontalLayout {
         padding-left: 10px;
         padding-right: 10px;
@@ -157,9 +113,9 @@ component OptionRow inherits Rectangle {
             width: 16px;
             if root.o.selected : Icon { source: @image-url("icons/check.svg"); tint: Theme.primary; width: 14px; height: 14px; }
         }
-        Text { text: root.o.label; font-size: 13px; font-weight: root.o.selected ? 600 : 400; color: Theme.fg; vertical-alignment: center; horizontal-stretch: 1; }
-        if root.o.tag != "" : VerticalLayout { alignment: center; GenTag { text: root.o.tag; } }
-        if root.o.note != "" : Text { text: root.o.note; font-size: 11px; color: Theme.muted-fg; vertical-alignment: center; }
+        Text { text: root.o.label; font-size: Theme.text-base; font-weight: root.o.selected ? 600 : 400; color: Theme.fg; vertical-alignment: center; horizontal-stretch: 1; }
+        if root.o.tag != "" : VerticalLayout { alignment: center; Tag { kind: "feature"; text: root.o.tag; } }
+        if root.o.note != "" : Text { text: root.o.note; font-size: Theme.text-xs; color: Theme.muted-fg; vertical-alignment: center; }
     }
     ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
 }
@@ -167,7 +123,7 @@ component OptionRow inherits Rectangle {
 component MenuBack inherits Rectangle {
     in property <string> title;
     height: 40px;
-    border-radius: 8px;
+    border-radius: Theme.radius-md;
     background: ta.has-hover ? Theme.muted : transparent;
     HorizontalLayout {
         padding-left: 8px;
@@ -176,7 +132,7 @@ component MenuBack inherits Rectangle {
             alignment: center;
             Icon { source: @image-url("icons/chevron-left.svg"); tint: Theme.muted-fg; width: 14px; height: 14px; }
         }
-        Text { text: root.title; font-size: 13px; font-weight: 600; color: Theme.fg; vertical-alignment: center; }
+        Text { text: root.title; font-size: Theme.text-base; font-weight: 600; color: Theme.fg; vertical-alignment: center; }
     }
     ta := TouchArea { mouse-cursor: pointer; clicked => { Ov.menu-go("main"); } }
 }
@@ -192,9 +148,12 @@ component GearMenu inherits Rectangle {
     width: 300px;
     height: lay.preferred-height;
     background: Theme.card;
-    border-radius: 12px;
+    border-radius: Theme.radius-lg;
     border-width: 1px;
-    border-color: Theme.input;
+    border-color: Theme.border;
+    drop-shadow-blur: Theme.shadow-sm-blur;
+    drop-shadow-offset-y: Theme.shadow-sm-y;
+    drop-shadow-color: Theme.shadow-sm;
     init => { Ov.menu-resized(self.height); }
     changed height => { Ov.menu-resized(self.height); }
     TouchArea { }
@@ -216,7 +175,7 @@ component GearMenu inherits Rectangle {
         if Ov.menu-panel == "main" : MenuDivider { }
         if Ov.menu-panel == "main" : Text {
             text: Ov.menu-info;
-            font-size: 11px;
+            font-size: Theme.text-xs;
             color: Theme.muted-fg;
             wrap: word-wrap;
         }
@@ -229,7 +188,7 @@ component GearMenu inherits Rectangle {
         if Ov.menu-panel == "fps" : MenuDivider { }
         if Ov.menu-panel == "fps" : Text {
             text: Ov.menu-fps-hint;
-            font-size: 11px;
+            font-size: Theme.text-xs;
             color: Theme.muted-fg;
             wrap: word-wrap;
         }
@@ -242,7 +201,7 @@ component GearMenu inherits Rectangle {
         if Ov.menu-panel == "quality" : MenuDivider { }
         if Ov.menu-panel == "quality" : Text {
             text: "Auto: a resolução acompanha a sua rede. Uma fixa menor economiza internet.";
-            font-size: 11px;
+            font-size: Theme.text-xs;
             color: Theme.muted-fg;
             wrap: word-wrap;
         }
@@ -290,10 +249,10 @@ component TileControls inherits Rectangle {
                     width: 30px;
                     height: 30px;
                     border-radius: 15px;
-                    background: #083233;
+                    background: Ink.avatar-bg;
                     Text {
                         text: root.t.initials;
-                        font-size: 11px;
+                        font-size: Theme.text-xs;
                         font-weight: 700;
                         color: Ink.cyan;
                         horizontal-alignment: center;
@@ -304,25 +263,25 @@ component TileControls inherits Rectangle {
             VerticalLayout {
                 alignment: center;
                 horizontal-stretch: 1;
-                Text { text: root.t.name; font-size: 14px; font-weight: 600; color: Ink.fg; overflow: elide; }
+                Text { text: root.t.name; font-size: Theme.text-md; font-weight: 600; color: Ink.fg; overflow: elide; }
                 HorizontalLayout {
                     spacing: 6px;
                     alignment: start;
                     VerticalLayout {
                         alignment: center;
-                        Rectangle { width: 7px; height: 7px; border-radius: 3.5px; background: Ink.cyan; }
+                        Rectangle { width: 8px; height: 8px; border-radius: 4px; background: Ink.cyan; }
                     }
-                    Text { text: "Ao vivo, P2P"; font-size: 12px; color: Ink.live; }
+                    Text { text: "Ao vivo, P2P"; font-size: Theme.text-sm; color: Ink.cyan; }
                 }
             }
             if root.t.res != "" && root.width > 520px : VerticalLayout {
                 alignment: center;
                 HorizontalLayout {
                     spacing: 4px;
-                    OvBadge { text: root.t.res; }
-                    if root.t.gen-tag != "" : VerticalLayout { alignment: center; GenTag { text: "FG " + root.t.gen-tag; } }
-                    OvBadge { text: root.t.rate; }
-                    if root.t.ping != "" : OvBadge { text: root.t.ping; warn: root.t.ping-warn; }
+                    Tag { text: root.t.res; }
+                    if root.t.gen-tag != "" : Tag { kind: "feature"; text: "FG " + root.t.gen-tag; }
+                    Tag { text: root.t.rate; }
+                    if root.t.ping != "" : Tag { kind: root.t.ping-warn ? "warn" : "dark"; text: root.t.ping; }
                 }
             }
         }
@@ -354,7 +313,9 @@ component TileControls inherits Rectangle {
                 alignment: center;
                 Slider {
                     width: root.width > 520px ? 100px : 64px;
-                    track: #ffffff40;
+                    label: "Volume";
+                    track: Ink.track;
+                    fill: Ink.cyan;
                     value: root.t.muted ? 0 : root.t.volume;
                     changed(v) => { Ov.set-volume(root.t.id, v); }
                 }
@@ -362,7 +323,7 @@ component TileControls inherits Rectangle {
             if root.width > 420px : Text {
                 text: (root.t.muted ? 0 : root.t.volume) + "%";
                 width: 40px;
-                font-size: 11px;
+                font-size: Theme.text-xs;
                 font-family: Theme.mono;
                 color: Ink.soft;
                 vertical-alignment: center;
@@ -375,7 +336,7 @@ component TileControls inherits Rectangle {
                 gear := Rectangle {
                     height: 36px;
                     width: gear-row.preferred-width + 16px;
-                    border-radius: 8px;
+                    border-radius: Theme.radius-md;
                     background: root.menu-open || gear-ta.has-hover ? Ink.hover : transparent;
                     gear-row := HorizontalLayout {
                         x: 8px;
@@ -392,7 +353,7 @@ component TileControls inherits Rectangle {
                         if root.t.gen-tag != "" : Text {
                             text: root.t.gen-tag;
                             font-family: Theme.mono;
-                            font-size: 11px;
+                            font-size: Theme.text-xs;
                             font-weight: 600;
                             color: Ink.cyan;
                             vertical-alignment: center;
