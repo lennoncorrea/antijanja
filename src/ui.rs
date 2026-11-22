@@ -799,13 +799,16 @@ fn render_picker(c: &mut Ctl, ui: &AppWindow) {
     let shown: Vec<&capture::Source> = list.iter().filter(|x| x.kind == c.picker_tab).collect();
     let cols = if c.picker_tab == "monitor" && shown.len() <= 2 { 2 } else { 3 };
     let current = if c.picker == "switch" { c.source.as_ref().map(|x| x.id.clone()) } else { None };
+    // Versão de desenvolvimento: AJ_NO_THUMBS esconde as miniaturas (capturas de tela do
+    // picker sem mostrar o que está nas telas de quem testa).
+    let hide_thumbs = cfg!(debug_assertions) && std::env::var_os("AJ_NO_THUMBS").is_some();
     let rows: Vec<Vec<Source>> = shown
         .chunks(cols)
         .map(|chunk| {
             let mut items: Vec<Source> = chunk
                 .iter()
                 .map(|x| {
-                    let thumb = c.thumbs.get(&x.id).cloned();
+                    let thumb = if hide_thumbs { None } else { c.thumbs.get(&x.id).cloned() };
                     Source {
                         id: s(&x.id),
                         name: s(&x.name),
@@ -2532,6 +2535,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
             if what.contains("link") {
                 c.link_mode = "add".into();
             }
+            c.account_restore = what.contains("restore");
             render_friends(c, ui);
             if what.starts_with("picker") {
                 open_picker(c, ui, "start");
