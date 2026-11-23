@@ -637,6 +637,12 @@ pub struct JoinPrep {
 /// propósito), DHT pronta, slot escolhido e ticket do host lido.
 pub fn prepare_join(state: &RdvState, code: &str, password: Option<&str>) -> Result<JoinPrep, String> {
     use crate::connlog::{log, short};
+    if password.is_none() {
+        if let Some(prep) = take_warm(code) {
+            log(format!("entrada no código {}: preparo feito antes do clique (slot {})", short(code), prep.slot));
+            return Ok(prep);
+        }
+    }
     let started = Instant::now();
     let keys = Keys::from_code(code, password)?;
     let dht = get_dht(state)?;
@@ -672,6 +678,77 @@ fn merge_ticket(first: Vec<std::net::SocketAddr>, ticket: Option<crate::direct::
     }
     t.addrs = addrs;
     Some(t)
+}
+
+/* ------------------- Preparo antes do clique (transmissões à vista) ------------------- */
+
+/// Preparo feito antes do clique vale por esse tempo (o slot escolhido pode ter sido
+/// ocupado por outro espectador; o ticket pode ter mudado).
+const WARM_TTL: Duration = Duration::from_secs(90);
+/// Quantas transmissões preparar ao mesmo tempo.
+const WARM_MAX: usize = 3;
+
+enum Warm {
+    Busy(Instant),
+    Ready(Instant, JoinPrep),
+}
+
+fn warm_map() -> &'static Mutex<HashMap<String, Warm>> {
+    static W: OnceLock<Mutex<HashMap<String, Warm>>> = OnceLock::new();
+    W.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Prepara em segundo plano a entrada nestas transmissões (as que estão à vista, sem
+/// senha): chaves, slot e ticket lidos, e uma batida na porta do host, para a passagem
+/// pelo roteador já estar aberta quando o usuário clicar. Refaz quando o preparo vence.
+pub fn prewarm(state: &RdvState, codes: &[String]) {
+    let Some(dht) = state.dht.get().cloned() else { return };
+    let mut map = warm_map().lock().unwrap();
+    map.retain(|code, w| match w {
+        Warm::Busy(at) => at.elapsed() < Duration::from_secs(60),
+        Warm::Ready(at, _) => at.elapsed() < WARM_TTL && codes.contains(code),
+    });
+    for code in codes.iter().take(WARM_MAX) {
+        if map.contains_key(code) || check_code(code) != Ok(false) {
+            continue;
+        }
+        map.insert(code.clone(), Warm::Busy(Instant::now()));
+        let (dht, code) = (dht.clone(), code.clone());
+        thread::spawn(move || {
+            let prep = (|| {
+                let keys = Keys::from_code(&code, None).ok()?;
+                let (picked, ticket) = thread::scope(|s| {
+                    let ticket = s.spawn(|| fetch_ticket(&dht, &keys));
+                    (pick_slot(&dht, &keys), ticket.join().ok().flatten())
+                });
+                let friend = crate::friends::get().map(|f| f.live_addrs(&code)).unwrap_or_default();
+                let ticket = merge_ticket(friend, ticket);
+                let (slot, seq) = picked.ok()?;
+                if let (Some(d), Some(t)) = (crate::direct::global(), &ticket) {
+                    d.warm(&keys, t);
+                }
+                Some(JoinPrep { keys: Arc::new(keys), dht, slot, seq, ticket })
+            })();
+            let mut map = warm_map().lock().unwrap();
+            match prep {
+                Some(p) => {
+                    map.insert(code, Warm::Ready(Instant::now(), p));
+                }
+                None => {
+                    map.remove(&code);
+                }
+            }
+        });
+    }
+}
+
+/// O preparo feito antes do clique, se ainda valer (só uma vez).
+fn take_warm(code: &str) -> Option<JoinPrep> {
+    let mut map = warm_map().lock().unwrap();
+    match map.remove(code)? {
+        Warm::Ready(at, prep) if at.elapsed() < WARM_TTL => Some(prep),
+        _ => None,
+    }
 }
 
 /// O que os caminhos da entrada (DHT e direto) contam para a espera.
@@ -1507,6 +1584,38 @@ mod tests {
         println!("resposta em {:?}", t.elapsed());
         assert!(answer.contains("answer"));
         assert!(t.elapsed() < Duration::from_secs(3), "a resposta direta devia chegar em menos de 3 s");
+        host_stop(&host);
+    }
+
+    /// Preparo antes do clique: depois de pronto, a entrada não consulta a DHT de novo para
+    /// escolher o slot e ler o ticket (e o preparo só vale uma vez).
+    #[test]
+    #[ignore]
+    fn live_prewarm_then_join() {
+        let host = Arc::new(RdvState::default());
+        let viewer = RdvState::default();
+        let _ = host.dht.set(Dht::client().unwrap());
+        let _ = viewer.dht.set(Dht::client().unwrap());
+        let h = host.clone();
+        let on_offer: OfferFn = Arc::new(move |code: &str, slot: u8, offer: String| {
+            let sid = serde_json::from_str::<serde_json::Value>(&offer).unwrap()["sid"].as_str().unwrap().to_string();
+            let (h, code) = (h.clone(), code.to_string());
+            thread::spawn(move || host_reply(&h, &code, slot, &serde_json::json!({ "t": "answer", "sid": sid }).to_string()));
+        });
+        let code = host_listen(&host, on_offer, None).unwrap();
+        prewarm(&viewer, std::slice::from_ref(&code));
+        let until = Instant::now() + Duration::from_secs(30);
+        while !matches!(warm_map().lock().unwrap().get(&code), Some(Warm::Ready(..))) {
+            assert!(Instant::now() < until, "o preparo não ficou pronto");
+            thread::sleep(Duration::from_millis(100));
+        }
+        let t = Instant::now();
+        let prep = prepare_join(&viewer, &code, None).unwrap();
+        println!("preparo pronto, entrada preparada em {:?}", t.elapsed());
+        assert!(t.elapsed() < Duration::from_millis(200));
+        assert!(take_warm(&code).is_none(), "o preparo vale uma vez só");
+        let answer = join(prep, "w1", r#"{"t":"offer","sid":"w1"}"#, 90, &AtomicBool::new(false), |_| {}).unwrap();
+        assert!(answer.contains("answer"));
         host_stop(&host);
     }
 

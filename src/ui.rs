@@ -486,6 +486,17 @@ fn render_public(c: &Ctl, ui: &AppWindow) {
     set_if_changed!(a, get_public_loading, set_public_loading, c.public.is_none());
     let (list, friend_codes) = with_friend_lives(c);
     let others: Vec<&rendezvous::PublicStream> = list.iter().filter(|p| !p.own).collect();
+    // Prepara a entrada nas transmissões à vista (amigos primeiro), para o clique ser
+    // mais rápido. Só no Início e sem senha.
+    if c.view == "home" {
+        let mut codes: Vec<String> = others
+            .iter()
+            .filter(|p| !p.entry.locked && !c.viewers.iter().any(|v| v.code == p.entry.code))
+            .map(|p| p.entry.code.clone())
+            .collect();
+        codes.sort_by_key(|code| !friend_codes.contains_key(code));
+        rendezvous::prewarm(c.app.rdv(), &codes);
+    }
     set_if_changed!(a, get_public_mine, set_public_mine, list.iter().any(|p| p.own));
     set_if_changed!(a, get_public_count, set_public_count, others.len() as i32);
     set_if_changed!(a, get_public_watching, set_public_watching, others.iter().map(|p| p.entry.viewers as i32).sum());

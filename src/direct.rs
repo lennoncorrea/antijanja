@@ -208,6 +208,21 @@ impl Direct {
         });
     }
 
+    /// Antes do clique: bate à porta do host e manda um "olá" para os endereços do ticket.
+    /// Abre a passagem pelos dois roteadores, e o pedido de verdade passa na hora.
+    pub fn warm(&self, keys: &Keys, ticket: &Ticket) {
+        let tag = keys.direct_tag();
+        let me: Vec<String> = self.g.my_addrs().iter().map(|a| a.to_string()).collect();
+        if !me.is_empty() {
+            if let Some(e) = serde_json::to_string(&me).ok().and_then(|s| keys.seal(&s).ok()) {
+                self.g.knock(&tag, &B64.encode(e));
+            }
+        }
+        for a in ticket.socket_addrs() {
+            self.g.send_rv(a, &Rv { k: tag.clone(), r: 'v', s: 0, m: 0, i: 0, n: 0, d: String::new() });
+        }
+    }
+
     /// Manda uma mensagem avulsa ao host (ex.: "desisti"), se houver para onde.
     pub fn viewer_send(&self, keys: &Keys, slot: u8, payload: &str, ticket: Option<&Ticket>) {
         let tag = keys.direct_tag();
