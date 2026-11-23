@@ -134,6 +134,12 @@ component SettingsCard inherits Card {
                 checked: App.s-mesh;
                 toggled(v) => { App.set-setting("mesh", v ? "1" : "0"); }
             }
+            ToggleRow {
+                title: "Ajudar quem não consegue conectar";
+                body: "Se o seu roteador abrir uma porta para o app, você repassa a conexão de quem está numa rede difícil: uma por vez, até 10 Mb/s. O vídeo continua cifrado.";
+                checked: App.s-relay;
+                toggled(v) => { App.set-setting("relay", v ? "1" : "0"); }
+            }
             // Senha: quem assiste precisa do código e dela (na lista pública aparece um cadeado).
             VerticalLayout {
                 spacing: 6px;
@@ -343,6 +349,14 @@ component CodeCard inherits Card {
             has-icon: true;
             enabled: App.code != "";
             clicked => { App.copy-my-code(); }
+        }
+        Btn {
+            kind: "outline";
+            text: "Copiar link de convite";
+            icon: @image-url("icons/link.svg");
+            has-icon: true;
+            enabled: App.code != "";
+            clicked => { App.copy-my-link(); }
         }
         Rectangle {
             border-radius: Theme.radius-md;

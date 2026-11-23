@@ -1086,8 +1086,32 @@ fn emit_viewer(app: &AppHandle, event: &str, id: &str, value: serde_json::Value)
 /// Entra numa transmissão pelo código. `id` identifica o tile na interface.
 /// Volta com o nome do host quando a conexão é montada.
 /// Devolve (nome do host, código de amigo do host).
+/// Códigos cuja próxima entrada vai com o repasse de outro usuário, e quando cada código
+/// tentou o repasse pela última vez (uma tentativa a cada tanto, para não ficar em loop).
+fn relay_state() -> &'static Mutex<(std::collections::HashSet<String>, HashMap<String, Instant>)> {
+    static R: std::sync::OnceLock<Mutex<(std::collections::HashSet<String>, HashMap<String, Instant>)>> = std::sync::OnceLock::new();
+    R.get_or_init(|| Mutex::new(Default::default()))
+}
+
+/// A conexão direta com este código falhou: a próxima entrada tenta pelo repasse de um
+/// vizinho (docs/repasse.md). `false` se não há quem repasse ou se já tentou há pouco.
+pub fn retry_with_relay(code: &str) -> bool {
+    if !crate::gossip::relay_available() {
+        return false;
+    }
+    let mut r = relay_state().lock().unwrap();
+    r.1.retain(|_, at| at.elapsed() < Duration::from_secs(180));
+    if r.1.contains_key(code) {
+        return false;
+    }
+    r.1.insert(code.to_string(), Instant::now());
+    r.0.insert(code.to_string());
+    true
+}
+
 pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Option<String>, name: String, volume: u32, view_fps: u32) -> Res<(String, String)> {
     leave_viewer(&app, &id).await;
+    let use_relay = relay_state().lock().unwrap().0.remove(&code);
     let gen = VIEWER_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let stop = Arc::new(AtomicBool::new(false));
     let vol = volume.min(100) as f32 / 100.0;
@@ -1302,8 +1326,15 @@ pub async fn viewer_join(app: AppHandle, id: String, code: String, password: Opt
         }
     };
 
+    let turn = if use_relay {
+        let t = tokio::task::spawn_blocking(crate::gossip::request_relay).await.ok().flatten();
+        crate::connlog::log(format!("espectador: repasse de um vizinho {}", if t.is_some() { "conseguido" } else { "indisponível" }));
+        t
+    } else {
+        None
+    };
     let (session, offer) = transport::tokio_rt()
-        .spawn(ViewerSession::offer(sinks, true))
+        .spawn(ViewerSession::offer_relayed(sinks, true, turn))
         .await
         .map_err(|e| e.to_string())??;
     if !viewer_alive(&id, gen) {

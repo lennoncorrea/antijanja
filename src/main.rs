@@ -22,23 +22,28 @@ mod friends;
 mod fullscreen;
 mod gossip;
 mod identity;
+mod invite;
 mod congestion;
 mod connlog;
+mod direct;
 mod gpu;
 mod media;
 mod mesh;
 mod meshnet;
+mod nostr;
 mod nvof;
 mod overlay;
 mod pieces;
 mod player;
 mod playout;
+mod relay;
 mod rendezvous;
 mod session;
 mod settings;
 mod transport;
 mod ui;
 mod updater;
+mod upnp;
 mod video;
 
 fn main() {

@@ -60,7 +60,7 @@ impl MeshLink {
         let offer = pc.create_offer(None).await.map_err(err)?;
         pc.set_local_description(offer).await.map_err(err)?;
         wait_gathering(&mut grx).await;
-        let sdp = pc.local_description().await.ok_or("sem descrição local")?.sdp;
+        let sdp = crate::transport::with_upnp(pc.local_description().await.ok_or("sem descrição local")?.sdp).await;
         Ok((Arc::new(MeshLink { pc, dc: Arc::new(Mutex::new(Some(dc))), seq: AtomicU32::new(0) }), sdp))
     }
 
@@ -89,7 +89,7 @@ impl MeshLink {
         let answer = pc.create_answer(None).await.map_err(err)?;
         pc.set_local_description(answer).await.map_err(err)?;
         wait_gathering(&mut grx).await;
-        let sdp = pc.local_description().await.ok_or("sem descrição local")?.sdp;
+        let sdp = crate::transport::with_upnp(pc.local_description().await.ok_or("sem descrição local")?.sdp).await;
         Ok((Arc::new(MeshLink { pc, dc: slot, seq: AtomicU32::new(0) }), sdp))
     }
 
@@ -621,6 +621,21 @@ mod tests {
         d.extend_from_slice(&idx.to_le_bytes());
         d.extend((d.len()..len).map(|i| (i as u32).wrapping_mul(idx + 1) as u8));
         d
+    }
+
+    /// As conexões oferecem endereços IPv6 também (se o PC tiver IPv6 de verdade).
+    #[test]
+    fn offers_ipv6_candidates_when_available() {
+        let has_v6 = crate::gossip::global_v6().is_some();
+        let (link, sdp) = block_on(MeshLink::offer(false)).unwrap();
+        let v6 = sdp.lines().filter(|l| l.starts_with("a=candidate")).any(|l| l.split(' ').nth(4).is_some_and(|ip| ip.contains(':')));
+        let v4 = sdp.lines().filter(|l| l.starts_with("a=candidate")).any(|l| l.split(' ').nth(4).is_some_and(|ip| ip.contains('.')));
+        println!("IPv6 no PC: {has_v6}; na oferta: IPv4 {v4}, IPv6 {v6}");
+        assert!(v4, "sem candidato IPv4");
+        if has_v6 {
+            assert!(v6, "o PC tem IPv6 mas a oferta não");
+        }
+        let _ = block_on(link.pc.close());
     }
 
     fn intact(d: &[u8]) -> Option<u32> {

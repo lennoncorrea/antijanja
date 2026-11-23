@@ -108,7 +108,46 @@ enum Msg {
     /// Mensagem direta entre amigos (docs/amizades.md): de quem diz ser (`f`, chave da
     /// conta) e o conteúdo cifrado (`d`, base64). Quem confere é `friends`.
     Dm { f: String, d: String },
+    /// "Bate à porta" de um host (docs/encontro-direto.md): espalhada pelos vizinhos até o
+    /// host da transmissão `k` (marca derivada do código), que abre `e` (os endereços de
+    /// quem bate, cifrados com a chave do código) e chama de volta.
+    Knock { k: String, e: String, h: u8 },
+    /// Pedaço de uma mensagem do encontro direto (pedido ou resposta), mandado direto ao
+    /// outro lado. Quem confere e monta é `direct`.
+    Rv(Rv),
+    /// Posso repassar conexões (docs/repasse.md): meu servidor TURN está em `a`.
+    RelayCap { a: String },
+    /// Me dá uma credencial do seu repasse? (`n`: número do pedido)
+    RelayReq { n: u32 },
+    /// Credencial do repasse (vale para uma conexão).
+    RelayOk { n: u32, url: String, u: String, p: String },
+    /// Sem vaga no repasse agora.
+    RelayNo { n: u32 },
 }
+
+/// Pedaço de uma mensagem do encontro direto. `n == 0`: só abre a passagem pelo roteador.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Rv {
+    /// Marca da transmissão.
+    pub k: String,
+    /// Quem manda: 'v' (espectador) ou 'h' (host).
+    pub r: char,
+    /// Slot do pedido na DHT (o host responde também por lá).
+    #[serde(default)]
+    pub s: u8,
+    /// Número da mensagem (para montar os pedaços).
+    pub m: u32,
+    pub i: u8,
+    pub n: u8,
+    /// O pedaço (base64).
+    #[serde(default)]
+    pub d: String,
+}
+
+/// Uma batida chegou para nós? (`k`, `e`) -> se era para este app (aí não repassa).
+pub type KnockFn = Box<dyn Fn(&str, &str) -> bool + Send + Sync>;
+/// Pedaço do encontro direto recebido (de onde veio).
+pub type RvFn = Box<dyn Fn(SocketAddr, Rv) + Send + Sync>;
 
 fn encode(m: &Msg) -> Option<Vec<u8>> {
     let mut out = MAGIC.to_vec();
@@ -145,13 +184,43 @@ struct State {
     stun_tx: Option<[u8; 12]>,
     last_pex: Option<Instant>,
     pex_turn: usize,
+    /// Vizinhos que podem repassar: endereço do TURN e quando avisaram.
+    relays: HashMap<SocketAddr, (String, Instant)>,
+    /// Pedidos de credencial esperando resposta: número -> (vizinho, resposta).
+    relay_waits: HashMap<u32, (SocketAddr, std::sync::mpsc::Sender<Option<crate::relay::TurnCreds>>)>,
+}
+
+/// Aviso de repasse vale por tanto tempo (é repetido a cada troca de vizinhos).
+const RELAY_TTL: Duration = Duration::from_secs(90);
+
+/// Avisa já os vizinhos que este app pode repassar (sem esperar a próxima troca).
+pub fn announce_relay() {
+    if let (Some(g), Some(a)) = (GLOBAL.get(), crate::relay::advertised()) {
+        g.advertise_relay(&a);
+    }
+}
+
+/// Algum vizinho pode repassar agora?
+pub fn relay_available() -> bool {
+    GLOBAL.get().is_some_and(|g| g.relay_available())
+}
+
+/// Pede uma credencial de repasse aos vizinhos que podem repassar (um de cada vez).
+/// Bloqueia até alguns segundos.
+pub fn request_relay() -> Option<crate::relay::TurnCreds> {
+    GLOBAL.get()?.request_relay()
 }
 
 pub struct Gossip {
     sock: UdpSocket,
+    /// Socket IPv6 (só para o encontro direto): sem NAT no caminho, passa onde o IPv4 fica
+    /// preso atrás de CGNAT. Nem todo PC tem.
+    sock6: Option<UdpSocket>,
     cfg: Config,
     st: Mutex<State>,
     stop: AtomicBool,
+    on_knock: OnceLock<KnockFn>,
+    on_rv: OnceLock<RvFn>,
 }
 
 static GLOBAL: OnceLock<Arc<Gossip>> = OnceLock::new();
@@ -195,6 +264,14 @@ pub fn local_port() -> Option<u16> {
     GLOBAL.get().map(|g| g.local_addr().port())
 }
 
+/// IP da placa de rede usada para sair para a internet (nenhum pacote é mandado).
+pub fn lan_ip() -> Option<IpAddr> {
+    let s = UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("8.8.8.8:80").ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    (!ip.is_unspecified()).then_some(ip)
+}
+
 /// Vizinhos confirmados na fofoca do app.
 pub fn peer_count() -> usize {
     GLOBAL.get().map(|g| g.peers()).unwrap_or(0)
@@ -208,9 +285,10 @@ impl Gossip {
     pub fn start(cfg: Config) -> std::io::Result<Arc<Gossip>> {
         let sock = UdpSocket::bind(SocketAddrV4::new(cfg.bind, 0))?;
         sock.set_read_timeout(Some(Duration::from_millis(500)))?;
+        let sock6 = if cfg.bind.is_unspecified() { bind_v6() } else { None };
         let lan = cfg.lan;
         let dht = cfg.dht.clone();
-        let g = Arc::new(Gossip { sock, cfg, st: Mutex::new(State::default()), stop: AtomicBool::new(false) });
+        let g = Arc::new(Gossip { sock, sock6, cfg, st: Mutex::new(State::default()), stop: AtomicBool::new(false), on_knock: OnceLock::new(), on_rv: OnceLock::new() });
         log(format!("escutando na porta {}", g.local_addr().port()));
         let spawn = |name: &str, f: fn(Arc<Gossip>)| {
             let g = g.clone();
@@ -218,6 +296,9 @@ impl Gossip {
         };
         spawn("aj-gossip-rx", Gossip::recv_loop)?;
         spawn("aj-gossip-tick", Gossip::tick_loop)?;
+        if g.sock6.is_some() {
+            spawn("aj-gossip-rx6", Gossip::recv6_loop)?;
+        }
         if dht.is_some() {
             spawn("aj-gossip-dht", Gossip::discover_loop)?;
         }
@@ -229,6 +310,118 @@ impl Gossip {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.sock.local_addr().unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)))
+    }
+
+    /// Endereços onde este app pode ser chamado: o público (STUN ou o que os vizinhos
+    /// veem) e o da rede local.
+    pub fn my_addrs(&self) -> Vec<SocketAddr> {
+        let mut out = Vec::new();
+        // Porta aberta no roteador (UPnP) primeiro: alcançável sem furo.
+        if let Some(a) = crate::upnp::gossip_addr() {
+            out.push(SocketAddr::V4(a));
+        }
+        if let Some(p) = self.st.lock().unwrap().public {
+            if !out.contains(&SocketAddr::V4(p)) {
+                out.push(SocketAddr::V4(p));
+            }
+        }
+        let me = self.local_addr();
+        if me.ip().is_loopback() {
+            out.push(me);
+        } else if let Some(ip) = lan_ip() {
+            out.push(SocketAddr::new(ip, me.port()));
+        }
+        if let Some(port) = self.sock6.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port()) {
+            if let Some(ip) = global_v6() {
+                out.push(SocketAddr::new(IpAddr::V6(ip), port));
+            }
+        }
+        out
+    }
+
+    /// Endereço local do socket IPv6, se houver.
+    #[cfg(test)]
+    pub fn local_addr6(&self) -> Option<SocketAddr> {
+        self.sock6.as_ref().and_then(|s| s.local_addr().ok())
+    }
+
+    /// Quem recebe as batidas (o encontro direto).
+    pub fn on_knock(&self, f: KnockFn) {
+        let _ = self.on_knock.set(f);
+    }
+
+    /// Quem recebe os pedaços do encontro direto.
+    pub fn on_rv(&self, f: RvFn) {
+        let _ = self.on_rv.set(f);
+    }
+
+    /// Espalha uma batida pelos vizinhos.
+    pub fn knock(&self, k: &str, e: &str) {
+        let msg = Msg::Knock { k: k.to_string(), e: e.to_string(), h: 0 };
+        if !self.seen_knock(&msg) {
+            return;
+        }
+        let to: Vec<SocketAddr> = self.st.lock().unwrap().peers.iter().filter(|(_, p)| p.verified).map(|(a, _)| *a).collect();
+        for a in to {
+            self.send(a, &msg);
+        }
+    }
+
+    /// Manda um pedaço do encontro direto. `false` se não coube num pacote.
+    pub fn send_rv(&self, to: SocketAddr, rv: &Rv) -> bool {
+        let Some(b) = encode(&Msg::Rv(rv.clone())) else { return false };
+        match (to, &self.sock6) {
+            (SocketAddr::V6(_), Some(s6)) => s6.send_to(&b, to).is_ok(),
+            (SocketAddr::V6(_), None) => false,
+            _ => self.sock.send_to(&b, to).is_ok(),
+        }
+    }
+
+    /// Batida nova? (marca como vista)
+    fn seen_knock(&self, m: &Msg) -> bool {
+        let Msg::Knock { k, e, .. } = m else { return false };
+        let hash = *blake3::hash(format!("knock {k} {e}").as_bytes()).as_bytes();
+        let mut st = self.st.lock().unwrap();
+        if !st.seen.insert(hash) {
+            return false;
+        }
+        st.seen_order.push_back(hash);
+        while st.seen_order.len() > SEEN_MAX {
+            if let Some(old) = st.seen_order.pop_front() {
+                st.seen.remove(&old);
+            }
+        }
+        true
+    }
+
+    pub fn relay_available(&self) -> bool {
+        self.st.lock().unwrap().relays.values().any(|(_, at)| at.elapsed() < RELAY_TTL)
+    }
+
+    pub fn request_relay(&self) -> Option<crate::relay::TurnCreds> {
+        let candidates: Vec<SocketAddr> = self.st.lock().unwrap().relays.iter().filter(|(_, (_, at))| at.elapsed() < RELAY_TTL).map(|(a, _)| *a).collect();
+        for peer in candidates {
+            let mut nb = [0u8; 4];
+            let _ = getrandom::fill(&mut nb);
+            let n = u32::from_le_bytes(nb);
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.st.lock().unwrap().relay_waits.insert(n, (peer, tx));
+            self.send(peer, &Msg::RelayReq { n });
+            let got = rx.recv_timeout(Duration::from_millis(1500)).ok().flatten();
+            self.st.lock().unwrap().relay_waits.remove(&n);
+            if got.is_some() {
+                return got;
+            }
+        }
+        None
+    }
+
+    /// Avisa os vizinhos confirmados que este app pode repassar (`a`: endereço do TURN).
+    fn advertise_relay(&self, a: &str) {
+        let to: Vec<SocketAddr> = self.st.lock().unwrap().peers.iter().filter(|(_, p)| p.verified).map(|(a, _)| *a).collect();
+        for v in to {
+            self.send(v, &Msg::RelayCap { a: a.to_string() });
+        }
     }
 
     /// Vizinhos confirmados.
@@ -326,6 +519,21 @@ impl Gossip {
                 }
                 // Tempo esgotado, ou (no Windows) "porta inalcançável" de um envio anterior.
                 Err(_) => continue,
+            }
+        }
+    }
+
+    /// Recepção pelo socket IPv6: só o encontro direto (a fofoca em si é IPv4).
+    fn recv6_loop(self: Arc<Self>) {
+        let Some(s6) = &self.sock6 else { return };
+        let mut buf = [0u8; 2048];
+        while !self.stop.load(Ordering::SeqCst) {
+            if let Ok((n, from)) = s6.recv_from(&mut buf) {
+                if let Some(Msg::Rv(rv)) = decode(&buf[..n]) {
+                    if let Some(f) = self.on_rv.get() {
+                        f(from, rv);
+                    }
+                }
             }
         }
     }
@@ -443,6 +651,61 @@ impl Gossip {
                     }
                     return self.flush(out, deliver);
                 }
+                Msg::Knock { k, e, h } if verified => {
+                    drop(st);
+                    let msg = Msg::Knock { k: k.clone(), e: e.clone(), h };
+                    if !self.seen_knock(&msg) {
+                        return;
+                    }
+                    if self.on_knock.get().is_some_and(|f| f(&k, &e)) {
+                        return; // era para nós
+                    }
+                    if h < MAX_HOPS {
+                        let st = self.st.lock().unwrap();
+                        for (a, p) in &st.peers {
+                            if *a != from && p.verified {
+                                out.push((*a, Msg::Knock { k: k.clone(), e: e.clone(), h: h + 1 }));
+                            }
+                        }
+                    }
+                    return self.flush(out, deliver);
+                }
+                Msg::Rv(rv) => {
+                    drop(st);
+                    if let Some(f) = self.on_rv.get() {
+                        f(from, rv);
+                    }
+                    return self.flush(out, deliver);
+                }
+                Msg::RelayCap { a } if verified => {
+                    if a.parse::<SocketAddr>().is_ok() && (st.relays.len() < MAX_PEERS || st.relays.contains_key(&from)) {
+                        st.relays.insert(from, (a, now));
+                    }
+                }
+                Msg::RelayReq { n } if verified => {
+                    drop(st);
+                    let reply = match crate::relay::issue() {
+                        Some(c) => Msg::RelayOk { n, url: c.url, u: c.user, p: c.pass },
+                        None => Msg::RelayNo { n },
+                    };
+                    out.push((from, reply));
+                    return self.flush(out, deliver);
+                }
+                Msg::RelayOk { n, url, u, p } => {
+                    if let Some((peer, tx)) = st.relay_waits.remove(&n) {
+                        if peer == from && url.starts_with("turn:") {
+                            let _ = tx.send(Some(crate::relay::TurnCreds { url, user: u, pass: p }));
+                        }
+                    }
+                }
+                Msg::RelayNo { n } => {
+                    if let Some((peer, tx)) = st.relay_waits.remove(&n) {
+                        if peer == from {
+                            st.relays.remove(&from);
+                            let _ = tx.send(None);
+                        }
+                    }
+                }
                 Msg::Bye => {
                     if st.peers.remove(&from).is_some() {
                         log(format!("vizinho saiu {from}"));
@@ -502,10 +765,18 @@ impl Gossip {
                     true
                 });
                 st.live.retain(|_, (_, at, _)| at.elapsed() < LIVE_TTL);
+                let verified_now: Vec<SocketAddr> = st.peers.iter().filter(|(_, p)| p.verified).map(|(a, _)| *a).collect();
+                st.relays.retain(|a, (_, at)| at.elapsed() < RELAY_TTL && verified_now.contains(a));
                 // Apresenta um vizinho aos outros (os dois lados chamam ao mesmo tempo).
                 if st.last_pex.is_none_or(|t| t.elapsed() >= PEX_EVERY) {
                     st.last_pex = Some(now);
-                    let verified: Vec<SocketAddr> = st.peers.iter().filter(|(_, p)| p.verified).map(|(a, _)| *a).collect();
+                    let verified: Vec<SocketAddr> = verified_now.clone();
+                    // E avisa que pode repassar, se puder.
+                    if let Some(a) = crate::relay::advertised() {
+                        for v in &verified {
+                            out.push((*v, Msg::RelayCap { a: a.clone() }));
+                        }
+                    }
                     if verified.len() >= 2 {
                         st.pex_turn = st.pex_turn.wrapping_add(1);
                         let a = verified[st.pex_turn % verified.len()];
@@ -536,7 +807,10 @@ impl Gossip {
                     }
                     thread::sleep(Duration::from_millis(100));
                 }
-                let port = self.st.lock().unwrap().public.map(|p| p.port()).unwrap_or(self.local_addr().port());
+                let port = crate::upnp::gossip_addr()
+                    .map(|a| a.port())
+                    .or(self.st.lock().unwrap().public.map(|p| p.port()))
+                    .unwrap_or(self.local_addr().port());
                 match dht.announce_peer(topic, Some(port)) {
                     Ok(_) => log(format!("anunciado no tópico (porta {port})")),
                     Err(e) => log(format!("falha ao anunciar no tópico: {e}")),
@@ -622,6 +896,26 @@ impl Gossip {
 fn topic_id(net: &str) -> mainline::Id {
     let h = blake3::hash(format!("antijanja gossip v1{net}").as_bytes());
     mainline::Id::from_bytes(&h.as_bytes()[..20]).expect("20 bytes")
+}
+
+fn bind_v6() -> Option<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let s = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).ok()?;
+    s.set_only_v6(true).ok()?;
+    s.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)).into()).ok()?;
+    s.set_read_timeout(Some(Duration::from_millis(500))).ok()?;
+    Some(s.into())
+}
+
+/// Endereço IPv6 global deste PC (o usado para sair), se houver. Nenhum pacote é mandado.
+pub fn global_v6() -> Option<std::net::Ipv6Addr> {
+    let s = UdpSocket::bind("[::]:0").ok()?;
+    s.connect("[2001:4860:4860::8888]:53").ok()?;
+    match s.local_addr().ok()?.ip() {
+        // Global unicast (2000::/3): nem local, nem link-local, nem ULA.
+        IpAddr::V6(ip) if (ip.segments()[0] & 0xe000) == 0x2000 => Some(ip),
+        _ => None,
+    }
 }
 
 fn is_global(ip: IpAddr) -> bool {

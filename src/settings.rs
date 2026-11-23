@@ -27,6 +27,8 @@ pub struct Settings {
     pub stream_password: String,
     /// Malha P2P (experimental): quem assiste repassa partes do vídeo para os outros.
     pub mesh: bool,
+    /// Repassar a conexão de quem não consegue conectar (docs/repasse.md).
+    pub relay: bool,
 }
 
 impl Default for Settings {
@@ -48,6 +50,7 @@ impl Default for Settings {
             view_fps: 0,
             stream_password: String::new(),
             mesh: false,
+            relay: true,
         }
     }
 }
