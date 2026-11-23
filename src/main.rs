@@ -30,6 +30,7 @@ mod gpu;
 mod media;
 mod mesh;
 mod meshnet;
+mod nostr;
 mod nvof;
 mod overlay;
 mod pieces;

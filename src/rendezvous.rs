@@ -396,6 +396,55 @@ fn keep_ticket(dht: Dht, keys: Arc<Keys>, stop: Arc<AtomicBool>, code: String) {
     });
 }
 
+/* ------------- Encontro por relays Nostr (docs/encontro-nostr.md) ------------- */
+
+/// Marca da transmissão nos relays Nostr (a mesma base da marca do encontro direto).
+fn nostr_tag(keys: &Keys) -> String {
+    format!("aj1-{}", keys.direct_tag())
+}
+
+/// Canais Nostr abertos como host, por código: (chaves, canal, marca de resposta de cada
+/// tentativa de entrada que chegou por lá).
+type NostrHosts = Mutex<HashMap<String, (Arc<Keys>, crate::nostr::Channel, HashMap<String, String>)>>;
+
+fn nostr_hosts() -> &'static NostrHosts {
+    static H: OnceLock<NostrHosts> = OnceLock::new();
+    H.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Host: escuta pedidos deste código nos relays Nostr.
+fn nostr_host_listen(code: &str, keys: Arc<Keys>, on_offer: OfferFn) {
+    let (k, c) = (keys.clone(), code.to_string());
+    let chan = crate::nostr::Channel::open(&nostr_tag(&keys), move |content| {
+        let Some(text) = base64::engine::general_purpose::STANDARD.decode(content.as_bytes()).ok().and_then(|b| k.open(&b)) else { return };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
+        let (Some(payload), Some(reply)) = (v["p"].as_str(), v["r"].as_str()) else { return };
+        let Some(sid) = serde_json::from_str::<serde_json::Value>(payload).ok().and_then(|p| p["sid"].as_str().map(str::to_string)) else { return };
+        let slot = v["s"].as_u64().unwrap_or(0) as u8 % SLOTS;
+        if let Some((_, _, replies)) = nostr_hosts().lock().unwrap().get_mut(&c) {
+            if replies.len() < 256 {
+                replies.insert(sid.clone(), reply.chars().take(80).collect());
+            }
+        }
+        crate::connlog::log(format!("host: pedido pelo Nostr da tentativa {}", crate::connlog::short(&sid)));
+        on_offer(&c, slot, payload.to_string());
+    });
+    if let Some(chan) = chan {
+        nostr_hosts().lock().unwrap().insert(code.to_string(), (keys, chan, HashMap::new()));
+    }
+}
+
+/// Host: se o pedido desta tentativa veio pelo Nostr, a resposta vai por lá também.
+fn nostr_host_reply(code: &str, payload: &str) {
+    let Some(sid) = serde_json::from_str::<serde_json::Value>(payload).ok().and_then(|p| p["sid"].as_str().map(str::to_string)) else { return };
+    let hosts = nostr_hosts().lock().unwrap();
+    let Some((keys, chan, replies)) = hosts.get(code) else { return };
+    let Some(tag) = replies.get(&sid) else { return };
+    if let Ok(sealed) = keys.seal(payload) {
+        chan.publish(tag, &base64::engine::general_purpose::STANDARD.encode(sealed));
+    }
+}
+
 fn get_dht(state: &RdvState) -> Result<Dht, String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -500,6 +549,7 @@ pub fn host_listen(state: &RdvState, on_offer: OfferFn, password: Option<&str>) 
         d.host_register(&code, keys.clone(), on_offer.clone());
     }
     keep_ticket(dht.clone(), keys.clone(), stop.clone(), code.clone());
+    nostr_host_listen(&code, keys.clone(), on_offer.clone());
 
     // Uma thread por slot, cada uma consultando a DHT em loop.
     for slot in 0..SLOTS {
@@ -533,6 +583,7 @@ pub fn host_stop(state: &RdvState) {
     if let Some(d) = crate::direct::global() {
         d.host_clear();
     }
+    nostr_hosts().lock().unwrap().clear();
 }
 
 /// Tentativas de publicar uma resposta do host antes de desistir (o espectador ainda
@@ -557,6 +608,7 @@ pub fn host_reply(state: &RdvState, code: &str, slot: u8, payload: &str) -> Resu
     if let Some(d) = crate::direct::global() {
         d.host_reply(code, payload);
     }
+    nostr_host_reply(code, payload);
     let dht = get_dht(state)?;
     // Só este host escreve nas chaves deste código, mas o relógio pode voltar
     // (ajuste do Windows): mantemos o seq sempre crescente.
@@ -793,6 +845,39 @@ pub fn join(prep: JoinPrep, sid: &str, payload: &str, timeout_secs: u64, stop: &
         });
     }
 
+    // Caminho pelos relays Nostr: escuta uma marca só desta tentativa e publica o pedido
+    // (com essa marca dentro, cifrada) na marca da transmissão, de tempos em tempos.
+    let nostr = {
+        let mut r = [0u8; 12];
+        let _ = getrandom::fill(&mut r);
+        let reply: String = format!("aj1r-{}", r.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        let (tx, k) = (Mutex::new(tx.clone()), keys.clone());
+        crate::nostr::Channel::open(&reply, move |content| {
+            if let Some(text) = base64::engine::general_purpose::STANDARD.decode(content.as_bytes()).ok().and_then(|b| k.open(&b)) {
+                let _ = tx.lock().unwrap().send(JoinMsg::Host(text, "Nostr"));
+            }
+        })
+        .map(|chan| (Arc::new(chan), reply))
+    };
+    let nostr_wrap = |p: &str, reply: &str| -> Option<String> {
+        let inner = serde_json::json!({ "s": slot, "r": reply, "p": p }).to_string();
+        keys.seal(&inner).ok().map(|b| base64::engine::general_purpose::STANDARD.encode(b))
+    };
+    if let Some((chan, reply)) = &nostr {
+        if let Some(content) = nostr_wrap(payload, reply) {
+            let (chan, done, host_tag) = (chan.clone(), done.clone(), nostr_tag(&keys));
+            thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    chan.publish(&host_tag, &content);
+                    let until = Instant::now() + REPUBLISH;
+                    while Instant::now() < until && !done.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            });
+        }
+    }
+
     // Caminho pela DHT.
     let my_seq = Arc::new(std::sync::atomic::AtomicI64::new(seq));
     {
@@ -895,6 +980,17 @@ pub fn join(prep: JoinPrep, sid: &str, payload: &str, timeout_secs: u64, stop: &
     let cancel = serde_json::json!({ "t": "cancel", "sid": sid }).to_string();
     if let Some(d) = &direct {
         d.viewer_send(&keys, slot, &cancel, ticket.as_ref());
+    }
+    if let Some((chan, reply)) = &nostr {
+        if let Some(content) = nostr_wrap(&cancel, reply) {
+            chan.publish(&nostr_tag(&keys), &content);
+            // O canal fecha ao ser solto: dá um instante para o aviso sair.
+            let chan = chan.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_secs(3));
+                drop(chan);
+            });
+        }
     }
     let seq = my_seq.load(Ordering::SeqCst);
     thread::spawn(move || {
@@ -1616,6 +1712,32 @@ mod tests {
         assert!(take_warm(&code).is_none(), "o preparo vale uma vez só");
         let answer = join(prep, "w1", r#"{"t":"offer","sid":"w1"}"#, 90, &AtomicBool::new(false), |_| {}).unwrap();
         assert!(answer.contains("answer"));
+        host_stop(&host);
+    }
+
+    /// Entrada completa sem o encontro direto: a resposta chega pelos relays Nostr bem
+    /// antes da DHT. `cargo test live_join_nostr -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_join_nostr() {
+        let host = Arc::new(RdvState::default());
+        let viewer = RdvState::default();
+        let _ = host.dht.set(Dht::client().unwrap());
+        let _ = viewer.dht.set(Dht::client().unwrap());
+        let h = host.clone();
+        let on_offer: OfferFn = Arc::new(move |code: &str, slot: u8, offer: String| {
+            let sid = serde_json::from_str::<serde_json::Value>(&offer).unwrap()["sid"].as_str().unwrap().to_string();
+            let (h, code) = (h.clone(), code.to_string());
+            thread::spawn(move || host_reply(&h, &code, slot, &serde_json::json!({ "t": "answer", "sid": sid }).to_string()));
+        });
+        let code = host_listen(&host, on_offer, None).unwrap();
+        thread::sleep(Duration::from_secs(3)); // o host se inscreve nos relays
+        let prep = prepare_join(&viewer, &code, None).unwrap();
+        let t = Instant::now();
+        let answer = join(prep, "n1", r#"{"t":"offer","sid":"n1"}"#, 60, &AtomicBool::new(false), |_| {}).unwrap();
+        println!("resposta em {:?}", t.elapsed());
+        assert!(answer.contains("answer"));
+        assert!(t.elapsed() < Duration::from_secs(8), "a resposta pelo Nostr devia chegar em poucos segundos");
         host_stop(&host);
     }
 

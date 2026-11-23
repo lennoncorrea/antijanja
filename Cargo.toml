@@ -61,6 +61,9 @@ xcap = "0.9.10"
 igd-next = "0.18.0"
 turn = "0.17"
 webrtc-util = { version = "0.17.3", default-features = false }
+tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+k256 = { version = "0.14.0", features = ["schnorr"] }
+sha2 = "0.11"
 
 # LTO "thin" e algumas unidades de código: binário quase igual, build bem mais leve
 # (o build completo com lto=true travava o PC).
