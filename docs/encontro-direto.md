@@ -37,6 +37,21 @@ quem fica preso atrás de CGNAT ou NAT simétrico no IPv4 costuma passar direto 
 - As conexões WebRTC escutam em IPv4 e IPv6 (`transport::UDP_BIND`): o ICE testa os
   dois e fica com o que conectar.
 
+## Porta aberta no roteador (UPnP)
+
+Quando o roteador da casa aceita UPnP, o próprio app abre portas nele (`src/upnp.rs`),
+sempre com prazo de 1 h (renovado enquanto o app está aberto; roteador que só aceita
+porta aberta para sempre fica sem):
+
+- a porta da fofoca: o endereço aberto vai primeiro no ticket e no anúncio do tópico, e
+  pedidos diretos e vizinhos chegam sem precisar de batida;
+- as portas de cada conexão WebRTC: o endereço aberto entra na oferta/resposta como mais
+  um candidato, e o outro lado conecta por ele mesmo com NAT simétrico.
+
+Roteador sem IP público (atrás de outro roteador, ou CGNAT da operadora): abrir porta não
+adianta e o app nem tenta. A busca pelo roteador é feita em segundo plano ao abrir o app;
+a conexão nunca espera por ela. Desligado nos testes e com `AJ_NO_UPNP=1`.
+
 ## Mensagens (na fofoca)
 
 - `knock`: `k` = marca da transmissão, `e` = endereços de quem bate (cifrados), `h` =

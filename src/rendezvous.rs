@@ -1003,6 +1003,7 @@ fn start_gossip(app: &AppHandle, dht: &Dht) {
     };
     match crate::gossip::Gossip::start(cfg) {
         Ok(g) => {
+            crate::upnp::start_gossip(g.local_addr().port());
             crate::direct::install(g.clone());
             crate::gossip::install(g);
         }

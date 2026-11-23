@@ -143,6 +143,13 @@ fn audio_codec() -> RTCRtpCodec {
 /// dois e fica com o que conectar.
 pub(crate) const UDP_BIND: [&str; 2] = ["0.0.0.0:0", "[::]:0"];
 
+/// Oferta/resposta com o endereço aberto no roteador (UPnP) como mais um candidato, se
+/// houver (`upnp::augment_sdp`). Conversar com o roteador bloqueia: fora do runtime.
+pub(crate) async fn with_upnp(sdp: String) -> String {
+    let fallback = sdp.clone();
+    tokio::task::spawn_blocking(move || crate::upnp::augment_sdp(&sdp)).await.unwrap_or(fallback)
+}
+
 /// Monta a PeerConnection com nossos codecs e STUN.
 pub(crate) async fn build_pc(handler: Arc<dyn PeerConnectionEventHandler>, stun: bool) -> Res<Arc<dyn PeerConnection>> {
     let mut me = MediaEngine::default();
@@ -413,7 +420,7 @@ impl HostPeer {
         let answer = pc.create_answer(None).await.map_err(err)?;
         pc.set_local_description(answer).await.map_err(err)?;
         wait_gathering(&mut grx).await;
-        let sdp = pc.local_description().await.ok_or("sem descrição local")?.sdp;
+        let sdp = with_upnp(pc.local_description().await.ok_or("sem descrição local")?.sdp).await;
 
         let packetizer: Box<dyn Packetizer> = Box::new(rtc::rtp::packetizer::new_packetizer(
             Instant::now(),
@@ -686,7 +693,7 @@ impl ViewerSession {
         let offer = pc.create_offer(None).await.map_err(err)?;
         pc.set_local_description(offer).await.map_err(err)?;
         wait_gathering(&mut grx).await;
-        let sdp = pc.local_description().await.ok_or("sem descrição local")?.sdp;
+        let sdp = with_upnp(pc.local_description().await.ok_or("sem descrição local")?.sdp).await;
         Ok((Arc::new(ViewerSession { pc, dc, mesh }), sdp))
     }
 

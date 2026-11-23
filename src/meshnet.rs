@@ -60,7 +60,7 @@ impl MeshLink {
         let offer = pc.create_offer(None).await.map_err(err)?;
         pc.set_local_description(offer).await.map_err(err)?;
         wait_gathering(&mut grx).await;
-        let sdp = pc.local_description().await.ok_or("sem descrição local")?.sdp;
+        let sdp = crate::transport::with_upnp(pc.local_description().await.ok_or("sem descrição local")?.sdp).await;
         Ok((Arc::new(MeshLink { pc, dc: Arc::new(Mutex::new(Some(dc))), seq: AtomicU32::new(0) }), sdp))
     }
 
@@ -89,7 +89,7 @@ impl MeshLink {
         let answer = pc.create_answer(None).await.map_err(err)?;
         pc.set_local_description(answer).await.map_err(err)?;
         wait_gathering(&mut grx).await;
-        let sdp = pc.local_description().await.ok_or("sem descrição local")?.sdp;
+        let sdp = crate::transport::with_upnp(pc.local_description().await.ok_or("sem descrição local")?.sdp).await;
         Ok((Arc::new(MeshLink { pc, dc: slot, seq: AtomicU32::new(0) }), sdp))
     }
 

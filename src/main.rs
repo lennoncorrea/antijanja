@@ -40,6 +40,7 @@ mod settings;
 mod transport;
 mod ui;
 mod updater;
+mod upnp;
 mod video;
 
 fn main() {

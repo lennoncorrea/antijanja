@@ -283,8 +283,14 @@ impl Gossip {
     /// veem) e o da rede local.
     pub fn my_addrs(&self) -> Vec<SocketAddr> {
         let mut out = Vec::new();
+        // Porta aberta no roteador (UPnP) primeiro: alcançável sem furo.
+        if let Some(a) = crate::upnp::gossip_addr() {
+            out.push(SocketAddr::V4(a));
+        }
         if let Some(p) = self.st.lock().unwrap().public {
-            out.push(SocketAddr::V4(p));
+            if !out.contains(&SocketAddr::V4(p)) {
+                out.push(SocketAddr::V4(p));
+            }
         }
         let me = self.local_addr();
         if me.ip().is_loopback() {
@@ -701,7 +707,10 @@ impl Gossip {
                     }
                     thread::sleep(Duration::from_millis(100));
                 }
-                let port = self.st.lock().unwrap().public.map(|p| p.port()).unwrap_or(self.local_addr().port());
+                let port = crate::upnp::gossip_addr()
+                    .map(|a| a.port())
+                    .or(self.st.lock().unwrap().public.map(|p| p.port()))
+                    .unwrap_or(self.local_addr().port());
                 match dht.announce_peer(topic, Some(port)) {
                     Ok(_) => log(format!("anunciado no tópico (porta {port})")),
                     Err(e) => log(format!("falha ao anunciar no tópico: {e}")),
