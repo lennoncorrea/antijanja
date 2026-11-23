@@ -27,6 +27,16 @@ igual; vale a resposta que chegar primeiro. Nenhum servidor novo.
 
 Na mesma rede local, o endereço local do ticket já basta (sem batida).
 
+### Roteador que troca a porta (NAT simétrico)
+
+- O espectador guarda de onde o "olá" do host veio e passa a mandar o pedido para lá
+  também: com NAT simétrico no host, essa porta não é a do ticket.
+- Os "olás" (do host, depois da batida; do espectador, até aprender o endereço do host)
+  vão também para as 10 portas acima e abaixo da porta pública conhecida: esses
+  roteadores costumam dar portas em sequência a cada destino novo.
+- No Início, o app já prepara a entrada nas transmissões à vista (até 3, amigos
+  primeiro, sem senha): lê o ticket, escolhe o slot e bate à porta antes do clique.
+
 ## IPv6
 
 Muitas operadoras já dão IPv6, e no IPv6 não há roteador traduzindo endereço (NAT):

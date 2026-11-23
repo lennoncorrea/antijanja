@@ -37,6 +37,11 @@ const KNOCK_EVERY: Duration = Duration::from_secs(5);
 const PARTIAL_TTL: Duration = Duration::from_secs(15);
 /// Pedidos já vistos (para não entregar de novo o mesmo pedido repetido).
 const SEEN_TTL: Duration = Duration::from_secs(300);
+/// "Olás" vão também para as portas vizinhas do endereço público conhecido (roteador com
+/// NAT simétrico costuma dar portas em sequência a cada destino novo).
+const NEAR_PORTS: u16 = 10;
+/// Endereços do host aprendidos pelo espectador (de onde vieram os "olás").
+const MAX_LEARNED: usize = 4;
 
 fn log(msg: impl AsRef<str>) {
     crate::connlog::log(format!("direto: {}", msg.as_ref()));
@@ -64,6 +69,9 @@ struct HostReg {
 struct Waiter {
     keys: Arc<Keys>,
     tx: Sender<String>,
+    /// De onde o host chamou de volta: pode não ser o endereço do ticket (NAT que troca
+    /// a porta a cada destino). O pedido passa a ir para lá também.
+    learned: Vec<SocketAddr>,
 }
 
 #[derive(Default)]
@@ -164,14 +172,28 @@ impl Direct {
         // espectador (que já está mandando o pedido para nós).
         let (g, k) = (self.g.clone(), k.to_string());
         thread::spawn(move || {
-            for _ in 0..4 {
+            for round in 0..4 {
                 for a in &addrs {
-                    g.send_rv(*a, &Rv { k: k.clone(), r: 'h', s: 0, m: 0, i: 0, n: 0, d: String::new() });
+                    g.send_rv(*a, &hello(&k, 'h'));
+                }
+                // Nas duas primeiras voltas, também as portas vizinhas (NAT simétrico do
+                // lado do espectador).
+                if round < 2 {
+                    for a in near(&addrs) {
+                        g.send_rv(a, &hello(&k, 'h'));
+                    }
                 }
                 thread::sleep(Duration::from_millis(250));
             }
         });
         true
+    }
+
+    /// "Olá" para as portas vizinhas destes endereços (só os públicos IPv4).
+    fn hello_near(&self, addrs: &[SocketAddr], tag: &str, role: char) {
+        for a in near(addrs) {
+            self.g.send_rv(a, &hello(tag, role));
+        }
     }
 
     /* --------------------------- espectador --------------------------- */
@@ -180,7 +202,7 @@ impl Direct {
     /// mensagem do host (aberta) vai para `tx`.
     pub fn viewer_start(self: &Arc<Self>, keys: Arc<Keys>, slot: u8, payload: String, ticket: Option<Ticket>, tx: Sender<String>, done: Arc<AtomicBool>) {
         let tag = keys.direct_tag();
-        self.st.lock().unwrap().waiters.insert(tag.clone(), Waiter { keys: keys.clone(), tx });
+        self.st.lock().unwrap().waiters.insert(tag.clone(), Waiter { keys: keys.clone(), tx, learned: Vec::new() });
         let d = self.clone();
         thread::spawn(move || {
             let targets = ticket.map(|t| t.socket_addrs()).unwrap_or_default();
@@ -196,8 +218,14 @@ impl Direct {
                         d.g.knock(&tag, e);
                     }
                 }
-                for a in &targets {
+                let learned = d.st.lock().unwrap().waiters.get(&tag).map(|w| w.learned.clone()).unwrap_or_default();
+                for a in targets.iter().chain(learned.iter().filter(|a| !targets.contains(a))) {
                     d.send_sealed_msg(*a, &keys, &tag, 'v', slot, msg, &payload);
+                }
+                // Abre a passagem para as portas vizinhas das do host (NAT simétrico do lado
+                // dele): o "olá" que ele mandar de uma porta nova consegue entrar.
+                if learned.is_empty() {
+                    d.hello_near(&targets, &tag, 'v');
                 }
                 let until = Instant::now() + RESEND;
                 while Instant::now() < until && !done.load(Ordering::SeqCst) {
@@ -250,8 +278,22 @@ impl Direct {
     }
 
     fn on_rv(&self, from: SocketAddr, rv: Rv) {
-        if rv.n == 0 || rv.n > MAX_PIECES || rv.i >= rv.n {
-            return; // só abriu a passagem pelo roteador
+        if rv.n == 0 {
+            // Só abriu a passagem pelo roteador. Se é o host chamando um espectador daqui,
+            // guarda de onde veio: o pedido passa a ir para lá também.
+            if rv.r == 'h' {
+                let mut st = self.st.lock().unwrap();
+                if let Some(w) = st.waiters.get_mut(&rv.k) {
+                    if !w.learned.contains(&from) && w.learned.len() < MAX_LEARNED {
+                        log(format!("o host chamou de volta de {}", if from.is_ipv6() { "um endereço IPv6" } else { "um endereço IPv4" }));
+                        w.learned.push(from);
+                    }
+                }
+            }
+            return;
+        }
+        if rv.n > MAX_PIECES || rv.i >= rv.n {
+            return;
         }
         let Ok(piece) = B64.decode(rv.d.as_bytes()) else { return };
         if piece.len() > PIECE {
@@ -324,6 +366,30 @@ impl Direct {
             self.send_sealed(from, &keys, &rv.k, 'h', 0, &answer);
         }
     }
+}
+
+fn hello(tag: &str, role: char) -> Rv {
+    Rv { k: tag.to_string(), r: role, s: 0, m: 0, i: 0, n: 0, d: String::new() }
+}
+
+/// Portas vizinhas (±`NEAR_PORTS`) dos endereços IPv4 públicos da lista.
+fn near(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    for a in addrs {
+        let SocketAddr::V4(v4) = a else { continue };
+        let ip = v4.ip();
+        if ip.is_private() || ip.is_loopback() || ip.is_link_local() {
+            continue;
+        }
+        for d in 1..=NEAR_PORTS {
+            for p in [v4.port().checked_add(d), v4.port().checked_sub(d)].into_iter().flatten() {
+                if p >= 1024 {
+                    out.push(SocketAddr::new((*ip).into(), p));
+                }
+            }
+        }
+    }
+    out
 }
 
 fn sid_of(payload: &str) -> Option<String> {
@@ -434,6 +500,49 @@ mod tests {
         done.store(true, Ordering::SeqCst);
         hg.stop();
         vg.stop();
+    }
+
+    /// O ticket aponta para um endereço que não responde (o NAT do host trocou a porta):
+    /// o host chama de volta pela batida, o espectador aprende de onde veio o "olá" e o
+    /// pedido chega por lá.
+    #[test]
+    fn viewer_learns_the_host_address_from_its_hello() {
+        let (hg, mg, vg) = (node("host"), node("meio"), node("viewer"));
+        hg.connect(mg.local_addr());
+        vg.connect(mg.local_addr());
+        let until = Instant::now() + Duration::from_secs(5);
+        while hg.peers() < 1 || vg.peers() < 1 || mg.peers() < 2 {
+            assert!(Instant::now() < until, "vizinhos não se confirmaram");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let (host, _meio, viewer) = (Direct::new(hg.clone()), Direct::new(mg.clone()), Direct::new(vg.clone()));
+        let (code, keys) = Keys::new_host(None).unwrap();
+        let (otx, orx) = mpsc::channel::<String>();
+        let otx = Mutex::new(otx);
+        host.host_register(&code, Arc::new(keys), Arc::new(move |_, _, p| {
+            let _ = otx.lock().unwrap().send(p);
+        }));
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let offer = r#"{"t":"offer","sid":"aprende"}"#.to_string();
+        let (atx, _arx) = mpsc::channel();
+        let done = Arc::new(AtomicBool::new(false));
+        let t = Instant::now();
+        viewer.viewer_start(Arc::new(Keys::from_code(&code, None).unwrap()), 0, offer.clone(), Some(Ticket { addrs: vec![dead.to_string()], ts: 0 }), atx, done.clone());
+        assert_eq!(orx.recv_timeout(Duration::from_secs(5)).expect("pedido não chegou pelo endereço aprendido"), offer);
+        println!("chegou em {:?}", t.elapsed());
+        done.store(true, Ordering::SeqCst);
+        for g in [hg, mg, vg] {
+            g.stop();
+        }
+    }
+
+    #[test]
+    fn near_ports_only_for_public_ipv4() {
+        let n = near(&["203.0.113.5:40000".parse().unwrap()]);
+        assert_eq!(n.len(), 2 * NEAR_PORTS as usize);
+        assert!(n.contains(&"203.0.113.5:40010".parse().unwrap()) && n.contains(&"203.0.113.5:39990".parse().unwrap()));
+        assert!(near(&["192.168.0.2:40000".parse().unwrap(), "127.0.0.1:5".parse().unwrap(), "[2804::1]:40000".parse().unwrap()]).is_empty());
+        assert!(near(&["203.0.113.5:1025".parse().unwrap()]).iter().all(|a| a.port() >= 1024));
     }
 
     /// A batida corre pela fofoca (espectador — vizinho — host) e o host chama de volta.
