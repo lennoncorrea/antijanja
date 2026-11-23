@@ -22,6 +22,7 @@ mod friends;
 mod fullscreen;
 mod gossip;
 mod identity;
+mod invite;
 mod congestion;
 mod connlog;
 mod direct;

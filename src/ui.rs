@@ -5,7 +5,7 @@
 //! próprias e posiciona os players nativos sobre os tiles da tela "Assistindo".
 
 use crate::app::AppHandle;
-use crate::{audio, capture, friends, identity, overlay, rendezvous, session, settings, transport, updater};
+use crate::{audio, capture, friends, identity, invite, overlay, rendezvous, session, settings, transport, updater};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::Value;
 use slint::{ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
@@ -1556,6 +1556,22 @@ fn paste_join(c: &mut Ctl, ui: &AppWindow) {
     }
 }
 
+/// Traz a janela para a frente (clique num link de convite com o app já aberto).
+fn bring_to_front(c: &Ctl) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE};
+    let hwnd = HWND(c.app.hwnd() as *mut _);
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
 fn join_with_code(c: &mut Ctl, ui: &AppWindow, raw: &str) {
     let code: String = raw.chars().filter(|ch| !ch.is_whitespace()).collect();
     if code.is_empty() {
@@ -2019,6 +2035,14 @@ fn wire(ui: &AppWindow) {
             }
         })
     });
+    a.on_copy_my_link(|| {
+        later(|c, ui| {
+            let code = c.code.clone();
+            if !code.is_empty() && clipboard_set(&invite::link_for(&code)) {
+                toast(c, ui, "ok", "Link copiado. Quem tiver o AntiJanja atualizado entra clicando nele.");
+            }
+        })
+    });
     a.on_set_setting(|k, v| later(move |c, ui| set_setting(c, ui, &k, &v)));
     a.on_refresh_apps(|| later(|c, ui| refresh_apps(c, ui)));
     a.on_open_picker(|mode| later(move |c, ui| open_picker(c, ui, &mode)));
@@ -2423,6 +2447,12 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // A janela dos controles por cima do vídeo precisa de atributos do winit (dona, fora
     // da barra de tarefas) que o Slint não expõe.
     slint::BackendSelector::new().with_winit_window_attributes_hook(overlay::attributes_hook).select()?;
+    // Aberto por um link de convite com outro AntiJanja já aberto: passa o código para ele
+    // e fecha (o Windows abre um app novo a cada clique no link).
+    let link_code = invite::code_from_args();
+    if link_code.as_deref().is_some_and(invite::forward) {
+        return Ok(());
+    }
     let ui = AppWindow::new()?;
 
     let app = AppHandle::new(|name, value| {
@@ -2524,6 +2554,19 @@ pub fn run() -> Result<(), slint::PlatformError> {
     });
 
     rendezvous::init(&app);
+    // Links de convite: registra o antijanja:// e recebe os códigos de cliques posteriores.
+    invite::register();
+    invite::listen(|code| {
+        let _ = slint::invoke_from_event_loop(move || {
+            with(|c, ui| {
+                bring_to_front(c);
+                join_with_code(c, ui, &code);
+            });
+        });
+    });
+    if let Some(code) = link_code {
+        later(move |c, ui| join_with_code(c, ui, &code));
+    }
     if rendezvous::rdv_ready(app.rdv()) {
         with(|c, ui| {
             c.net = "ok".into();

@@ -105,4 +105,6 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\${PRODUCT}.lnk"
   Delete "$DESKTOP\${PRODUCT}.lnk"
   DeleteRegKey HKCU "${UNINST_KEY}"
+  ; Link de convite antijanja:// (registrado pelo próprio app ao abrir)
+  DeleteRegKey HKCU "Software\Classes\antijanja"
 SectionEnd

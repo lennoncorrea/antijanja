@@ -344,6 +344,14 @@ component CodeCard inherits Card {
             enabled: App.code != "";
             clicked => { App.copy-my-code(); }
         }
+        Btn {
+            kind: "outline";
+            text: "Copiar link de convite";
+            icon: @image-url("icons/link.svg");
+            has-icon: true;
+            enabled: App.code != "";
+            clicked => { App.copy-my-link(); }
+        }
         Rectangle {
             border-radius: Theme.radius-md;
             background: Theme.raised;
