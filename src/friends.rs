@@ -690,6 +690,21 @@ impl Friends {
 
     /// O que sou de quem tem este código: "me", "friend", "sent" (pedido enviado),
     /// "incoming" (ele pediu) ou "" (nada).
+    /// Endereços de um amigo que está transmitindo com este código (para o encontro direto):
+    /// o da conexão direta com ele, se estiver aberta (a passagem pelo roteador já existe,
+    /// então o pedido chega na hora), e os da presença dele.
+    pub fn live_addrs(&self, code: &str) -> Vec<SocketAddr> {
+        let st = self.st.lock().unwrap();
+        let Some((key, p)) = st.presence.iter().find(|(_, p)| !p.gone && p.live.as_ref().is_some_and(|l| l.code == code)) else { return Vec::new() };
+        let mut out: Vec<SocketAddr> = st.links.get(key).filter(|l| l.last_rx.is_some_and(|t| t.elapsed() < LINK_DEAD)).and_then(|l| l.addr).into_iter().collect();
+        for a in [&p.addr, &p.lan].iter().filter_map(|a| a.parse::<SocketAddr>().ok()) {
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
+        out
+    }
+
     pub fn relation(&self, code: &str) -> &'static str {
         let Ok(m) = identity::parse_friend_code(code) else { return "" };
         if m == self.id().master_pub() {

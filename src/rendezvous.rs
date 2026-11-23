@@ -415,22 +415,68 @@ fn raise_stop(slot: &Mutex<Option<Arc<AtomicBool>>>) {
     }
 }
 
+/// Sem a DHT, tenta de novo a cada tanto (o app pode ter aberto antes da internet, ou a
+/// rede caiu e voltou): o aviso "Sem rede P2P" some sozinho quando ela conecta.
+const DHT_RETRY: Duration = Duration::from_secs(10);
+
 /// Inicia o nó da DHT em segundo plano assim que o app abre.
 pub fn init(app: &AppHandle) {
     let app = app.clone();
-    thread::spawn(move || match Dht::client() {
-        Ok(dht) => {
-            let ok = dht.bootstrapped();
-            start_gossip(&app, &dht);
-            crate::friends::dht_ready(&dht);
-            let _ = app.rdv().dht.set(dht);
-            let _ = app.emit("dht-status", ok);
-        }
-        Err(e) => {
-            eprintln!("DHT indisponível: {e}");
-            let _ = app.emit("dht-status", false);
+    thread::spawn(move || {
+        let dht = loop {
+            match Dht::client() {
+                Ok(dht) => break dht,
+                Err(e) => {
+                    crate::connlog::log(format!("rede: DHT não abriu ({e}); tentando de novo em {} s", DHT_RETRY.as_secs()));
+                    let _ = app.emit("dht-status", false);
+                    thread::sleep(DHT_RETRY);
+                }
+            }
+        };
+        let t = Instant::now();
+        let mut ok = dht.bootstrapped();
+        crate::connlog::log(format!("rede: DHT {} em {} ms", if ok { "conectada" } else { "sem resposta" }, t.elapsed().as_millis()));
+        start_gossip(&app, &dht);
+        crate::friends::dht_ready(&dht);
+        let _ = app.rdv().dht.set(dht.clone());
+        let _ = app.emit("dht-status", ok);
+        diagnose_later();
+        let mut tries = 0u32;
+        while !ok {
+            thread::sleep(DHT_RETRY);
+            tries += 1;
+            ok = dht.bootstrapped();
+            if ok {
+                crate::connlog::log(format!("rede: DHT conectada depois de {tries} nova(s) tentativa(s)"));
+                let _ = app.emit("dht-status", true);
+            }
         }
     });
+}
+
+/// Uns segundos depois de abrir, registra no log o que a rede deste PC permite (para
+/// entender depois por que alguém não conecta): DHT, endereço público (STUN), vizinhos na
+/// fofoca, IPv6 e porta aberta no roteador (UPnP).
+fn diagnose_later() {
+    thread::spawn(|| {
+        thread::sleep(Duration::from_secs(20));
+        crate::connlog::log(network_summary());
+    });
+}
+
+/// Resumo da rede deste PC, numa linha.
+fn network_summary() -> String {
+    let public = crate::gossip::public_addr();
+    let nat = match (crate::upnp::gossip_addr(), public) {
+        (Some(_), _) => "porta aberta no roteador (UPnP)",
+        (None, Some(_)) => "atrás de roteador (STUN respondeu)",
+        (None, None) => "sem endereço público (STUN não respondeu: UDP bloqueado?)",
+    };
+    format!(
+        "diagnóstico: {nat}; {} vizinho(s) na fofoca; IPv6 {}",
+        crate::gossip::peer_count(),
+        if crate::gossip::global_v6().is_some() { "sim" } else { "não" }
+    )
 }
 
 /// Recebe (código em que o pedido chegou, slot, pedido).
@@ -600,9 +646,32 @@ pub fn prepare_join(state: &RdvState, code: &str, password: Option<&str>) -> Res
         (picked, ticket.join().ok().flatten())
     });
     let (slot, seq) = picked.inspect_err(|e| log(format!("entrada no código {}: sem slot: {e}", short(code))))?;
+    // Transmissão de um amigo: a conexão direta com ele já está aberta, e o endereço dela
+    // vai primeiro (o pedido chega sem esperar a batida).
+    let friend = crate::friends::get().map(|f| f.live_addrs(code)).unwrap_or_default();
+    if !friend.is_empty() {
+        log(format!("entrada no código {}: transmissão de amigo ({} endereço(s) conhecidos)", short(code), friend.len()));
+    }
+    let ticket = merge_ticket(friend, ticket);
     let t = ticket.as_ref().map(|t| format!("ticket com {} endereço(s)", t.addrs.len())).unwrap_or("sem ticket".into());
     log(format!("entrada no código {}: slot {slot} escolhido em {} ms; {t}", short(code), started.elapsed().as_millis()));
     Ok(JoinPrep { keys: Arc::new(keys), dht, slot, seq, ticket })
+}
+
+/// Junta os endereços de um amigo (primeiro) aos do ticket, sem repetir.
+fn merge_ticket(first: Vec<std::net::SocketAddr>, ticket: Option<crate::direct::Ticket>) -> Option<crate::direct::Ticket> {
+    if first.is_empty() {
+        return ticket;
+    }
+    let mut t = ticket.unwrap_or_default();
+    let mut addrs: Vec<String> = first.iter().map(|a| a.to_string()).collect();
+    for a in t.addrs {
+        if !addrs.contains(&a) {
+            addrs.push(a);
+        }
+    }
+    t.addrs = addrs;
+    Some(t)
 }
 
 /// O que os caminhos da entrada (DHT e direto) contam para a espera.
@@ -1265,6 +1334,18 @@ mod tests {
         let mut f = entry(&open, now_ms(), false);
         f.locked = true;
         assert!(!valid(&f), "cadeado num código sem senha");
+    }
+
+    #[test]
+    fn friend_addresses_go_first_in_the_ticket() {
+        let a: std::net::SocketAddr = "198.51.100.7:4000".parse().unwrap();
+        assert_eq!(merge_ticket(vec![], None), None);
+        let t = crate::direct::Ticket { addrs: vec!["203.0.113.5:1".into(), a.to_string()], ts: 9 };
+        assert_eq!(merge_ticket(vec![], Some(t.clone())), Some(t.clone()));
+        let m = merge_ticket(vec![a], Some(t)).unwrap();
+        assert_eq!(m.addrs, vec![a.to_string(), "203.0.113.5:1".to_string()], "amigo primeiro, sem repetir");
+        assert_eq!(m.ts, 9);
+        assert_eq!(merge_ticket(vec![a], None).unwrap().addrs, vec![a.to_string()]);
     }
 
     #[test]
