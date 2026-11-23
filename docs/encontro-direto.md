@@ -27,6 +27,16 @@ igual; vale a resposta que chegar primeiro. Nenhum servidor novo.
 
 Na mesma rede local, o endereço local do ticket já basta (sem batida).
 
+## IPv6
+
+Muitas operadoras já dão IPv6, e no IPv6 não há roteador traduzindo endereço (NAT):
+quem fica preso atrás de CGNAT ou NAT simétrico no IPv4 costuma passar direto pelo IPv6.
+
+- O ticket e a batida levam também o endereço IPv6 global do app (um socket IPv6 só para
+  o encontro direto; a fofoca em si continua em IPv4).
+- As conexões WebRTC escutam em IPv4 e IPv6 (`transport::UDP_BIND`): o ICE testa os
+  dois e fica com o que conectar.
+
 ## Mensagens (na fofoca)
 
 - `knock`: `k` = marca da transmissão, `e` = endereços de quem bate (cifrados), `h` =

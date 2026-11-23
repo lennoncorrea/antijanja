@@ -180,6 +180,9 @@ struct State {
 
 pub struct Gossip {
     sock: UdpSocket,
+    /// Socket IPv6 (só para o encontro direto): sem NAT no caminho, passa onde o IPv4 fica
+    /// preso atrás de CGNAT. Nem todo PC tem.
+    sock6: Option<UdpSocket>,
     cfg: Config,
     st: Mutex<State>,
     stop: AtomicBool,
@@ -249,9 +252,10 @@ impl Gossip {
     pub fn start(cfg: Config) -> std::io::Result<Arc<Gossip>> {
         let sock = UdpSocket::bind(SocketAddrV4::new(cfg.bind, 0))?;
         sock.set_read_timeout(Some(Duration::from_millis(500)))?;
+        let sock6 = if cfg.bind.is_unspecified() { bind_v6() } else { None };
         let lan = cfg.lan;
         let dht = cfg.dht.clone();
-        let g = Arc::new(Gossip { sock, cfg, st: Mutex::new(State::default()), stop: AtomicBool::new(false), on_knock: OnceLock::new(), on_rv: OnceLock::new() });
+        let g = Arc::new(Gossip { sock, sock6, cfg, st: Mutex::new(State::default()), stop: AtomicBool::new(false), on_knock: OnceLock::new(), on_rv: OnceLock::new() });
         log(format!("escutando na porta {}", g.local_addr().port()));
         let spawn = |name: &str, f: fn(Arc<Gossip>)| {
             let g = g.clone();
@@ -259,6 +263,9 @@ impl Gossip {
         };
         spawn("aj-gossip-rx", Gossip::recv_loop)?;
         spawn("aj-gossip-tick", Gossip::tick_loop)?;
+        if g.sock6.is_some() {
+            spawn("aj-gossip-rx6", Gossip::recv6_loop)?;
+        }
         if dht.is_some() {
             spawn("aj-gossip-dht", Gossip::discover_loop)?;
         }
@@ -285,7 +292,18 @@ impl Gossip {
         } else if let Some(ip) = lan_ip() {
             out.push(SocketAddr::new(ip, me.port()));
         }
+        if let Some(port) = self.sock6.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port()) {
+            if let Some(ip) = global_v6() {
+                out.push(SocketAddr::new(IpAddr::V6(ip), port));
+            }
+        }
         out
+    }
+
+    /// Endereço local do socket IPv6, se houver.
+    #[cfg(test)]
+    pub fn local_addr6(&self) -> Option<SocketAddr> {
+        self.sock6.as_ref().and_then(|s| s.local_addr().ok())
     }
 
     /// Quem recebe as batidas (o encontro direto).
@@ -313,7 +331,11 @@ impl Gossip {
     /// Manda um pedaço do encontro direto. `false` se não coube num pacote.
     pub fn send_rv(&self, to: SocketAddr, rv: &Rv) -> bool {
         let Some(b) = encode(&Msg::Rv(rv.clone())) else { return false };
-        self.sock.send_to(&b, to).is_ok()
+        match (to, &self.sock6) {
+            (SocketAddr::V6(_), Some(s6)) => s6.send_to(&b, to).is_ok(),
+            (SocketAddr::V6(_), None) => false,
+            _ => self.sock.send_to(&b, to).is_ok(),
+        }
     }
 
     /// Batida nova? (marca como vista)
@@ -428,6 +450,21 @@ impl Gossip {
                 }
                 // Tempo esgotado, ou (no Windows) "porta inalcançável" de um envio anterior.
                 Err(_) => continue,
+            }
+        }
+    }
+
+    /// Recepção pelo socket IPv6: só o encontro direto (a fofoca em si é IPv4).
+    fn recv6_loop(self: Arc<Self>) {
+        let Some(s6) = &self.sock6 else { return };
+        let mut buf = [0u8; 2048];
+        while !self.stop.load(Ordering::SeqCst) {
+            if let Ok((n, from)) = s6.recv_from(&mut buf) {
+                if let Some(Msg::Rv(rv)) = decode(&buf[..n]) {
+                    if let Some(f) = self.on_rv.get() {
+                        f(from, rv);
+                    }
+                }
             }
         }
     }
@@ -750,6 +787,26 @@ impl Gossip {
 fn topic_id(net: &str) -> mainline::Id {
     let h = blake3::hash(format!("antijanja gossip v1{net}").as_bytes());
     mainline::Id::from_bytes(&h.as_bytes()[..20]).expect("20 bytes")
+}
+
+fn bind_v6() -> Option<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let s = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).ok()?;
+    s.set_only_v6(true).ok()?;
+    s.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)).into()).ok()?;
+    s.set_read_timeout(Some(Duration::from_millis(500))).ok()?;
+    Some(s.into())
+}
+
+/// Endereço IPv6 global deste PC (o usado para sair), se houver. Nenhum pacote é mandado.
+pub fn global_v6() -> Option<std::net::Ipv6Addr> {
+    let s = UdpSocket::bind("[::]:0").ok()?;
+    s.connect("[2001:4860:4860::8888]:53").ok()?;
+    match s.local_addr().ok()?.ip() {
+        // Global unicast (2000::/3): nem local, nem link-local, nem ULA.
+        IpAddr::V6(ip) if (ip.segments()[0] & 0xe000) == 0x2000 => Some(ip),
+        _ => None,
+    }
 }
 
 fn is_global(ip: IpAddr) -> bool {

@@ -380,6 +380,47 @@ mod tests {
         vg.stop();
     }
 
+    /// O encontro direto também vai por IPv6 (aqui pelo ::1 do próprio PC).
+    #[test]
+    fn offer_and_answer_over_ipv6() {
+        let mk = |name: &str| {
+            Gossip::start(Config {
+                id: name.into(),
+                net: "teste-v6".into(),
+                dht: None,
+                lan: false,
+                bind: Ipv4Addr::UNSPECIFIED,
+                check: Box::new(|_| None),
+                deliver: Box::new(|_| {}),
+            })
+            .unwrap()
+        };
+        let (hg, vg) = (mk("host6"), mk("viewer6"));
+        let Some(port6) = hg.local_addr6().map(|a| a.port()) else {
+            println!("sem IPv6 neste PC");
+            return;
+        };
+        let (host, viewer) = (Direct::new(hg.clone()), Direct::new(vg.clone()));
+        let (code, keys) = Keys::new_host(None).unwrap();
+        let (otx, orx) = mpsc::channel::<String>();
+        let otx = Mutex::new(otx);
+        host.host_register(&code, Arc::new(keys), Arc::new(move |_, _, p| {
+            let _ = otx.lock().unwrap().send(p);
+        }));
+        let ticket = Ticket { addrs: vec![format!("[::1]:{port6}")], ts: 0 };
+        let offer = r#"{"t":"offer","sid":"v6"}"#.to_string();
+        let (atx, arx) = mpsc::channel();
+        let done = Arc::new(AtomicBool::new(false));
+        viewer.viewer_start(Arc::new(Keys::from_code(&code, None).unwrap()), 1, offer.clone(), Some(ticket), atx, done.clone());
+        assert_eq!(orx.recv_timeout(Duration::from_secs(3)).expect("pedido não chegou por IPv6"), offer);
+        let answer = r#"{"t":"answer","sid":"v6"}"#;
+        assert!(host.host_reply(&code, answer));
+        assert_eq!(arx.recv_timeout(Duration::from_secs(3)).expect("resposta não voltou por IPv6"), answer);
+        done.store(true, Ordering::SeqCst);
+        hg.stop();
+        vg.stop();
+    }
+
     /// A batida corre pela fofoca (espectador — vizinho — host) e o host chama de volta.
     #[test]
     fn knock_reaches_the_host_through_a_neighbour() {

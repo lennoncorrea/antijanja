@@ -137,6 +137,12 @@ fn audio_codec() -> RTCRtpCodec {
     }
 }
 
+/// Onde as conexões escutam: todas as placas de rede, em IPv4 e em IPv6. Com IPv6 (muitas
+/// operadoras já dão) não há roteador traduzindo endereço no caminho, e a conexão direta
+/// funciona onde o IPv4 fica preso atrás de NAT (CGNAT, NAT simétrico). O ICE testa os
+/// dois e fica com o que conectar.
+pub(crate) const UDP_BIND: [&str; 2] = ["0.0.0.0:0", "[::]:0"];
+
 /// Monta a PeerConnection com nossos codecs e STUN.
 pub(crate) async fn build_pc(handler: Arc<dyn PeerConnectionEventHandler>, stun: bool) -> Res<Arc<dyn PeerConnection>> {
     let mut me = MediaEngine::default();
@@ -165,7 +171,7 @@ pub(crate) async fn build_pc(handler: Arc<dyn PeerConnectionEventHandler>, stun:
         .with_interceptor_registry(registry)
         .with_handler(handler)
         .with_runtime(runtime())
-        .with_udp_addrs(vec!["0.0.0.0:0"])
+        .with_udp_addrs(UDP_BIND.to_vec())
         .build()
         .await
         .map_err(err)?;

@@ -623,6 +623,21 @@ mod tests {
         d
     }
 
+    /// As conexões oferecem endereços IPv6 também (se o PC tiver IPv6 de verdade).
+    #[test]
+    fn offers_ipv6_candidates_when_available() {
+        let has_v6 = crate::gossip::global_v6().is_some();
+        let (link, sdp) = block_on(MeshLink::offer(false)).unwrap();
+        let v6 = sdp.lines().filter(|l| l.starts_with("a=candidate")).any(|l| l.split(' ').nth(4).is_some_and(|ip| ip.contains(':')));
+        let v4 = sdp.lines().filter(|l| l.starts_with("a=candidate")).any(|l| l.split(' ').nth(4).is_some_and(|ip| ip.contains('.')));
+        println!("IPv6 no PC: {has_v6}; na oferta: IPv4 {v4}, IPv6 {v6}");
+        assert!(v4, "sem candidato IPv4");
+        if has_v6 {
+            assert!(v6, "o PC tem IPv6 mas a oferta não");
+        }
+        let _ = block_on(link.pc.close());
+    }
+
     fn intact(d: &[u8]) -> Option<u32> {
         if d.len() < 9 {
             return None;
