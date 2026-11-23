@@ -35,6 +35,7 @@ mod overlay;
 mod pieces;
 mod player;
 mod playout;
+mod relay;
 mod rendezvous;
 mod session;
 mod settings;

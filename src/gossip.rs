@@ -115,6 +115,14 @@ enum Msg {
     /// Pedaço de uma mensagem do encontro direto (pedido ou resposta), mandado direto ao
     /// outro lado. Quem confere e monta é `direct`.
     Rv(Rv),
+    /// Posso repassar conexões (docs/repasse.md): meu servidor TURN está em `a`.
+    RelayCap { a: String },
+    /// Me dá uma credencial do seu repasse? (`n`: número do pedido)
+    RelayReq { n: u32 },
+    /// Credencial do repasse (vale para uma conexão).
+    RelayOk { n: u32, url: String, u: String, p: String },
+    /// Sem vaga no repasse agora.
+    RelayNo { n: u32 },
 }
 
 /// Pedaço de uma mensagem do encontro direto. `n == 0`: só abre a passagem pelo roteador.
@@ -176,6 +184,31 @@ struct State {
     stun_tx: Option<[u8; 12]>,
     last_pex: Option<Instant>,
     pex_turn: usize,
+    /// Vizinhos que podem repassar: endereço do TURN e quando avisaram.
+    relays: HashMap<SocketAddr, (String, Instant)>,
+    /// Pedidos de credencial esperando resposta: número -> (vizinho, resposta).
+    relay_waits: HashMap<u32, (SocketAddr, std::sync::mpsc::Sender<Option<crate::relay::TurnCreds>>)>,
+}
+
+/// Aviso de repasse vale por tanto tempo (é repetido a cada troca de vizinhos).
+const RELAY_TTL: Duration = Duration::from_secs(90);
+
+/// Avisa já os vizinhos que este app pode repassar (sem esperar a próxima troca).
+pub fn announce_relay() {
+    if let (Some(g), Some(a)) = (GLOBAL.get(), crate::relay::advertised()) {
+        g.advertise_relay(&a);
+    }
+}
+
+/// Algum vizinho pode repassar agora?
+pub fn relay_available() -> bool {
+    GLOBAL.get().is_some_and(|g| g.relay_available())
+}
+
+/// Pede uma credencial de repasse aos vizinhos que podem repassar (um de cada vez).
+/// Bloqueia até alguns segundos.
+pub fn request_relay() -> Option<crate::relay::TurnCreds> {
+    GLOBAL.get()?.request_relay()
 }
 
 pub struct Gossip {
@@ -359,6 +392,36 @@ impl Gossip {
             }
         }
         true
+    }
+
+    pub fn relay_available(&self) -> bool {
+        self.st.lock().unwrap().relays.values().any(|(_, at)| at.elapsed() < RELAY_TTL)
+    }
+
+    pub fn request_relay(&self) -> Option<crate::relay::TurnCreds> {
+        let candidates: Vec<SocketAddr> = self.st.lock().unwrap().relays.iter().filter(|(_, (_, at))| at.elapsed() < RELAY_TTL).map(|(a, _)| *a).collect();
+        for peer in candidates {
+            let mut nb = [0u8; 4];
+            let _ = getrandom::fill(&mut nb);
+            let n = u32::from_le_bytes(nb);
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.st.lock().unwrap().relay_waits.insert(n, (peer, tx));
+            self.send(peer, &Msg::RelayReq { n });
+            let got = rx.recv_timeout(Duration::from_millis(1500)).ok().flatten();
+            self.st.lock().unwrap().relay_waits.remove(&n);
+            if got.is_some() {
+                return got;
+            }
+        }
+        None
+    }
+
+    /// Avisa os vizinhos confirmados que este app pode repassar (`a`: endereço do TURN).
+    fn advertise_relay(&self, a: &str) {
+        let to: Vec<SocketAddr> = self.st.lock().unwrap().peers.iter().filter(|(_, p)| p.verified).map(|(a, _)| *a).collect();
+        for v in to {
+            self.send(v, &Msg::RelayCap { a: a.to_string() });
+        }
     }
 
     /// Vizinhos confirmados.
@@ -614,6 +677,35 @@ impl Gossip {
                     }
                     return self.flush(out, deliver);
                 }
+                Msg::RelayCap { a } if verified => {
+                    if a.parse::<SocketAddr>().is_ok() && (st.relays.len() < MAX_PEERS || st.relays.contains_key(&from)) {
+                        st.relays.insert(from, (a, now));
+                    }
+                }
+                Msg::RelayReq { n } if verified => {
+                    drop(st);
+                    let reply = match crate::relay::issue() {
+                        Some(c) => Msg::RelayOk { n, url: c.url, u: c.user, p: c.pass },
+                        None => Msg::RelayNo { n },
+                    };
+                    out.push((from, reply));
+                    return self.flush(out, deliver);
+                }
+                Msg::RelayOk { n, url, u, p } => {
+                    if let Some((peer, tx)) = st.relay_waits.remove(&n) {
+                        if peer == from && url.starts_with("turn:") {
+                            let _ = tx.send(Some(crate::relay::TurnCreds { url, user: u, pass: p }));
+                        }
+                    }
+                }
+                Msg::RelayNo { n } => {
+                    if let Some((peer, tx)) = st.relay_waits.remove(&n) {
+                        if peer == from {
+                            st.relays.remove(&from);
+                            let _ = tx.send(None);
+                        }
+                    }
+                }
                 Msg::Bye => {
                     if st.peers.remove(&from).is_some() {
                         log(format!("vizinho saiu {from}"));
@@ -673,10 +765,18 @@ impl Gossip {
                     true
                 });
                 st.live.retain(|_, (_, at, _)| at.elapsed() < LIVE_TTL);
+                let verified_now: Vec<SocketAddr> = st.peers.iter().filter(|(_, p)| p.verified).map(|(a, _)| *a).collect();
+                st.relays.retain(|a, (_, at)| at.elapsed() < RELAY_TTL && verified_now.contains(a));
                 // Apresenta um vizinho aos outros (os dois lados chamam ao mesmo tempo).
                 if st.last_pex.is_none_or(|t| t.elapsed() >= PEX_EVERY) {
                     st.last_pex = Some(now);
-                    let verified: Vec<SocketAddr> = st.peers.iter().filter(|(_, p)| p.verified).map(|(a, _)| *a).collect();
+                    let verified: Vec<SocketAddr> = verified_now.clone();
+                    // E avisa que pode repassar, se puder.
+                    if let Some(a) = crate::relay::advertised() {
+                        for v in &verified {
+                            out.push((*v, Msg::RelayCap { a: a.clone() }));
+                        }
+                    }
                     if verified.len() >= 2 {
                         st.pex_turn = st.pex_turn.wrapping_add(1);
                         let a = verified[st.pex_turn % verified.len()];

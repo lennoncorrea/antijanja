@@ -136,6 +136,31 @@ pub fn start_gossip(local_port: u16) {
         .ok();
 }
 
+/// Portas do repasse (docs/repasse.md): a do servidor TURN e a da conexão repassada,
+/// abertas no roteador. Só com UPnP e IP público; senão, `None`.
+pub fn open_relay_ports() -> Option<(SocketAddrV4, SocketAddrV4)> {
+    let gw = st().lock().unwrap().gateway.clone().filter(|_| enabled())?;
+    let lan = lan_ipv4()?;
+    // Portas livres neste PC (o sistema escolhe; o roteador tenta abrir o mesmo número).
+    let free = || std::net::UdpSocket::bind("0.0.0.0:0").ok().and_then(|s| s.local_addr().ok()).map(|a| a.port());
+    let (lp, rp) = (free()?, free()?);
+    let listen = map(&gw, SocketAddrV4::new(lan, lp), "repasse")?;
+    let relay = map(&gw, SocketAddrV4::new(lan, rp), "repasse (conexão)")?;
+    // O servidor escuta na porta local; o roteador pode ter dado outro número por fora.
+    if listen.port() != lp || relay.port() != rp {
+        log("o roteador abriu as portas do repasse com outro número: repasse desligado");
+        return None;
+    }
+    Some((listen, relay))
+}
+
+/// Renova a abertura destas portas (mesmo número dentro e fora). `true` se todas abriram.
+pub fn renew(ports: &[u16]) -> bool {
+    let Some(gw) = st().lock().unwrap().gateway.clone().filter(|_| enabled()) else { return false };
+    let Some(lan) = lan_ipv4() else { return false };
+    ports.iter().all(|p| map(&gw, SocketAddrV4::new(lan, *p), "repasse").is_some_and(|a| a.port() == *p))
+}
+
 /// Endereço público da fofoca aberto no roteador, se houver.
 pub fn gossip_addr() -> Option<SocketAddrV4> {
     st().lock().unwrap().gossip

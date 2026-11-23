@@ -143,6 +143,10 @@ fn audio_codec() -> RTCRtpCodec {
 /// dois e fica com o que conectar.
 pub(crate) const UDP_BIND: [&str; 2] = ["0.0.0.0:0", "[::]:0"];
 
+/// Só nos testes: a próxima conexão montada usa só este repasse (TURN).
+#[cfg(test)]
+pub(crate) static TEST_RELAY_ONLY: Mutex<Option<crate::relay::TurnCreds>> = Mutex::new(None);
+
 /// Oferta/resposta com o endereço aberto no roteador (UPnP) como mais um candidato, se
 /// houver (`upnp::augment_sdp`). Conversar com o roteador bloqueia: fora do runtime.
 pub(crate) async fn with_upnp(sdp: String) -> String {
@@ -152,6 +156,12 @@ pub(crate) async fn with_upnp(sdp: String) -> String {
 
 /// Monta a PeerConnection com nossos codecs e STUN.
 pub(crate) async fn build_pc(handler: Arc<dyn PeerConnectionEventHandler>, stun: bool) -> Res<Arc<dyn PeerConnection>> {
+    build_pc_relayed(handler, stun, None).await
+}
+
+/// Como `build_pc`, com o repasse de outro usuário (TURN) como caminho a mais
+/// (docs/repasse.md). O ICE só usa o repasse se o caminho direto não conectar.
+pub(crate) async fn build_pc_relayed(handler: Arc<dyn PeerConnectionEventHandler>, stun: bool, turn: Option<&crate::relay::TurnCreds>) -> Res<Arc<dyn PeerConnection>> {
     let mut me = MediaEngine::default();
     me.register_codec(
         RTCRtpCodecParameters { rtp_codec: video_codec(), payload_type: H264_PT, ..Default::default() },
@@ -172,8 +182,24 @@ pub(crate) async fn build_pc(handler: Arc<dyn PeerConnectionEventHandler>, stun:
     } else {
         vec![]
     };
+    let mut ice_servers = ice_servers;
+    let mut config = RTCConfigurationBuilder::new();
+    // Nos testes: a próxima conexão só pelo repasse (para provar que ele funciona).
+    #[cfg(test)]
+    let forced = TEST_RELAY_ONLY.lock().unwrap().take();
+    #[cfg(test)]
+    let turn = match &forced {
+        Some(t) => {
+            config = config.with_ice_transport_policy(rtc::peer_connection::configuration::RTCIceTransportPolicy::Relay);
+            Some(t)
+        }
+        None => turn,
+    };
+    if let Some(t) = turn {
+        ice_servers.push(RTCIceServer { urls: vec![t.url.clone()], username: t.user.clone(), credential: t.pass.clone() });
+    }
     let pc = PeerConnectionBuilder::new()
-        .with_configuration(RTCConfigurationBuilder::new().with_ice_servers(ice_servers).build())
+        .with_configuration(config.with_ice_servers(ice_servers).build())
         .with_media_engine(me)
         .with_interceptor_registry(registry)
         .with_handler(handler)
@@ -617,6 +643,11 @@ pub enum Timed {
 impl ViewerSession {
     /// Cria a oferta (só recebe vídeo e áudio).
     pub async fn offer(sinks: ViewerSinks, stun: bool) -> Res<(Arc<ViewerSession>, String)> {
+        Self::offer_relayed(sinks, stun, None).await
+    }
+
+    /// Oferta com o repasse de outro usuário como caminho a mais (docs/repasse.md).
+    pub async fn offer_relayed(sinks: ViewerSinks, stun: bool, turn: Option<crate::relay::TurnCreds>) -> Res<(Arc<ViewerSession>, String)> {
         let (gtx, mut grx) = channel::<()>(1);
         let dc_cell: Arc<OnceLock<Arc<dyn DataChannel>>> = Arc::new(OnceLock::new());
         let cell = dc_cell.clone();
@@ -627,7 +658,7 @@ impl ViewerSession {
             spawn(async move { receive_track(track, s, cell).await });
         });
         let handler = Arc::new(Handler { gathered: gtx, on_state: sinks.on_state.clone(), on_track: Some(on_track), on_dc: None });
-        let pc = build_pc(handler, stun).await?;
+        let pc = build_pc_relayed(handler, stun, turn.as_ref()).await?;
         for kind in [RtpCodecKind::Video, RtpCodecKind::Audio] {
             pc.add_transceiver_from_kind(
                 kind,

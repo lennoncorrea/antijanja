@@ -5,7 +5,7 @@
 //! próprias e posiciona os players nativos sobre os tiles da tela "Assistindo".
 
 use crate::app::AppHandle;
-use crate::{audio, capture, friends, identity, invite, overlay, rendezvous, session, settings, transport, updater};
+use crate::{audio, capture, friends, identity, invite, overlay, relay, rendezvous, session, settings, transport, updater};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::Value;
 use slint::{ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
@@ -68,6 +68,8 @@ struct Viewer {
     /// medições seguidas concordarem.
     nominal_fps: u32,
     fps_candidate: (u32, u8),
+    /// Senha usada para entrar (para tentar de novo pelo repasse sem perguntar de novo).
+    password: Option<String>,
 }
 
 /// Taxa comum mais perto do fps medido (dentro de 10%), senão o múltiplo de 5 mais perto.
@@ -462,6 +464,7 @@ fn render_settings(c: &Ctl, ui: &AppWindow) {
     set_if_changed!(a, get_s_bitrate, set_s_bitrate, s(st.bitrate.to_string()));
     set_if_changed!(a, get_s_cursor, set_s_cursor, st.cursor);
     set_if_changed!(a, get_s_mesh, set_s_mesh, st.mesh);
+    set_if_changed!(a, get_s_relay, set_s_relay, st.relay);
     set_if_changed!(a, get_s_audio_mode, set_s_audio_mode, s(if st.audio_mode.is_empty() { "system" } else { &st.audio_mode }));
     set_if_changed!(a, get_s_audio_app, set_s_audio_app, s(&st.audio_app));
     set_if_changed!(a, get_s_abitrate, set_s_abitrate, s(st.abitrate.to_string()));
@@ -1387,6 +1390,13 @@ fn set_setting(c: &mut Ctl, ui: &AppWindow, key: &str, value: &str) {
         "volume" => c.s.volume = num().unwrap_or(c.s.volume),
         "cursor" => c.s.cursor = on,
         "mesh" => c.s.mesh = on,
+        "relay" => {
+            c.s.relay = on;
+            relay::set_enabled(on);
+            if on {
+                relay::start(true);
+            }
+        }
         "password" => {
             let new = value.trim().to_string();
             if new == c.s.stream_password {
@@ -1645,6 +1655,7 @@ fn start_watching(c: &mut Ctl, ui: &AppWindow, code: String, password: Option<St
         renditions: vec![],
         nominal_fps: 0,
         fps_candidate: (0, 0),
+        password: password.clone(),
     });
     c.focus = None;
     c.view = "watch".into();
@@ -1904,6 +1915,14 @@ fn handle_event(c: &mut Ctl, ui: &AppWindow, name: &str, v: Value) {
                     relayout(c, ui);
                 }
                 "failed" => {
+                    // Não conectou direto: tenta de novo pelo repasse de um vizinho (uma vez).
+                    if !x.watching && session::retry_with_relay(&x.code) {
+                        let (code, password) = (x.code.clone(), x.password.clone());
+                        end_watching(c, ui, &id, None, false);
+                        toast(c, ui, "", "A conexão direta não deu. Tentando pelo repasse de outro usuário…");
+                        start_watching(c, ui, code, password);
+                        return;
+                    }
                     let msg = if x.watching { "A conexão caiu." } else { "Não deu para conectar direto. Alguns roteadores bloqueiam conexões P2P." };
                     end_watching(c, ui, &id, Some(msg), true);
                 }
@@ -2565,6 +2584,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
     });
 
     rendezvous::init(&app);
+    // Repasse para quem não consegue conectar (liga sozinho se a porta abrir no roteador).
+    relay::start(with(|c, _| c.s.relay).unwrap_or(true));
     // Links de convite: registra o antijanja:// e recebe os códigos de cliques posteriores.
     invite::register();
     invite::listen(|code| {
@@ -2955,7 +2976,7 @@ mod tests {
             id: String::new(), code: String::new(), host_name: String::new(), step: 0, busy: false, watching: true,
             host_friend: String::new(),
             stats: None, ping: None, volume: 100, muted: false, quality: "auto".into(), renditions: vec![],
-            nominal_fps: 0, fps_candidate: (0, 0),
+            nominal_fps: 0, fps_candidate: (0, 0), password: None,
         };
         for m in [58.0, 61.0, 57.0, 60.0, 62.0] {
             v.update_nominal_fps(m);

@@ -59,6 +59,8 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_Media
 windows-capture = "2.0.1"
 xcap = "0.9.10"
 igd-next = "0.18.0"
+turn = "0.17"
+webrtc-util = { version = "0.17.3", default-features = false }
 
 # LTO "thin" e algumas unidades de código: binário quase igual, build bem mais leve
 # (o build completo com lto=true travava o PC).
