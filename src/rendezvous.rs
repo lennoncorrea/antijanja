@@ -127,7 +127,7 @@ fn password_secret(password: &str, host_pk: &[u8; 32]) -> Result<[u8; 32], Strin
     Ok(out)
 }
 
-struct Keys {
+pub(crate) struct Keys {
     /// Chave pública do host (é o próprio código).
     host_pk: [u8; 32],
     /// Chave privada do host: só existe no computador de quem transmite.
@@ -138,7 +138,7 @@ struct Keys {
 
 impl Keys {
     /// Espectador: chaves a partir do código colado (e da senha, se a transmissão tiver).
-    fn from_code(code: &str, password: Option<&str>) -> Result<Self, String> {
+    pub(crate) fn from_code(code: &str, password: Option<&str>) -> Result<Self, String> {
         let (pk, locked) = parse_code(code)?;
         let pk = pk.to_bytes();
         let secret = match (locked, password.filter(|p| !p.is_empty())) {
@@ -150,7 +150,7 @@ impl Keys {
     }
 
     /// Host: sorteia um par de chaves novo. Devolve (código, chaves).
-    fn new_host(password: Option<&str>) -> Result<(String, Self), String> {
+    pub(crate) fn new_host(password: Option<&str>) -> Result<(String, Self), String> {
         let mut seed = [0u8; 32];
         getrandom::fill(&mut seed).map_err(|e| e.to_string())?;
         let sk = SigningKey::from_bytes(&seed);
@@ -196,7 +196,14 @@ impl Keys {
         }
     }
 
-    fn seal(&self, plain: &str) -> Result<Vec<u8>, String> {
+    /// Marca da transmissão no encontro direto (`direct`): tirada da chave dos
+    /// espectadores, então muda com a senha (senha errada, o host nem reconhece).
+    pub(crate) fn direct_tag(&self) -> String {
+        let h = blake3::derive_key("antijanja direct tag v1", &self.public(Role::Viewer));
+        h[..12].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    pub(crate) fn seal(&self, plain: &str) -> Result<Vec<u8>, String> {
         let mut enc = DeflateEncoder::new(Vec::new(), Compression::best());
         enc.write_all(plain.as_bytes()).map_err(|e| e.to_string())?;
         let compressed = enc.finish().map_err(|e| e.to_string())?;
@@ -211,7 +218,7 @@ impl Keys {
         Ok(out)
     }
 
-    fn open(&self, sealed: &[u8]) -> Option<String> {
+    pub(crate) fn open(&self, sealed: &[u8]) -> Option<String> {
         if sealed.len() <= NONCE_LEN {
             return None;
         }
@@ -336,6 +343,59 @@ fn fetch(dht: &Dht, keys: &Keys, role: Role, slot: u8, newer_than: i64) -> Optio
     keys.open(&sealed).map(|text| (seq, text))
 }
 
+/* ---------------- Ticket do encontro direto (docs/encontro-direto.md) ---------------- */
+
+const TICKET_SALT: &[u8] = b"t.0";
+/// O host confere os endereços a cada tanto e republica quando mudam (ou a cada
+/// `TICKET_REFRESH`: a DHT esquece em ~2 h, mas os nós que guardam mudam).
+const TICKET_CHECK: Duration = Duration::from_secs(5);
+const TICKET_REFRESH: Duration = Duration::from_secs(10 * 60);
+
+/// Host: grava o ticket (endereços onde pode ser chamado) na DHT.
+fn publish_ticket(dht: &Dht, keys: &Keys, ticket: &crate::direct::Ticket) -> Result<(), String> {
+    let json = serde_json::to_string(ticket).map_err(|e| e.to_string())?;
+    let sealed = keys.seal(&json)?;
+    let signer = keys.signer(Role::Host)?.clone();
+    dht.put_mutable(MutableItem::new(signer, &sealed, now_ms(), Some(TICKET_SALT)), None)
+        .map(|_| ())
+        .map_err(|e| format!("Falha ao publicar o ticket: {e}"))
+}
+
+/// Espectador: lê o ticket do host (o mais novo que abrir com a chave do código).
+fn fetch_ticket(dht: &Dht, keys: &Keys) -> Option<crate::direct::Ticket> {
+    let mut items: Vec<MutableItem> = dht.get_mutable(&keys.host_pk, Some(TICKET_SALT), None).filter(|it| sane_seq(it.seq())).collect();
+    items.sort_by_key(|it| std::cmp::Reverse(it.seq()));
+    items.iter().find_map(|it| serde_json::from_str(&keys.open(it.value())?).ok())
+}
+
+/// Host: mantém o ticket do código atualizado enquanto ele estiver ativo.
+fn keep_ticket(dht: Dht, keys: Arc<Keys>, stop: Arc<AtomicBool>, code: String) {
+    thread::spawn(move || {
+        let mut last: Option<(Vec<String>, Instant)> = None;
+        while !stop.load(Ordering::SeqCst) {
+            if let Some(d) = crate::direct::global() {
+                let addrs: Vec<String> = d.my_addrs().iter().map(|a| a.to_string()).collect();
+                let due = last.as_ref().is_none_or(|(old, at)| *old != addrs || at.elapsed() >= TICKET_REFRESH);
+                if due && !addrs.is_empty() {
+                    let t = Instant::now();
+                    let ticket = crate::direct::Ticket { addrs: addrs.clone(), ts: now_ms() };
+                    match publish_ticket(&dht, &keys, &ticket) {
+                        Ok(()) => {
+                            crate::connlog::log(format!("host: ticket do código {} publicado em {} ms ({} endereço(s))", crate::connlog::short(&code), t.elapsed().as_millis(), addrs.len()));
+                            last = Some((addrs, Instant::now()));
+                        }
+                        Err(e) => crate::connlog::log(format!("host: {e}")),
+                    }
+                }
+            }
+            let until = Instant::now() + TICKET_CHECK;
+            while Instant::now() < until && !stop.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+    });
+}
+
 fn get_dht(state: &RdvState) -> Result<Dht, String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -389,6 +449,12 @@ pub fn host_listen(state: &RdvState, on_offer: OfferFn, password: Option<&str>) 
     let stop = Arc::new(AtomicBool::new(false));
     *state.hosting.lock().unwrap() = Some(stop.clone());
 
+    // Encontro direto: atende pedidos que chegam pela fofoca e deixa o ticket na DHT.
+    if let Some(d) = crate::direct::global() {
+        d.host_register(&code, keys.clone(), on_offer.clone());
+    }
+    keep_ticket(dht.clone(), keys.clone(), stop.clone(), code.clone());
+
     // Uma thread por slot, cada uma consultando a DHT em loop.
     for slot in 0..SLOTS {
         let (dht, keys, stop, on_offer) = (dht.clone(), keys.clone(), stop.clone(), on_offer.clone());
@@ -418,6 +484,9 @@ pub fn host_listen(state: &RdvState, on_offer: OfferFn, password: Option<&str>) 
 pub fn host_stop(state: &RdvState) {
     raise_stop(&state.hosting);
     state.host_keys.lock().unwrap().clear();
+    if let Some(d) = crate::direct::global() {
+        d.host_clear();
+    }
 }
 
 /// Tentativas de publicar uma resposta do host antes de desistir (o espectador ainda
@@ -437,6 +506,11 @@ static REPLY_LOCK: Mutex<()> = Mutex::new(());
 /// encontra, e ele ficava em "Esperando o host responder" até desistir.
 pub fn host_reply(state: &RdvState, code: &str, slot: u8, payload: &str) -> Result<(), String> {
     let keys = state.host_keys.lock().unwrap().get(code).cloned().ok_or("código que não é desta transmissão")?;
+    // Se o pedido veio direto, a resposta vai direto na hora (e pela DHT também, logo
+    // abaixo, caso o espectador não receba).
+    if let Some(d) = crate::direct::global() {
+        d.host_reply(code, payload);
+    }
     let dht = get_dht(state)?;
     // Só este host escreve nas chaves deste código, mas o relógio pode voltar
     // (ajuste do Windows): mantemos o seq sempre crescente.
@@ -505,42 +579,127 @@ pub enum JoinEvent {
 /// consulta a DHT e leva alguns segundos: o espectador faz isso enquanto o WebRTC monta a
 /// oferta, e não depois.
 pub struct JoinPrep {
-    keys: Keys,
+    keys: Arc<Keys>,
     dht: Dht,
     slot: u8,
     seq: i64,
+    /// Onde chamar o host direto (lido da DHT junto com a escolha do slot).
+    ticket: Option<crate::direct::Ticket>,
 }
 
 /// Espectador, primeira parte da entrada: chaves do código (com a senha, que é lenta de
-/// propósito), DHT pronta e slot escolhido.
+/// propósito), DHT pronta, slot escolhido e ticket do host lido.
 pub fn prepare_join(state: &RdvState, code: &str, password: Option<&str>) -> Result<JoinPrep, String> {
     use crate::connlog::{log, short};
     let started = Instant::now();
     let keys = Keys::from_code(code, password)?;
     let dht = get_dht(state)?;
-    let (slot, seq) = pick_slot(&dht, &keys).inspect_err(|e| log(format!("entrada no código {}: sem slot: {e}", short(code))))?;
-    log(format!("entrada no código {}: slot {slot} escolhido em {} ms", short(code), started.elapsed().as_millis()));
-    Ok(JoinPrep { keys, dht, slot, seq })
+    let (picked, ticket) = thread::scope(|s| {
+        let ticket = s.spawn(|| fetch_ticket(&dht, &keys));
+        let picked = pick_slot(&dht, &keys);
+        (picked, ticket.join().ok().flatten())
+    });
+    let (slot, seq) = picked.inspect_err(|e| log(format!("entrada no código {}: sem slot: {e}", short(code))))?;
+    let t = ticket.as_ref().map(|t| format!("ticket com {} endereço(s)", t.addrs.len())).unwrap_or("sem ticket".into());
+    log(format!("entrada no código {}: slot {slot} escolhido em {} ms; {t}", short(code), started.elapsed().as_millis()));
+    Ok(JoinPrep { keys: Arc::new(keys), dht, slot, seq, ticket })
 }
 
-/// Espectador, segunda parte: publica a oferta e espera a resposta do host (até
-/// `timeout_secs`). `sid` identifica esta tentativa; respostas com outro `sid` são
-/// ignoradas. Se desistir (cancelado ou sem resposta), avisa o host para ele liberar a vaga.
+/// O que os caminhos da entrada (DHT e direto) contam para a espera.
+enum JoinMsg {
+    /// O pedido saiu pela DHT pela primeira vez.
+    Published,
+    /// Mensagem do host (aberta), e por onde veio.
+    Host(String, &'static str),
+    /// A DHT não conseguiu publicar nem a primeira vez.
+    DhtFailed(String),
+}
+
+/// Espectador, segunda parte: manda a oferta (pela DHT e direto, ao mesmo tempo) e espera
+/// a resposta do host (até `timeout_secs`); vale a que chegar primeiro. `sid` identifica
+/// esta tentativa; respostas com outro `sid` são ignoradas. Se desistir (cancelado ou sem
+/// resposta), avisa o host para ele liberar a vaga.
 pub fn join(prep: JoinPrep, sid: &str, payload: &str, timeout_secs: u64, stop: &AtomicBool, on_event: impl Fn(JoinEvent)) -> Result<String, String> {
     use crate::connlog::{log, short};
     // Cada espectador tem a própria flag de cancelamento: várias entradas podem
     // acontecer ao mesmo tempo (assistir várias transmissões).
-    let JoinPrep { keys, dht, slot, seq: mut my_seq } = prep;
+    let JoinPrep { keys, dht, slot, seq, ticket } = prep;
     let started = Instant::now();
     let tag = format!("espectador {}", short(sid));
     log(format!("{tag}: mandando o pedido ({} bytes) no slot {slot}", payload.len()));
 
     let deadline = started + Duration::from_secs(timeout_secs.clamp(10, 600));
-    let mut last_seq = 0i64;
-    let mut published_at: Option<Instant> = None;
-    let mut publishes = 0u32;
-    let mut busy = false;
+    let (tx, rx) = std::sync::mpsc::channel::<JoinMsg>();
+    let done = Arc::new(AtomicBool::new(false));
 
+    // Caminho direto (pela fofoca), se ela estiver rodando.
+    let direct = crate::direct::global();
+    if let Some(d) = &direct {
+        let (htx, hrx) = std::sync::mpsc::channel::<String>();
+        d.viewer_start(keys.clone(), slot, payload.to_string(), ticket.clone(), htx, done.clone());
+        let (tx, done) = (tx.clone(), done.clone());
+        thread::spawn(move || {
+            while !done.load(Ordering::SeqCst) {
+                if let Ok(text) = hrx.recv_timeout(Duration::from_millis(200)) {
+                    let _ = tx.send(JoinMsg::Host(text, "direto"));
+                }
+            }
+        });
+    }
+
+    // Caminho pela DHT.
+    let my_seq = Arc::new(std::sync::atomic::AtomicI64::new(seq));
+    {
+        let (keys, dht, done, payload, tx, tag, my_seq) = (keys.clone(), dht.clone(), done.clone(), payload.to_string(), tx.clone(), tag.clone(), my_seq.clone());
+        thread::spawn(move || {
+            let mut last_seq = 0i64;
+            let mut published_at: Option<Instant> = None;
+            let mut publishes = 0u32;
+            while !done.load(Ordering::SeqCst) {
+                // Republica a oferta periodicamente, caso o host tenha perdido a anterior.
+                if published_at.is_none_or(|t| t.elapsed() > REPUBLISH) {
+                    // O host não respondeu à publicação anterior: talvez ela tenha ido para nós
+                    // ruins. Busca os nós de novo (e o seq mais novo do slot) antes de repetir.
+                    if publishes > 0 {
+                        let cur = refresh_nodes(&dht, &keys, Role::Viewer, slot);
+                        if sane_seq(cur) {
+                            my_seq.fetch_max(cur, Ordering::SeqCst);
+                        }
+                    }
+                    let t = Instant::now();
+                    match publish(&dht, &keys, Role::Viewer, slot, &payload, my_seq.load(Ordering::SeqCst)) {
+                        Ok(seq) => {
+                            my_seq.store(seq, Ordering::SeqCst);
+                            publishes += 1;
+                            log(format!("{tag}: pedido publicado (vez {publishes}) em {} ms", t.elapsed().as_millis()));
+                            if publishes == 1 {
+                                let _ = tx.send(JoinMsg::Published);
+                            }
+                        }
+                        Err(e) => {
+                            log(format!("{tag}: falha ao publicar o pedido: {e}"));
+                            if publishes == 0 {
+                                let _ = tx.send(JoinMsg::DhtFailed(e));
+                            }
+                        }
+                    }
+                    published_at = Some(Instant::now());
+                }
+                if done.load(Ordering::SeqCst) {
+                    break;
+                }
+                if let Some((seq, text)) = fetch(&dht, &keys, Role::Host, slot, last_seq) {
+                    last_seq = seq;
+                    let _ = tx.send(JoinMsg::Host(text, "DHT"));
+                }
+                thread::sleep(Duration::from_millis(700));
+            }
+        });
+    }
+    drop(tx);
+
+    let mut busy = false;
+    let mut published = false;
     let err = loop {
         if stop.load(Ordering::SeqCst) {
             break "cancelado".to_string();
@@ -548,62 +707,53 @@ pub fn join(prep: JoinPrep, sid: &str, payload: &str, timeout_secs: u64, stop: &
         if Instant::now() >= deadline {
             break "O host não respondeu. Confira se o código está certo e se a transmissão ainda está ativa.".to_string();
         }
-        // Republica a oferta periodicamente, caso o host tenha perdido a anterior.
-        if published_at.is_none_or(|t| t.elapsed() > REPUBLISH) {
-            // O host não respondeu à publicação anterior: talvez ela tenha ido para nós
-            // ruins. Busca os nós de novo (e o seq mais novo do slot) antes de repetir.
-            if publishes > 0 {
-                let cur = refresh_nodes(&dht, &keys, Role::Viewer, slot);
-                if sane_seq(cur) {
-                    my_seq = my_seq.max(cur);
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(JoinMsg::Published) => {
+                if !published {
+                    published = true;
+                    on_event(JoinEvent::Published);
                 }
             }
-            let t = Instant::now();
-            match publish(&dht, &keys, Role::Viewer, slot, payload, my_seq) {
-                Ok(seq) => {
-                    my_seq = seq;
-                    publishes += 1;
-                    log(format!("{tag}: pedido publicado (vez {publishes}) em {} ms", t.elapsed().as_millis()));
-                    if publishes == 1 {
-                        on_event(JoinEvent::Published);
+            // Sem caminho direto, a DHT falhar na primeira vez é erro; com ele, segue
+            // esperando a resposta direta.
+            Ok(JoinMsg::DhtFailed(e)) if direct.is_none() => break e,
+            Ok(JoinMsg::DhtFailed(_)) => {}
+            Ok(JoinMsg::Host(text, via)) => {
+                let v = serde_json::from_str::<serde_json::Value>(&text).unwrap_or_default();
+                if v["sid"] != sid {
+                    log(format!("{tag}: resposta de outra tentativa no slot (ignorada)"));
+                } else if v["t"] == "busy" {
+                    log(format!("{tag}: host ocupado com outras entradas ({via})"));
+                    if !busy {
+                        busy = true;
+                        on_event(JoinEvent::Busy);
                     }
-                }
-                Err(e) => {
-                    log(format!("{tag}: falha ao publicar o pedido: {e}"));
-                    // Na primeira vez nada saiu: é erro. Depois, tenta de novo mais tarde.
-                    if publishes == 0 {
-                        break e;
-                    }
+                } else {
+                    done.store(true, Ordering::SeqCst);
+                    log(format!("{tag}: resposta recebida em {} ms ({via})", started.elapsed().as_millis()));
+                    return Ok(text);
                 }
             }
-            published_at = Some(Instant::now());
+            Err(_) => {}
         }
-        if let Some((seq, text)) = fetch(&dht, &keys, Role::Host, slot, last_seq) {
-            last_seq = seq;
-            let v = serde_json::from_str::<serde_json::Value>(&text).unwrap_or_default();
-            if v["sid"] != sid {
-                log(format!("{tag}: resposta de outra tentativa no slot (ignorada)"));
-            } else if v["t"] == "busy" {
-                log(format!("{tag}: host ocupado com outras entradas"));
-                if !busy {
-                    busy = true;
-                    on_event(JoinEvent::Busy);
-                }
-            } else {
-                log(format!("{tag}: resposta recebida em {} ms", started.elapsed().as_millis()));
-                return Ok(text);
-            }
+        // O caminho direto não tem "publicado": depois de um instante, a interface já
+        // pode mostrar "esperando o host".
+        if !published && direct.is_some() && started.elapsed() > Duration::from_secs(1) {
+            published = true;
+            on_event(JoinEvent::Published);
         }
-        thread::sleep(Duration::from_millis(700));
     };
-    log(format!("{tag}: desistiu depois de {} s ({err}); pedido publicado {publishes} vez(es)", started.elapsed().as_secs()));
+    done.store(true, Ordering::SeqCst);
+    log(format!("{tag}: desistiu depois de {} s ({err})", started.elapsed().as_secs()));
     // Avisa o host (em segundo plano) para ele não guardar a vaga desta tentativa.
-    if publishes > 0 {
-        let cancel = serde_json::json!({ "t": "cancel", "sid": sid }).to_string();
-        thread::spawn(move || {
-            let _ = publish(&dht, &keys, Role::Viewer, slot, &cancel, my_seq);
-        });
+    let cancel = serde_json::json!({ "t": "cancel", "sid": sid }).to_string();
+    if let Some(d) = &direct {
+        d.viewer_send(&keys, slot, &cancel, ticket.as_ref());
     }
+    let seq = my_seq.load(Ordering::SeqCst);
+    thread::spawn(move || {
+        let _ = publish(&dht, &keys, Role::Viewer, slot, &cancel, seq);
+    });
     Err(err)
 }
 
@@ -852,7 +1002,10 @@ fn start_gossip(app: &AppHandle, dht: &Dht) {
         }),
     };
     match crate::gossip::Gossip::start(cfg) {
-        Ok(g) => crate::gossip::install(g),
+        Ok(g) => {
+            crate::direct::install(g.clone());
+            crate::gossip::install(g);
+        }
         Err(e) => crate::connlog::log(format!("fofoca: não iniciou: {e}")),
     }
 }
@@ -1215,6 +1368,64 @@ mod tests {
         assert!(answer.contains("answer"));
         host_stop(&host);
         assert!(host_reply(&host, &code, 0, "{}").is_err(), "depois de parar, o código não responde mais");
+    }
+
+    /// Ticket do encontro direto pela DHT real, em nós diferentes: só quem tem o código lê.
+    #[test]
+    #[ignore]
+    fn live_ticket_roundtrip() {
+        let (a, b) = (Dht::client().unwrap(), Dht::client().unwrap());
+        assert!(a.bootstrapped() && b.bootstrapped());
+        let (code, keys) = Keys::new_host(None).unwrap();
+        let ticket = crate::direct::Ticket { addrs: vec!["203.0.113.5:40000".into(), "192.168.0.10:40000".into()], ts: now_ms() };
+        let t = Instant::now();
+        publish_ticket(&a, &keys, &ticket).unwrap();
+        println!("publicado em {:?}", t.elapsed());
+        let t = Instant::now();
+        assert_eq!(fetch_ticket(&b, &Keys::from_code(&code, None).unwrap()), Some(ticket));
+        println!("lido em {:?}", t.elapsed());
+        let (other, _) = Keys::new_host(None).unwrap();
+        assert_eq!(fetch_ticket(&b, &Keys::from_code(&other, None).unwrap()), None);
+    }
+
+    /// Entrada completa com o encontro direto ligado (fofoca em 127.0.0.1, ticket pela DHT
+    /// real): a resposta chega pelo caminho direto, sem esperar a DHT.
+    #[test]
+    #[ignore]
+    fn live_join_direct() {
+        let g = crate::gossip::Gossip::start(crate::gossip::Config {
+            id: "teste-direto".into(),
+            net: "teste-direto".into(),
+            dht: None,
+            lan: false,
+            bind: std::net::Ipv4Addr::LOCALHOST,
+            check: Box::new(|_| None),
+            deliver: Box::new(|_| {}),
+        })
+        .unwrap();
+        crate::direct::install(g);
+        let host = Arc::new(RdvState::default());
+        let viewer = RdvState::default();
+        let _ = host.dht.set(Dht::client().unwrap());
+        let _ = viewer.dht.set(Dht::client().unwrap());
+        let h = host.clone();
+        let on_offer: OfferFn = Arc::new(move |code: &str, slot: u8, offer: String| {
+            let sid = serde_json::from_str::<serde_json::Value>(&offer).unwrap()["sid"].as_str().unwrap().to_string();
+            let (h, code) = (h.clone(), code.to_string());
+            thread::spawn(move || host_reply(&h, &code, slot, &serde_json::json!({ "t": "answer", "sid": sid }).to_string()));
+        });
+        let code = host_listen(&host, on_offer, None).unwrap();
+        thread::sleep(Duration::from_secs(8)); // o ticket sai logo depois do código
+        let t = Instant::now();
+        let prep = prepare_join(&viewer, &code, None).unwrap();
+        assert!(prep.ticket.is_some(), "ticket não foi lido");
+        println!("preparo em {:?}", t.elapsed());
+        let t = Instant::now();
+        let answer = join(prep, "d1", r#"{"t":"offer","sid":"d1"}"#, 60, &AtomicBool::new(false), |_| {}).unwrap();
+        println!("resposta em {:?}", t.elapsed());
+        assert!(answer.contains("answer"));
+        assert!(t.elapsed() < Duration::from_secs(3), "a resposta direta devia chegar em menos de 3 s");
+        host_stop(&host);
     }
 
     /// Como na vida real: host e espectador em nós da DHT diferentes, e o espectador

@@ -108,7 +108,38 @@ enum Msg {
     /// Mensagem direta entre amigos (docs/amizades.md): de quem diz ser (`f`, chave da
     /// conta) e o conteúdo cifrado (`d`, base64). Quem confere é `friends`.
     Dm { f: String, d: String },
+    /// "Bate à porta" de um host (docs/encontro-direto.md): espalhada pelos vizinhos até o
+    /// host da transmissão `k` (marca derivada do código), que abre `e` (os endereços de
+    /// quem bate, cifrados com a chave do código) e chama de volta.
+    Knock { k: String, e: String, h: u8 },
+    /// Pedaço de uma mensagem do encontro direto (pedido ou resposta), mandado direto ao
+    /// outro lado. Quem confere e monta é `direct`.
+    Rv(Rv),
 }
+
+/// Pedaço de uma mensagem do encontro direto. `n == 0`: só abre a passagem pelo roteador.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Rv {
+    /// Marca da transmissão.
+    pub k: String,
+    /// Quem manda: 'v' (espectador) ou 'h' (host).
+    pub r: char,
+    /// Slot do pedido na DHT (o host responde também por lá).
+    #[serde(default)]
+    pub s: u8,
+    /// Número da mensagem (para montar os pedaços).
+    pub m: u32,
+    pub i: u8,
+    pub n: u8,
+    /// O pedaço (base64).
+    #[serde(default)]
+    pub d: String,
+}
+
+/// Uma batida chegou para nós? (`k`, `e`) -> se era para este app (aí não repassa).
+pub type KnockFn = Box<dyn Fn(&str, &str) -> bool + Send + Sync>;
+/// Pedaço do encontro direto recebido (de onde veio).
+pub type RvFn = Box<dyn Fn(SocketAddr, Rv) + Send + Sync>;
 
 fn encode(m: &Msg) -> Option<Vec<u8>> {
     let mut out = MAGIC.to_vec();
@@ -152,6 +183,8 @@ pub struct Gossip {
     cfg: Config,
     st: Mutex<State>,
     stop: AtomicBool,
+    on_knock: OnceLock<KnockFn>,
+    on_rv: OnceLock<RvFn>,
 }
 
 static GLOBAL: OnceLock<Arc<Gossip>> = OnceLock::new();
@@ -195,6 +228,14 @@ pub fn local_port() -> Option<u16> {
     GLOBAL.get().map(|g| g.local_addr().port())
 }
 
+/// IP da placa de rede usada para sair para a internet (nenhum pacote é mandado).
+pub fn lan_ip() -> Option<IpAddr> {
+    let s = UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("8.8.8.8:80").ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    (!ip.is_unspecified()).then_some(ip)
+}
+
 /// Vizinhos confirmados na fofoca do app.
 pub fn peer_count() -> usize {
     GLOBAL.get().map(|g| g.peers()).unwrap_or(0)
@@ -210,7 +251,7 @@ impl Gossip {
         sock.set_read_timeout(Some(Duration::from_millis(500)))?;
         let lan = cfg.lan;
         let dht = cfg.dht.clone();
-        let g = Arc::new(Gossip { sock, cfg, st: Mutex::new(State::default()), stop: AtomicBool::new(false) });
+        let g = Arc::new(Gossip { sock, cfg, st: Mutex::new(State::default()), stop: AtomicBool::new(false), on_knock: OnceLock::new(), on_rv: OnceLock::new() });
         log(format!("escutando na porta {}", g.local_addr().port()));
         let spawn = |name: &str, f: fn(Arc<Gossip>)| {
             let g = g.clone();
@@ -229,6 +270,67 @@ impl Gossip {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.sock.local_addr().unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)))
+    }
+
+    /// Endereços onde este app pode ser chamado: o público (STUN ou o que os vizinhos
+    /// veem) e o da rede local.
+    pub fn my_addrs(&self) -> Vec<SocketAddr> {
+        let mut out = Vec::new();
+        if let Some(p) = self.st.lock().unwrap().public {
+            out.push(SocketAddr::V4(p));
+        }
+        let me = self.local_addr();
+        if me.ip().is_loopback() {
+            out.push(me);
+        } else if let Some(ip) = lan_ip() {
+            out.push(SocketAddr::new(ip, me.port()));
+        }
+        out
+    }
+
+    /// Quem recebe as batidas (o encontro direto).
+    pub fn on_knock(&self, f: KnockFn) {
+        let _ = self.on_knock.set(f);
+    }
+
+    /// Quem recebe os pedaços do encontro direto.
+    pub fn on_rv(&self, f: RvFn) {
+        let _ = self.on_rv.set(f);
+    }
+
+    /// Espalha uma batida pelos vizinhos.
+    pub fn knock(&self, k: &str, e: &str) {
+        let msg = Msg::Knock { k: k.to_string(), e: e.to_string(), h: 0 };
+        if !self.seen_knock(&msg) {
+            return;
+        }
+        let to: Vec<SocketAddr> = self.st.lock().unwrap().peers.iter().filter(|(_, p)| p.verified).map(|(a, _)| *a).collect();
+        for a in to {
+            self.send(a, &msg);
+        }
+    }
+
+    /// Manda um pedaço do encontro direto. `false` se não coube num pacote.
+    pub fn send_rv(&self, to: SocketAddr, rv: &Rv) -> bool {
+        let Some(b) = encode(&Msg::Rv(rv.clone())) else { return false };
+        self.sock.send_to(&b, to).is_ok()
+    }
+
+    /// Batida nova? (marca como vista)
+    fn seen_knock(&self, m: &Msg) -> bool {
+        let Msg::Knock { k, e, .. } = m else { return false };
+        let hash = *blake3::hash(format!("knock {k} {e}").as_bytes()).as_bytes();
+        let mut st = self.st.lock().unwrap();
+        if !st.seen.insert(hash) {
+            return false;
+        }
+        st.seen_order.push_back(hash);
+        while st.seen_order.len() > SEEN_MAX {
+            if let Some(old) = st.seen_order.pop_front() {
+                st.seen.remove(&old);
+            }
+        }
+        true
     }
 
     /// Vizinhos confirmados.
@@ -440,6 +542,32 @@ impl Gossip {
                     drop(st);
                     if let Some(h) = DIRECT.get() {
                         h(from, &f, &d);
+                    }
+                    return self.flush(out, deliver);
+                }
+                Msg::Knock { k, e, h } if verified => {
+                    drop(st);
+                    let msg = Msg::Knock { k: k.clone(), e: e.clone(), h };
+                    if !self.seen_knock(&msg) {
+                        return;
+                    }
+                    if self.on_knock.get().is_some_and(|f| f(&k, &e)) {
+                        return; // era para nós
+                    }
+                    if h < MAX_HOPS {
+                        let st = self.st.lock().unwrap();
+                        for (a, p) in &st.peers {
+                            if *a != from && p.verified {
+                                out.push((*a, Msg::Knock { k: k.clone(), e: e.clone(), h: h + 1 }));
+                            }
+                        }
+                    }
+                    return self.flush(out, deliver);
+                }
+                Msg::Rv(rv) => {
+                    drop(st);
+                    if let Some(f) = self.on_rv.get() {
+                        f(from, rv);
                     }
                     return self.flush(out, deliver);
                 }

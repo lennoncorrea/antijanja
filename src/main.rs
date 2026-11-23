@@ -24,6 +24,7 @@ mod gossip;
 mod identity;
 mod congestion;
 mod connlog;
+mod direct;
 mod gpu;
 mod media;
 mod mesh;
